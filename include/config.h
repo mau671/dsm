@@ -3,16 +3,18 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <limits.h>
 #include "dsm_types.h"
 
 #define DSM_MAX_PEER_HOSTS 16
 #define DSM_MAX_HOST_LEN   256
 
+/* Tope de intentos de una RPC de pagina. Acota el peor caso de una falla de
+ * pagina: (intentos - 1) esperas de backoff mas un plazo de espera cada una. */
+#define DSM_MAX_REQUEST_RETRIES 10u
+
 /* Bloque de puertos asignado al grupo de trabajo (100 puertos).
  * El sistema solo puede escuchar/sondear dentro de este bloque: el
- * laboratorio comparte maquinas entre equipos y el rango es exclusivo.
- * Se puede sobreescribir en compilacion si cambia la asignacion. */
+ * laboratorio comparte maquinas entre equipos y el rango es exclusivo. */
 #ifndef DSM_PORT_BLOCK_MIN
 #define DSM_PORT_BLOCK_MIN 27600u
 #endif
@@ -29,9 +31,7 @@ typedef struct dsm_config {
     uint64_t node_mem;
     uint32_t max_runtime_nodes;
     uint32_t vnodes_per_mb;
-    uint32_t chunk_pages;
     bool     redundancy_raid5;
-    uint32_t raid_k;
 
     uint16_t port_min;
     uint16_t port_max;
@@ -54,13 +54,15 @@ typedef struct dsm_config {
     uint32_t dispatcher_threads;
     uint32_t page_lock_stripes;
     uint32_t home_slack_permille;   /* 1250 = 1.25 */
-    uint32_t wait_pool_entries;
     uint32_t lock_timeout_ms;
     uint32_t worker_queue_cap;
-    uint32_t sync_threads;
 
-    char     output_dir[PATH_MAX];
     char     log_level[16];
+
+    /* Propiedad de este proceso, no del archivo compartido: se toma de la
+     * variable de entorno DSM_NODE_MODE. Un cliente usa la memoria del cluster
+     * sin aportar memoria ni custodiar páginas. */
+    bool     client_mode;
 
     /* Hash CRC32 del archivo original para validar consistencia entre nodos */
     uint32_t raw_hash;

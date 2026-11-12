@@ -151,7 +151,9 @@ static int parse_hosts(char *val_str, dsm_config_t *cfg)
     return (cfg->peer_host_count > 0) ? 0 : -1;
 }
 
-/* Máscara de bits para detectar claves duplicadas */
+/* Máscara de bits para detectar claves duplicadas. Los bits son consecutivos:
+ * la mascara cabe en uint64_t y no deja huecos, de modo que su ancho es el
+ * numero de claves reconocidas por el parser. */
 #define KEY_CLUSTER_ID          (1ULL << 0)
 #define KEY_PAGE_SIZE           (1ULL << 1)
 #define KEY_BASE_ADDR           (1ULL << 2)
@@ -160,32 +162,30 @@ static int parse_hosts(char *val_str, dsm_config_t *cfg)
 #define KEY_NODE_MEM            (1ULL << 5)
 #define KEY_MAX_RUNTIME_NODES   (1ULL << 6)
 #define KEY_VNODES_PER_MB       (1ULL << 7)
-#define KEY_CHUNK_PAGES         (1ULL << 8)
-#define KEY_REDUNDANCY          (1ULL << 9)
-#define KEY_RAID_K              (1ULL << 10)
-#define KEY_PORT_MIN            (1ULL << 11)
-#define KEY_PORT_MAX            (1ULL << 12)
-#define KEY_PEER_HOSTS          (1ULL << 13)
-#define KEY_CONNECT_TIMEOUT_MS  (1ULL << 14)
-#define KEY_DISCOVERY_TIMEOUT_MS (1ULL << 15)
-#define KEY_SEND_TIMEOUT_MS     (1ULL << 16)
-#define KEY_REQUEST_TIMEOUT_MS  (1ULL << 17)
-#define KEY_REQUEST_RETRIES     (1ULL << 18)
-#define KEY_RECONNECT_MIN_MS    (1ULL << 19)
-#define KEY_RECONNECT_MAX_MS    (1ULL << 20)
-#define KEY_HB_INTERVAL_MS      (1ULL << 21)
-#define KEY_HB_SUSPECT          (1ULL << 22)
-#define KEY_HB_DEAD             (1ULL << 23)
-#define KEY_WORKER_THREADS      (1ULL << 24)
-#define KEY_DISPATCHER_THREADS  (1ULL << 25)
-#define KEY_PAGE_LOCK_STRIPES   (1ULL << 26)
-#define KEY_HOME_SLACK          (1ULL << 27)
-#define KEY_WAIT_POOL_ENTRIES   (1ULL << 28)
-#define KEY_LOCK_TIMEOUT_MS     (1ULL << 29)
-#define KEY_WORKER_QUEUE_CAP    (1ULL << 30)
-#define KEY_OUTPUT_DIR          (1ULL << 31)
-#define KEY_SYNC_THREADS        (1ULL << 32)
-#define KEY_LOG_LEVEL           (1ULL << 33)
+#define KEY_REDUNDANCY          (1ULL << 8)
+#define KEY_PORT_MIN            (1ULL << 9)
+#define KEY_PORT_MAX            (1ULL << 10)
+#define KEY_PEER_HOSTS          (1ULL << 11)
+#define KEY_CONNECT_TIMEOUT_MS  (1ULL << 12)
+#define KEY_DISCOVERY_TIMEOUT_MS (1ULL << 13)
+#define KEY_SEND_TIMEOUT_MS     (1ULL << 14)
+#define KEY_REQUEST_TIMEOUT_MS  (1ULL << 15)
+#define KEY_REQUEST_RETRIES     (1ULL << 16)
+#define KEY_RECONNECT_MIN_MS    (1ULL << 17)
+#define KEY_RECONNECT_MAX_MS    (1ULL << 18)
+#define KEY_HB_INTERVAL_MS      (1ULL << 19)
+#define KEY_HB_SUSPECT          (1ULL << 20)
+#define KEY_HB_DEAD             (1ULL << 21)
+#define KEY_WORKER_THREADS      (1ULL << 22)
+#define KEY_DISPATCHER_THREADS  (1ULL << 23)
+#define KEY_PAGE_LOCK_STRIPES   (1ULL << 24)
+#define KEY_HOME_SLACK          (1ULL << 25)
+#define KEY_LOCK_TIMEOUT_MS     (1ULL << 26)
+#define KEY_WORKER_QUEUE_CAP    (1ULL << 27)
+#define KEY_LOG_LEVEL           (1ULL << 28)
+
+/* Rol del proceso segun DSM_NODE_MODE; se aplica despues de leer el archivo. */
+static int config_load_mode(dsm_config_t *cfg);
 
 int config_load(dsm_config_t *cfg, const char *path)
 {
@@ -203,9 +203,7 @@ int config_load(dsm_config_t *cfg, const char *path)
     cfg->node_mem             = 268435456ULL;
     cfg->max_runtime_nodes    = 256;
     cfg->vnodes_per_mb        = 16;
-    cfg->chunk_pages          = 256;
     cfg->redundancy_raid5     = false;
-    cfg->raid_k               = 2;
     cfg->port_min             = 27600;
     cfg->port_max             = 27699;
     cfg->connect_timeout_ms   = 200;
@@ -222,11 +220,8 @@ int config_load(dsm_config_t *cfg, const char *path)
     cfg->dispatcher_threads   = 2;
     cfg->page_lock_stripes    = 256;
     cfg->home_slack_permille   = 1250;
-    cfg->wait_pool_entries    = 4096;
     cfg->lock_timeout_ms      = 10000;
     cfg->worker_queue_cap     = 4096;
-    cfg->sync_threads         = 4;
-    strncpy(cfg->output_dir, "./reportes", sizeof(cfg->output_dir) - 1);
     strncpy(cfg->log_level, "INFO", sizeof(cfg->log_level) - 1);
 
     FILE *f = fopen(path, "rb");
@@ -331,9 +326,6 @@ int config_load(dsm_config_t *cfg, const char *path)
         } else if (strcasecmp(key, "VNODES_PER_MB") == 0) {
             mask = KEY_VNODES_PER_MB;
             parse_err = parse_u32(val, &cfg->vnodes_per_mb);
-        } else if (strcasecmp(key, "CHUNK_PAGES") == 0) {
-            mask = KEY_CHUNK_PAGES;
-            parse_err = parse_u32(val, &cfg->chunk_pages);
         } else if (strcasecmp(key, "REDUNDANCY") == 0) {
             mask = KEY_REDUNDANCY;
             if (strcasecmp(val, "NONE") == 0) {
@@ -343,9 +335,6 @@ int config_load(dsm_config_t *cfg, const char *path)
             } else {
                 parse_err = -1;
             }
-        } else if (strcasecmp(key, "RAID_K") == 0) {
-            mask = KEY_RAID_K;
-            parse_err = parse_u32(val, &cfg->raid_k);
         } else if (strcasecmp(key, "PORT_MIN") == 0) {
             mask = KEY_PORT_MIN;
             parse_err = parse_u16(val, &cfg->port_min);
@@ -397,22 +386,12 @@ int config_load(dsm_config_t *cfg, const char *path)
         } else if (strcasecmp(key, "HOME_SLACK") == 0) {
             mask = KEY_HOME_SLACK;
             parse_err = parse_slack_permille(val, &cfg->home_slack_permille);
-        } else if (strcasecmp(key, "WAIT_POOL_ENTRIES") == 0) {
-            mask = KEY_WAIT_POOL_ENTRIES;
-            parse_err = parse_u32(val, &cfg->wait_pool_entries);
         } else if (strcasecmp(key, "LOCK_TIMEOUT_MS") == 0) {
             mask = KEY_LOCK_TIMEOUT_MS;
             parse_err = parse_u32(val, &cfg->lock_timeout_ms);
         } else if (strcasecmp(key, "WORKER_QUEUE_CAP") == 0) {
             mask = KEY_WORKER_QUEUE_CAP;
             parse_err = parse_u32(val, &cfg->worker_queue_cap);
-        } else if (strcasecmp(key, "SYNC_THREADS") == 0) {
-            mask = KEY_SYNC_THREADS;
-            parse_err = parse_u32(val, &cfg->sync_threads);
-        } else if (strcasecmp(key, "OUTPUT_DIR") == 0) {
-            mask = KEY_OUTPUT_DIR;
-            strncpy(cfg->output_dir, val, sizeof(cfg->output_dir) - 1);
-            cfg->output_dir[sizeof(cfg->output_dir) - 1] = '\0';
         } else if (strcasecmp(key, "DSM_LOG_LEVEL") == 0 || strcasecmp(key, "LOG_LEVEL") == 0) {
             mask = KEY_LOG_LEVEL;
             strncpy(cfg->log_level, val, sizeof(cfg->log_level) - 1);
@@ -442,7 +421,41 @@ int config_load(dsm_config_t *cfg, const char *path)
     }
 
     free(raw_buf);
-    return config_validate(cfg);
+
+    /* Primero se valida el archivo y despues se resuelve el rol: un archivo
+     * invalido falla igual en los dos modos. */
+    int rc = config_validate(cfg);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+    return config_load_mode(cfg);
+}
+
+/*
+ * El rol del proceso (nodo completo o cliente) no vive en dsm.conf: el archivo
+ * describe el cluster y lo comparten todos sus miembros, mientras que el rol es
+ * una propiedad de cada proceso. Se toma de DSM_NODE_MODE para que dos procesos
+ * con el mismo archivo difieran solo en lo que aportan. Un valor desconocido es
+ * un error de configuración y no un modo por defecto silencioso.
+ */
+static int config_load_mode(dsm_config_t *cfg)
+{
+    const char *mode = getenv("DSM_NODE_MODE");
+    if (!mode || *mode == '\0') {
+        cfg->client_mode = false;
+        return DSM_OK;
+    }
+    if (strcasecmp(mode, "node") == 0) {
+        cfg->client_mode = false;
+        return DSM_OK;
+    }
+    if (strcasecmp(mode, "client") == 0) {
+        cfg->client_mode = true;
+        return DSM_OK;
+    }
+
+    DSM_LOG_ERR("DSM_NODE_MODE invalido: '%s' (valores admitidos: node, client)", mode);
+    return DSM_ERR_CONFIG;
 }
 
 int config_validate(dsm_config_t *cfg)
@@ -559,7 +572,7 @@ int config_validate(dsm_config_t *cfg)
     }
 
     if (cfg->redundancy_raid5) {
-        DSM_LOG_ERR("RAID5 no esta soportado en el prototipo 1 (desactive con REDUNDANCY = NONE)");
+        DSM_LOG_ERR("RAID5 no esta soportado (desactive con REDUNDANCY = NONE)");
         return DSM_ERR_CONFIG;
     }
 
@@ -570,6 +583,21 @@ int config_validate(dsm_config_t *cfg)
 
     if (cfg->request_retries < 1) {
         DSM_LOG_ERR("REQUEST_RETRIES debe ser >= 1");
+        return DSM_ERR_CONFIG;
+    }
+
+    /* Cada reintento cuesta como minimo un plazo de espera de la RPC: un
+     * valor sin cota convierte una sola falla de pagina en una espera de
+     * minutos antes de devolver el error al llamador. */
+    if (cfg->request_retries > DSM_MAX_REQUEST_RETRIES) {
+        DSM_LOG_ERR("REQUEST_RETRIES no puede superar %u", DSM_MAX_REQUEST_RETRIES);
+        return DSM_ERR_CONFIG;
+    }
+
+    /* RECONNECT_MIN_MS es la base del backoff exponencial y RECONNECT_MAX_MS
+     * su tope: invertirlos deja el crecimiento sin sentido. */
+    if (cfg->reconnect_min_ms > cfg->reconnect_max_ms) {
+        DSM_LOG_ERR("RECONNECT_MIN_MS no puede superar RECONNECT_MAX_MS");
         return DSM_ERR_CONFIG;
     }
 
@@ -600,5 +628,6 @@ void config_dump(const dsm_config_t *cfg)
                  cfg->worker_threads, cfg->dispatcher_threads);
     DSM_LOG_INFO("  HOME_SLACK        = %u.%03u",
                  cfg->home_slack_permille / 1000, cfg->home_slack_permille % 1000);
+    DSM_LOG_INFO("  MODO_PROCESO      = %s", cfg->client_mode ? "cliente" : "nodo");
     DSM_LOG_INFO("  RAW_HASH          = 0x%08X", cfg->raw_hash);
 }
