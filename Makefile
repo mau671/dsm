@@ -1,7 +1,3 @@
-# ==============================================================================
-# Makefile — DSM Prototipo 1
-# ==============================================================================
-
 CC      ?= cc
 AR      ?= ar
 BUILD   ?= build
@@ -30,27 +26,38 @@ PROFILES := release debug asan tsan
 
 LIB_SRCS := $(wildcard src/*.c)
 
-.PHONY: all release debug asan tsan clean test test-unit test-int
+.PHONY: all release debug asan tsan clean test test-unit test-e2e
 
 all: release
 
-# Macro para instanciar reglas por perfil
+# Cada perfil deja los objetos en build/obj/<perfil>, la biblioteca en
+# build/lib/<perfil> y los ejecutables en build/bin/<perfil>.
 define build_profile
-$$(BUILD)/$(1):
+$$(BUILD)/obj/$(1):
 	mkdir -p $$@
 
-$$(BUILD)/$(1)/%.o: src/%.c | $$(BUILD)/$(1)
+$$(BUILD)/lib/$(1):
+	mkdir -p $$@
+
+$$(BUILD)/bin/$(1):
+	mkdir -p $$@
+
+$$(BUILD)/obj/$(1)/%.o: src/%.c | $$(BUILD)/obj/$(1)
 	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) -MMD -MP -c $$< -o $$@
 
-$$(BUILD)/$(1)/libdsm.a: $$(patsubst src/%.c,$$(BUILD)/$(1)/%.o,$$(LIB_SRCS)) | $$(BUILD)/$(1)
+$$(BUILD)/lib/$(1)/libdsm.a: $$(patsubst src/%.c,$$(BUILD)/obj/$(1)/%.o,$$(LIB_SRCS)) | $$(BUILD)/lib/$(1)
 	$$(AR) rcs $$@ $$^
 
-$$(BUILD)/$(1)/%: apps/%.c $$(BUILD)/$(1)/libdsm.a | $$(BUILD)/$(1)
-	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< -L$$(BUILD)/$(1) -ldsm \
+$$(BUILD)/bin/$(1)/%: apps/%.c $$(BUILD)/lib/$(1)/libdsm.a | $$(BUILD)/bin/$(1)
+	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< -L$$(BUILD)/lib/$(1) -ldsm \
 	      $$(LDFLAGS_COMMON) $$(LDFLAGS_$(2)) -o $$@
 
-$$(BUILD)/$(1)/dsmctl: tools/dsmctl.c $$(BUILD)/$(1)/libdsm.a | $$(BUILD)/$(1)
-	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< -L$$(BUILD)/$(1) -ldsm \
+$$(BUILD)/bin/$(1)/dsmctl: tools/dsmctl.c $$(BUILD)/lib/$(1)/libdsm.a | $$(BUILD)/bin/$(1)
+	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< -L$$(BUILD)/lib/$(1) -ldsm \
+	      $$(LDFLAGS_COMMON) $$(LDFLAGS_$(2)) -o $$@
+
+$$(BUILD)/bin/$(1)/video_pack: tools/video_pack.c | $$(BUILD)/bin/$(1)
+	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< \
 	      $$(LDFLAGS_COMMON) $$(LDFLAGS_$(2)) -o $$@
 endef
 
@@ -61,21 +68,28 @@ profile_tsan    := TSAN
 
 $(foreach p,$(PROFILES),$(eval $(call build_profile,$(p),$(profile_$(p)))))
 
-release: $(BUILD)/release/libdsm.a $(BUILD)/release/dsmd $(BUILD)/release/dsmctl
-debug:   $(BUILD)/debug/libdsm.a   $(BUILD)/debug/dsmd   $(BUILD)/debug/dsmctl \
-         $(BUILD)/debug/test_basico
-asan:    $(BUILD)/asan/libdsm.a    $(BUILD)/asan/dsmd    $(BUILD)/asan/dsmctl
-tsan:    $(BUILD)/tsan/libdsm.a    $(BUILD)/tsan/dsmd    $(BUILD)/tsan/dsmctl
+release: $(BUILD)/lib/release/libdsm.a \
+         $(BUILD)/bin/release/dsm $(BUILD)/bin/release/dsmctl \
+         $(BUILD)/bin/release/filtro_video $(BUILD)/bin/release/juego_vida \
+         $(BUILD)/bin/release/video_pack
+debug:   $(BUILD)/lib/debug/libdsm.a \
+         $(BUILD)/bin/debug/dsm $(BUILD)/bin/debug/dsmctl \
+         $(BUILD)/bin/debug/test_basico $(BUILD)/bin/debug/filtro_video \
+         $(BUILD)/bin/debug/juego_vida $(BUILD)/bin/debug/video_pack
+asan:    $(BUILD)/lib/asan/libdsm.a \
+         $(BUILD)/bin/asan/dsm $(BUILD)/bin/asan/dsmctl
+tsan:    $(BUILD)/lib/tsan/libdsm.a \
+         $(BUILD)/bin/tsan/dsm $(BUILD)/bin/tsan/dsmctl
 
-# --- Tests unitarios (enlazan con asan para chequeo de memoria) ---
-$(BUILD)/unit:
+# --- Pruebas unitarias (enlazan con la biblioteca instrumentada de asan) ---
+$(BUILD)/bin/unit:
 	mkdir -p $@
 
 TEST_SRCS := $(wildcard tests/unit/test_*.c)
-TEST_BINS := $(patsubst tests/unit/%.c,$(BUILD)/unit/%,$(TEST_SRCS))
+TEST_BINS := $(patsubst tests/unit/%.c,$(BUILD)/bin/unit/%,$(TEST_SRCS))
 
-$(BUILD)/unit/%: tests/unit/%.c $(BUILD)/asan/libdsm.a | $(BUILD)/unit
-	$(CC) $(CFLAGS_COMMON) $(CFLAGS_ASAN) -Itests/harness $< -L$(BUILD)/asan -ldsm \
+$(BUILD)/bin/unit/%: tests/unit/%.c $(BUILD)/lib/asan/libdsm.a | $(BUILD)/bin/unit
+	$(CC) $(CFLAGS_COMMON) $(CFLAGS_ASAN) -Itests/harness $< -L$(BUILD)/lib/asan -ldsm \
 	      $(LDFLAGS_COMMON) $(LDFLAGS_ASAN) -o $@
 
 test-unit: asan $(TEST_BINS)
@@ -83,20 +97,19 @@ test-unit: asan $(TEST_BINS)
 	@set -e; for t in $(TEST_BINS); do echo ">> Ejecutando $$t"; ./$$t; echo ""; done
 	@echo "Todas las pruebas unitarias pasaron exitosamente."
 
-# --- Integracion de dos nodos con la API publica ---
-$(BUILD)/integration:
+# --- Prueba de extremo a extremo con dos nodos reales ---
+$(BUILD)/bin/e2e:
 	mkdir -p $@
 
-$(BUILD)/integration/test_two_nodes: tests/integration/test_two_nodes.c | $(BUILD)/integration
+$(BUILD)/bin/e2e/test_two_nodes: tests/e2e/test_two_nodes.c | $(BUILD)/bin/e2e
 	$(CC) $(CFLAGS_COMMON) $< $(LDFLAGS_COMMON) -o $@
 
-test-int: debug $(BUILD)/integration/test_two_nodes
-	$(BUILD)/integration/test_two_nodes
+test-e2e: debug $(BUILD)/bin/e2e/test_two_nodes
+	$(BUILD)/bin/e2e/test_two_nodes
 
-# --- Red del compañero: pruebas aisladas de la capa de red ---
 test: test-unit
 
 clean:
 	rm -rf $(BUILD)
 
--include $(wildcard $(BUILD)/*/*.d)
+-include $(wildcard $(BUILD)/obj/*/*.d)

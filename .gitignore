@@ -1,4 +1,14 @@
 build/
-*.o
-*.a
-*.d
+
+# Documentación de trabajo: solo se versionan los PDF compilados y la
+# referencia de la API.
+docs/Aplicaciones_de_prueba.md
+docs/assets/
+docs/Entregable01/*.tex
+docs/Entregable01/*.md
+docs/Entregable01/imgs/
+docs/Entregable01/PRUEBAS PROTOTIPO.docx
+docs/Entregable02/*.tex
+Instrucciones.md
+.agents/
+skills-lock.json
