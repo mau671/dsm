@@ -288,6 +288,96 @@ void dsm_unpack_dir_entry(const uint8_t in[DSM_DIR_ENTRY_LEN], dir_entry_t *d)
     memcpy(d->copyset, in + 40, 32);
 }
 
+/* --- Consultas de diagnóstico --- */
+
+size_t dsm_pack_query_req(const query_req_t *q, uint8_t out[DSM_QUERY_REQ_LEN])
+{
+    out[0] = q->kind;
+    out[1] = q->scope;
+    put_u16(out + 2, q->reserved);
+    put_u32(out + 4, q->first);
+    put_u32(out + 8, q->max);
+    return DSM_QUERY_REQ_LEN;
+}
+
+void dsm_unpack_query_req(const uint8_t in[DSM_QUERY_REQ_LEN], query_req_t *q)
+{
+    q->kind     = in[0];
+    q->scope    = in[1];
+    q->reserved = get_u16(in + 2);
+    q->first    = get_u32(in + 4);
+    q->max      = get_u32(in + 8);
+}
+
+size_t dsm_pack_query_resp(const query_resp_t *r, uint8_t out[DSM_QUERY_RESP_HDR_LEN])
+{
+    out[0] = r->kind;
+    out[1] = r->more;
+    put_u16(out + 2, r->reserved);
+    put_u32(out + 4, r->count);
+    return DSM_QUERY_RESP_HDR_LEN;
+}
+
+void dsm_unpack_query_resp(const uint8_t in[DSM_QUERY_RESP_HDR_LEN], query_resp_t *r)
+{
+    r->kind     = in[0];
+    r->more     = in[1];
+    r->reserved = get_u16(in + 2);
+    r->count    = get_u32(in + 4);
+}
+
+size_t dsm_pack_node_rec(const node_rec_t *n, uint8_t out[DSM_NODE_REC_LEN])
+{
+    put_u32(out + 0, n->slot);
+    memcpy(out + 4, n->uuid, 16);
+    put_u32(out + 20, n->ip);
+    put_u16(out + 24, n->port);
+    out[26] = n->state;
+    out[27] = n->missed_hb;
+    put_u32(out + 28, n->mem_pages);
+    put_u32(out + 32, n->free_pages);
+    put_u64(out + 36, n->epoch);
+    put_u64(out + 44, n->last_hb_ms);
+    return DSM_NODE_REC_LEN;
+}
+
+void dsm_unpack_node_rec(const uint8_t in[DSM_NODE_REC_LEN], node_rec_t *n)
+{
+    n->slot       = get_u32(in + 0);
+    memcpy(n->uuid, in + 4, 16);
+    n->ip         = get_u32(in + 20);
+    n->port       = get_u16(in + 24);
+    n->state      = in[26];
+    n->missed_hb  = in[27];
+    n->mem_pages  = get_u32(in + 28);
+    n->free_pages = get_u32(in + 32);
+    n->epoch      = get_u64(in + 36);
+    n->last_hb_ms = get_u64(in + 44);
+}
+
+size_t dsm_pack_page_rec(const page_rec_t *p, uint8_t out[DSM_PAGE_REC_LEN])
+{
+    put_u32(out + 0, p->page_id);
+    put_u32(out + 4, p->home);
+    put_u32(out + 8, p->version);
+    out[12] = p->state;
+    out[13] = p->pend_inval;
+    out[14] = p->pend_down;
+    out[15] = p->reserved;
+    return DSM_PAGE_REC_LEN;
+}
+
+void dsm_unpack_page_rec(const uint8_t in[DSM_PAGE_REC_LEN], page_rec_t *p)
+{
+    p->page_id    = get_u32(in + 0);
+    p->home       = get_u32(in + 4);
+    p->version    = get_u32(in + 8);
+    p->state      = in[12];
+    p->pend_inval = in[13];
+    p->pend_down  = in[14];
+    p->reserved   = in[15];
+}
+
 size_t dsm_pack_welcome(const welcome_t *w, uint8_t *out, size_t max_out)
 {
     /* El empaquetador es la ultima linea de defensa: un count fuera de rango

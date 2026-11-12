@@ -146,6 +146,74 @@ typedef struct {                 /* 72 B */
 
 #define DSM_DIR_ENTRY_LEN 72u
 
+/* --- Consultas de diagnóstico (QUERY_REQ / QUERY_RESP) ---
+ *
+ * dsmctl no integra la membresía: abre una conexión TCP efímera al puerto de
+ * escucha de un nodo, envía QUERY_REQ y lee la QUERY_RESP. La carga útil de
+ * la petición va serializada campo por campo en 12 bytes y la de la
+ * respuesta en 8 bytes seguidos de los registros del tipo consultado. */
+
+enum dsm_query_kind {
+    DSM_QUERY_NODES = 0,
+    DSM_QUERY_STATS = 1,
+    DSM_QUERY_PAGES = 2
+};
+
+enum dsm_query_scope {
+    DSM_QUERY_LOCAL  = 0,
+    DSM_QUERY_GLOBAL = 1
+};
+
+/* 12 B en el cable */
+typedef struct {
+    uint8_t  kind;
+    uint8_t  scope;
+    uint16_t reserved;
+    uint32_t first;
+    uint32_t max;
+} query_req_t;
+
+#define DSM_QUERY_REQ_LEN 12u
+
+/* 8 B en el cable */
+typedef struct {
+    uint8_t  kind;
+    uint8_t  more;
+    uint16_t reserved;
+    uint32_t count;
+} query_resp_t;
+
+#define DSM_QUERY_RESP_HDR_LEN 8u
+
+/* Registro de membresía: 52 B en el cable */
+typedef struct {
+    uint32_t slot;
+    uint8_t  uuid[16];
+    uint32_t ip;                 /* orden de red */
+    uint16_t port;               /* orden de host */
+    uint8_t  state;              /* dsm_node_state_t */
+    uint8_t  missed_hb;
+    uint32_t mem_pages;
+    uint32_t free_pages;
+    uint64_t epoch;
+    uint64_t last_hb_ms;
+} node_rec_t;
+
+#define DSM_NODE_REC_LEN 52u
+
+/* Registro de la tabla de páginas local: 16 B en el cable */
+typedef struct {
+    uint32_t page_id;
+    uint32_t home;
+    uint32_t version;
+    uint8_t  state;
+    uint8_t  pend_inval;
+    uint8_t  pend_down;
+    uint8_t  reserved;
+} page_rec_t;
+
+#define DSM_PAGE_REC_LEN 16u
+
 /* Carga del mensaje WELCOME */
 typedef struct {
     uint64_t epoch;
@@ -195,6 +263,18 @@ void   dsm_unpack_alloc_rec(const uint8_t in[DSM_ALLOC_REC_LEN], alloc_rec_t *a)
 
 size_t dsm_pack_dir_entry(const dir_entry_t *d, uint8_t out[DSM_DIR_ENTRY_LEN]);
 void   dsm_unpack_dir_entry(const uint8_t in[DSM_DIR_ENTRY_LEN], dir_entry_t *d);
+
+size_t dsm_pack_query_req(const query_req_t *q, uint8_t out[DSM_QUERY_REQ_LEN]);
+void   dsm_unpack_query_req(const uint8_t in[DSM_QUERY_REQ_LEN], query_req_t *q);
+
+size_t dsm_pack_query_resp(const query_resp_t *r, uint8_t out[DSM_QUERY_RESP_HDR_LEN]);
+void   dsm_unpack_query_resp(const uint8_t in[DSM_QUERY_RESP_HDR_LEN], query_resp_t *r);
+
+size_t dsm_pack_node_rec(const node_rec_t *n, uint8_t out[DSM_NODE_REC_LEN]);
+void   dsm_unpack_node_rec(const uint8_t in[DSM_NODE_REC_LEN], node_rec_t *n);
+
+size_t dsm_pack_page_rec(const page_rec_t *p, uint8_t out[DSM_PAGE_REC_LEN]);
+void   dsm_unpack_page_rec(const uint8_t in[DSM_PAGE_REC_LEN], page_rec_t *p);
 
 /* Empaquetado de WELCOME */
 size_t dsm_pack_welcome(const welcome_t *w, uint8_t *out, size_t max_out);
