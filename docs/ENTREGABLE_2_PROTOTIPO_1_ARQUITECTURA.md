@@ -278,10 +278,10 @@ prueba y no modificó el código del núcleo DSM.
 El Prototipo 1 valida la arquitectura actualizada y demuestra un flujo mínimo
 de memoria DSM entre dos nodos con coherencia MSI. La sustitución de
 `network.c`/`protocol.h` por `net.c`, `wire.c`, `util.c` y `discovery.c`
-produjo una organización más clara y reutilizable. Las pruebas unitarias y la
-integración de dos nodos respaldan el alcance implementado; la compilación ASan
-y TSan confirma que esos perfiles construyen correctamente, pero no sustituye
-una ejecución instrumentada.
+produjo una organización más clara y reutilizable. Las pruebas unitarias se ejecutan con AddressSanitizer y UBSan (make test-unit),
+sin errores reportados. El perfil ThreadSanitizer (make tsan) compiló
+correctamente, pero no se ejecutó la suite bajo TSan; queda como tarea del
+Prototipo 2.
 
 El siguiente prototipo debe concentrarse en completar las operaciones
 colectivas, writeback, recuperación ante fallos y pruebas de concurrencia,
