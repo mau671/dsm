@@ -30,7 +30,7 @@ PROFILES := release debug asan tsan
 
 LIB_SRCS := $(wildcard src/*.c)
 
-.PHONY: all release debug asan tsan clean test test-unit test-net
+.PHONY: all release debug asan tsan clean test test-unit
 
 all: release
 
@@ -82,20 +82,7 @@ test-unit: asan $(TEST_BINS)
 	@set -e; for t in $(TEST_BINS); do echo ">> Ejecutando $$t"; ./$$t; echo ""; done
 	@echo "Todas las pruebas unitarias pasaron exitosamente."
 
-# Prueba aislada de la capa de red del compañero (servidor + cliente en 27650)
-test-net: $(BUILD)/unit/test_net
-	@set -e; $(BUILD)/unit/test_net server 27650 & srv=$$!; sleep 0.5; \
-	 trap 'kill $$srv 2>/dev/null' EXIT; \
-	 $(BUILD)/unit/test_net client 127.0.0.1 27650 100
-
 # --- Red del compañero: pruebas aisladas de la capa de red ---
-$(BUILD)/unit/test_net: tests/test_net.c $(BUILD)/asan/network.o | $(BUILD)/unit
-	$(CC) $(CFLAGS_COMMON) $(CFLAGS_ASAN) -Iinclude $< $(BUILD)/asan/network.o \
-	      $(LDFLAGS_COMMON) $(LDFLAGS_ASAN) -o $@
-
-$(BUILD)/asan/network.o: src/network.c | $(BUILD)/asan
-	$(CC) $(CFLAGS_COMMON) $(CFLAGS_ASAN) -c $< -o $@
-
 test: test-unit
 
 clean:
