@@ -301,7 +301,15 @@ static int test_cluster_heartbeat_and_timeout_degradation(void)
 
     pthread_rwlock_rdlock(&ctx_a->memb.rw);
     CHECK(ctx_a->memb.nodes[1].state == DSM_NODE_ALIVE);
-    CHECK(ctx_a->memb.nodes[1].missed_hb == 0);
+    /*
+     * NOTA: A evalúa timeouts y B envía latidos cada 250 ms en hilos
+     * independientes; la fase entre ambos es indeterminada, por lo que
+     * en la evaluación de A puede haber transcurrido justo un intervalo
+     * completo desde el último latido recibido (missed_hb == 1) sin que
+     * el latido de B haya llegado todavía. Aceptamos <= 1 con estado
+     * ALIVE como prueba de intercambio saludable de latidos.
+     */
+    CHECK(ctx_a->memb.nodes[1].missed_hb <= 1);
     pthread_rwlock_unlock(&ctx_a->memb.rw);
 
     /*
