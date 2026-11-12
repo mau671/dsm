@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
@@ -29,6 +30,65 @@ int net_init(dsm_ctx_t *ctx)
         atomic_store(&n->inbound[i].alive, false);
     }
 
+    return DSM_OK;
+}
+
+static pending_req_t *pending_find_locked(dsm_ctx_t *ctx, uint32_t req_id,
+                                          pending_req_t **prev_out)
+{
+    uint32_t bucket = req_id % 1024u;
+    pending_req_t *prev = NULL;
+    pending_req_t *cur = ctx->net.pending[bucket];
+    while (cur) {
+        if (cur->req_id == req_id) {
+            if (prev_out) *prev_out = prev;
+            return cur;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+    return NULL;
+}
+
+static void pending_remove(dsm_ctx_t *ctx, pending_req_t *pending)
+{
+    uint32_t bucket = pending->req_id % 1024u;
+    pthread_mutex_lock(&ctx->net.pending_mu);
+    pending_req_t *prev = NULL;
+    pending_req_t *found = pending_find_locked(ctx, pending->req_id, &prev);
+    if (found == pending) {
+        if (prev) {
+            prev->next = found->next;
+        } else {
+            ctx->net.pending[bucket] = found->next;
+        }
+    }
+    pthread_mutex_unlock(&ctx->net.pending_mu);
+}
+
+static int pending_complete(dsm_ctx_t *ctx, const msg_header_t *hdr,
+                            const uint8_t *payload)
+{
+    pthread_mutex_lock(&ctx->net.pending_mu);
+    pending_req_t *pending = pending_find_locked(ctx, hdr->req_id, NULL);
+    if (!pending) {
+        pthread_mutex_unlock(&ctx->net.pending_mu);
+        return DSM_ERR_NOT_FOUND;
+    }
+
+    pending->status     = hdr->status;
+    pending->rx_version = hdr->data_version;
+    pending->rx_len     = hdr->payload_len;
+    pending->result     = DSM_OK;
+    if (hdr->payload_len > pending->rx_capacity) {
+        pending->result = DSM_ERR_NO_SPACE;
+        pending->rx_len = 0;
+    } else if (hdr->payload_len > 0) {
+        memcpy(pending->rx_payload, payload, hdr->payload_len);
+    }
+    pending->completed = 1;
+    sem_post(&pending->sem);
+    pthread_mutex_unlock(&ctx->net.pending_mu);
     return DSM_OK;
 }
 
@@ -157,9 +217,17 @@ static void *listener_thread_main(void *arg)
             }
         }
 
-        if (dsm_wire_validate(&hdr, hdr_raw, payload, ctx->cfg.cluster_id) == DSM_OK) {
+        if (dsm_wire_validate(&hdr, hdr_raw, payload, ctx->cfg.cluster_id) == DSM_OK &&
+            wire_payload_ok(hdr.type, hdr.flags, hdr.payload_len, ctx->cfg.page_size)) {
             atomic_fetch_add_explicit(&ctx->ctr.msgs_recv, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&ctx->ctr.bytes_recv, DSM_HDR_LEN + hdr.payload_len, memory_order_relaxed);
+            if (dsm_msg_is_response(hdr.type) &&
+                pending_complete(ctx, &hdr, payload) == DSM_OK) {
+                free(payload);
+                payload = NULL;
+                close(cfd);
+                continue;
+            }
             dsm_msg_t msg = { .hdr = hdr, .payload = payload };
             if (hdr.type == MSG_JOIN) {
                 membership_on_join_fd(ctx, &msg, cfd);
@@ -170,8 +238,10 @@ static void *listener_thread_main(void *arg)
             } else if (hdr.type == MSG_NODE_DOWN) {
                 membership_on_node_down(ctx, &msg);
             } else {
-                worker_enqueue(ctx, &msg, payload);
-                payload = NULL; /* Transferencia de propiedad a worker */
+                int enqueue_rc = worker_enqueue(ctx, &msg, payload);
+                if (enqueue_rc == DSM_OK) {
+                    payload = NULL; /* Transferencia de propiedad a worker */
+                }
             }
         }
 
@@ -296,6 +366,15 @@ int dsm_net_send(dsm_ctx_t *ctx, uint32_t dst, const msg_header_t *hdr, const vo
     atomic_fetch_add_explicit(&ctx->ctr.msgs_sent, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&ctx->ctr.bytes_sent, DSM_HDR_LEN + hdr->payload_len, memory_order_relaxed);
 
+    /*
+     * El listener procesa una trama y cierra su conexión. Mantener el
+     * descriptor como persistente haría que la siguiente trama viajara por
+     * un socket que el receptor ya cerró.
+     */
+    shutdown(p->out_fd, SHUT_RDWR);
+    close(p->out_fd);
+    p->out_fd = -1;
+    atomic_store(&p->connected, false);
     pthread_mutex_unlock(&p->send_mu);
     return DSM_OK;
 }
@@ -343,27 +422,113 @@ int dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
                  const void *tx_payload, uint32_t tx_len,
                  uint16_t *out_status, void *rx_payload, uint32_t *rx_len)
 {
-    (void)ctx;
-    (void)dst;
-    (void)type;
-    (void)page_id;
-    (void)tseq;
-    (void)access;
-    (void)flags;
-    (void)tx_payload;
-    (void)tx_len;
-    (void)out_status;
-    (void)rx_payload;
-    (void)rx_len;
-    return DSM_OK;
+    if (!ctx || dst >= MAX_NODES || tx_len > DSM_MAX_PAYLOAD ||
+        (tx_len > 0 && !tx_payload) || !rx_len) {
+        return DSM_ERR_INVALID;
+    }
+    if (rx_payload == NULL && *rx_len != 0) {
+        return DSM_ERR_INVALID;
+    }
+
+    pending_req_t pending;
+    memset(&pending, 0, sizeof(pending));
+    pending.req_id      = (uint32_t)atomic_fetch_add(&ctx->net.req_counter, 1) + 1u;
+    pending.page_id     = page_id;
+    pending.rx_payload  = rx_payload;
+    pending.rx_capacity = *rx_len;
+    pending.result      = DSM_ERR_TIMEOUT;
+    if (sem_init(&pending.sem, 0, 0) != 0) {
+        return DSM_ERR_MEM;
+    }
+
+    uint32_t bucket = pending.req_id % 1024u;
+    pthread_mutex_lock(&ctx->net.pending_mu);
+    pending.next = ctx->net.pending[bucket];
+    ctx->net.pending[bucket] = &pending;
+    pthread_mutex_unlock(&ctx->net.pending_mu);
+
+    msg_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic         = DSM_MAGIC;
+    hdr.cluster_id    = ctx->cfg.cluster_id;
+    hdr.proto_version = DSM_PROTO_VERSION;
+    hdr.type          = type;
+    hdr.src_slot      = ctx->memb.self_slot;
+    hdr.dst_slot      = dst;
+    hdr.req_id        = pending.req_id;
+    hdr.page_id       = page_id;
+    hdr.tseq          = tseq;
+    hdr.access        = access;
+    hdr.flags         = flags;
+    hdr.epoch         = ctx->memb.epoch;
+
+    int send_rc = dsm_net_send(ctx, dst, &hdr, tx_payload);
+    if (send_rc != DSM_OK) {
+        pending_remove(ctx, &pending);
+        sem_destroy(&pending.sem);
+        return send_rc;
+    }
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += (time_t)(ctx->cfg.request_timeout_ms / 1000u);
+    deadline.tv_nsec += (long)(ctx->cfg.request_timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    int wait_rc;
+    do {
+        wait_rc = sem_timedwait(&pending.sem, &deadline);
+    } while (wait_rc != 0 && errno == EINTR);
+
+    if (wait_rc != 0) {
+        pending_remove(ctx, &pending);
+        sem_destroy(&pending.sem);
+        return (errno == ETIMEDOUT) ? DSM_ERR_TIMEOUT : DSM_ERR_NET;
+    }
+
+    pending_remove(ctx, &pending);
+    if (out_status) *out_status = pending.status;
+    *rx_len = pending.rx_len;
+    int result = pending.result;
+    sem_destroy(&pending.sem);
+    return result;
 }
 
 int dsm_net_read_one(int fd, uint32_t cluster_id, dsm_msg_t *out, uint8_t **owned)
 {
-    (void)fd;
-    (void)cluster_id;
-    (void)out;
-    (void)owned;
+    if (fd < 0 || !out || !owned) return DSM_ERR_INVALID;
+
+    uint8_t raw_hdr[DSM_HDR_LEN];
+    int rc = dsm_read_full_deadline(fd, raw_hdr, DSM_HDR_LEN, 3000);
+    if (rc != DSM_OK) return rc;
+
+    msg_header_t hdr;
+    rc = dsm_wire_unpack(raw_hdr, &hdr);
+    if (rc != DSM_OK) return rc;
+
+    uint8_t *payload = NULL;
+    if (hdr.payload_len > 0) {
+        if (hdr.payload_len > DSM_MAX_PAYLOAD) return DSM_ERR_PROTO;
+        payload = malloc(hdr.payload_len);
+        if (!payload) return DSM_ERR_MEM;
+        rc = dsm_read_full_deadline(fd, payload, hdr.payload_len, 3000);
+        if (rc != DSM_OK) {
+            free(payload);
+            return rc;
+        }
+    }
+
+    if (dsm_wire_validate(&hdr, raw_hdr, payload, cluster_id) != DSM_OK) {
+        free(payload);
+        return DSM_ERR_PROTO;
+    }
+
+    out->hdr = hdr;
+    out->payload = payload;
+    *owned = payload;
     return DSM_OK;
 }
 

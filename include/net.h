@@ -37,7 +37,9 @@ typedef struct dsm_pending {
     uint8_t             completed;
     uint8_t            *rx_payload;
     uint32_t            rx_len;
+    uint32_t            rx_capacity;
     uint32_t            rx_version;
+    int                 result;
     struct dsm_pending *next;
 } pending_req_t;
 

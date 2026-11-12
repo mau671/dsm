@@ -97,13 +97,20 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
     /* 5. Inicializar estructuras internas */
     membership_init(ctx);
     net_init(ctx);
-    msi_init(ctx);
+    rc = msi_init(ctx);
+    if (rc != DSM_OK) {
+        net_destroy(ctx);
+        membership_destroy(ctx);
+        free(ctx);
+        return rc;
+    }
     sync_init(ctx);
 
     /* 6. Inicializar memoria virtual y manejador de fallos */
     rc = dsm_mem_init(&ctx->mem, &ctx->cfg);
     if (rc != DSM_OK) {
         DSM_LOG_ERR("Fallo al inicializar subsistema de memoria virtual: %d", rc);
+        msi_destroy(ctx);
         net_destroy(ctx);
         membership_destroy(ctx);
         free(ctx);
@@ -114,6 +121,7 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
     if (rc != DSM_OK) {
         DSM_LOG_ERR("Fallo al registrar manejador de señales SIGSEGV");
         dsm_mem_destroy(&ctx->mem);
+        msi_destroy(ctx);
         net_destroy(ctx);
         membership_destroy(ctx);
         free(ctx);
@@ -121,8 +129,28 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
     }
 
     /* 7. Iniciar workers y despachadores de fallos */
-    worker_start(ctx);
-    dispatcher_start(ctx);
+    rc = worker_start(ctx);
+    if (rc != DSM_OK) {
+        dsm_sig_restore();
+        dsm_mem_destroy(&ctx->mem);
+        msi_destroy(ctx);
+        net_destroy(ctx);
+        membership_destroy(ctx);
+        free(ctx);
+        return rc;
+    }
+    rc = dispatcher_start(ctx);
+    if (rc != DSM_OK) {
+        atomic_store(&ctx->running, false);
+        worker_stop(ctx);
+        dsm_sig_restore();
+        dsm_mem_destroy(&ctx->mem);
+        msi_destroy(ctx);
+        net_destroy(ctx);
+        membership_destroy(ctx);
+        free(ctx);
+        return rc;
+    }
 
     /* 8. Descubrimiento y adhesion al cluster */
     rc = discovery_join(ctx);
@@ -136,6 +164,7 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
         worker_stop(ctx);
         dsm_sig_restore();
         dsm_mem_destroy(&ctx->mem);
+        msi_destroy(ctx);
         net_stop_listener(ctx);
         net_destroy(ctx);
         membership_destroy(ctx);

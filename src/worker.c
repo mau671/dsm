@@ -1,7 +1,36 @@
 #include "worker.h"
 #include "dsm_internal.h"
+#include "sigsegv.h"
 #include <stdlib.h>
 #include <string.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static void fault_slot_wake(fault_slot_t *slot)
+{
+    __atomic_store_n(&slot->done, 1, __ATOMIC_RELEASE);
+    syscall(SYS_futex, (int *)&slot->done, FUTEX_WAKE, 1, NULL, NULL, 0);
+}
+
+static void *dispatcher_thread_main(void *arg)
+{
+    dsm_ctx_t *ctx = (dsm_ctx_t *)arg;
+
+    while (atomic_load(&ctx->running)) {
+        fault_slot_t *slot = faultq_pop();
+        if (!slot) {
+            sleep_ms(1);
+            continue;
+        }
+
+        (void)msi_local_fault(ctx, slot);
+        fault_slot_wake(slot);
+        atomic_fetch_add_explicit(&ctx->ctr.slots_woken, 1, memory_order_relaxed);
+    }
+
+    return NULL;
+}
 
 static void *worker_thread_main(void *arg)
 {
@@ -23,6 +52,35 @@ static void *worker_thread_main(void *arg)
         if (!w->head) w->tail = NULL;
         w->len--;
         pthread_mutex_unlock(&w->mu);
+
+        switch (item->msg.hdr.type) {
+        case MSG_PAGE_REQUEST:
+            msi_home_handle_request(ctx, &item->msg);
+            break;
+        case MSG_PAGE_DATA:
+            msi_on_page_data(ctx, &item->msg);
+            break;
+        case MSG_GRANT:
+            msi_on_grant(ctx, &item->msg);
+            break;
+        case MSG_INVALIDATE:
+            msi_on_invalidate(ctx, &item->msg);
+            break;
+        case MSG_INVALIDATE_ACK:
+            msi_on_invalidate_ack(ctx, &item->msg);
+            break;
+        case MSG_DOWNGRADE:
+            msi_on_downgrade(ctx, &item->msg);
+            break;
+        case MSG_DOWNGRADE_ACK:
+            msi_on_downgrade_ack(ctx, &item->msg);
+            break;
+        case MSG_WRITEBACK:
+            msi_on_writeback(ctx, &item->msg);
+            break;
+        default:
+            break;
+        }
 
         if (item->owned) {
             free(item->owned);
@@ -102,11 +160,17 @@ int worker_enqueue(dsm_ctx_t *ctx, const dsm_msg_t *m, uint8_t *owned)
 
 int dispatcher_start(dsm_ctx_t *ctx)
 {
-    (void)ctx;
+    if (pthread_create(&ctx->dispatcher_thread, NULL,
+                       dispatcher_thread_main, ctx) != 0) {
+        return DSM_ERR_MEM;
+    }
     return DSM_OK;
 }
 
 void dispatcher_stop(dsm_ctx_t *ctx)
 {
-    (void)ctx;
+    if (ctx->dispatcher_thread) {
+        pthread_join(ctx->dispatcher_thread, NULL);
+        ctx->dispatcher_thread = 0;
+    }
 }

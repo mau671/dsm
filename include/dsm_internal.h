@@ -61,6 +61,7 @@ typedef struct dsm_ctx {
     atomic_bool       running;
     pthread_t         hb_thread;
     pthread_t         listener_thread;
+    pthread_t         dispatcher_thread;
 } dsm_ctx_t;
 
 /* Acceso al contexto global del nodo */

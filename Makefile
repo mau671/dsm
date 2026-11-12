@@ -30,7 +30,7 @@ PROFILES := release debug asan tsan
 
 LIB_SRCS := $(wildcard src/*.c)
 
-.PHONY: all release debug asan tsan clean test test-unit
+.PHONY: all release debug asan tsan clean test test-unit test-int
 
 all: release
 
@@ -62,7 +62,8 @@ profile_tsan    := TSAN
 $(foreach p,$(PROFILES),$(eval $(call build_profile,$(p),$(profile_$(p)))))
 
 release: $(BUILD)/release/libdsm.a $(BUILD)/release/dsmd $(BUILD)/release/dsmctl
-debug:   $(BUILD)/debug/libdsm.a   $(BUILD)/debug/dsmd   $(BUILD)/debug/dsmctl
+debug:   $(BUILD)/debug/libdsm.a   $(BUILD)/debug/dsmd   $(BUILD)/debug/dsmctl \
+         $(BUILD)/debug/test_basico
 asan:    $(BUILD)/asan/libdsm.a    $(BUILD)/asan/dsmd    $(BUILD)/asan/dsmctl
 tsan:    $(BUILD)/tsan/libdsm.a    $(BUILD)/tsan/dsmd    $(BUILD)/tsan/dsmctl
 
@@ -81,6 +82,16 @@ test-unit: asan $(TEST_BINS)
 	@echo "=== Ejecutando pruebas unitarias ==="
 	@set -e; for t in $(TEST_BINS); do echo ">> Ejecutando $$t"; ./$$t; echo ""; done
 	@echo "Todas las pruebas unitarias pasaron exitosamente."
+
+# --- Integracion de dos nodos con la API publica ---
+$(BUILD)/integration:
+	mkdir -p $@
+
+$(BUILD)/integration/test_two_nodes: tests/integration/test_two_nodes.c | $(BUILD)/integration
+	$(CC) $(CFLAGS_COMMON) $< $(LDFLAGS_COMMON) -o $@
+
+test-int: debug $(BUILD)/integration/test_two_nodes
+	$(BUILD)/integration/test_two_nodes
 
 # --- Red del compañero: pruebas aisladas de la capa de red ---
 test: test-unit
