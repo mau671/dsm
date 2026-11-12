@@ -18,6 +18,7 @@ static void fill_page(unsigned char *buf, uint32_t page_num)
 }
 
 /* Reemplaza al handle_message "débil" de network.c */
+void handle_message(const struct msg_header *header, const void *payload, int fd);
 void handle_message(const struct msg_header *header, const void *payload, int fd)
 {
     (void)payload;
