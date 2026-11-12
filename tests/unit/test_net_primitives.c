@@ -1,8 +1,7 @@
 /* ==============================================================================
- * test_net_primitives.c — Integración de las primitivas de red unificadas.
+ * test_net_primitives.c — Pruebas de integración de las primitivas de red.
  *
- * Sustituye a la antigua prueba aislada test_net.c (capa genérica ya
- * eliminada) y ejercita la MISMA pila que usa el daemon: cabecera de 56 B,
+ * Ejercita la misma pila que usa el daemon: cabecera de 56 B,
  * CRC32 y conexiones cortas por mensaje.
  *
  * Cobertura:
@@ -463,7 +462,7 @@ static int test_read_retries_on_eintr(void)
 
 int main(void)
 {
-    printf("=== Test Suite: Primitivas de red unificadas (wire + util) ===\n");
+    printf("=== Test Suite: Primitivas de red (wire + util) ===\n");
     RUN_TEST(test_listener_roundtrip_valid_frame);
     RUN_TEST(test_corrupted_payload_rejected);
     RUN_TEST(test_closed_port_fails_fast);
