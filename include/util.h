@@ -20,6 +20,12 @@ int dsm_write_full(int fd, const void *buf, size_t len);
  * SIGPIPE. Reintenta EINTR. */
 int dsm_send_full(int fd, const void *buf, size_t len);
 
+/* Escritura garantizada con plazo total: espera POLLOUT con deadline y escribe con
+ * MSG_DONTWAIT, de modo que un peer que deja de drenar no bloquea al emisor.
+ * Devuelve 0 si se escribio el bloque completo y -1 en error o plazo agotado.
+ * Deja el descriptor en modo bloqueante. */
+int dsm_send_full_deadline(int fd, const void *buf, size_t len, uint32_t timeout_ms);
+
 /* Lectura garantizada de bloques completos sobre descriptores.
  * dsm_read_full_deadline acota el bloqueo total con poll()+deadline y
  * reintenta EINTR; es la unica ruta de lectura de red del proyecto (no se
@@ -30,7 +36,7 @@ int dsm_read_full_deadline(int fd, void *buf, size_t len, uint32_t timeout_ms);
 /* Conexion TCP con plazo: socket no bloqueante + connect + poll + SO_ERROR y
  * restauracion de las banderas originales. Devuelve el descriptor conectado o
  * DSM_ERR_TIMEOUT / DSM_ERR_NET. No instala timeouts de socket: las lecturas
- * usan dsm_read_full_deadline y las escrituras dsm_send_full. */
+ * usan dsm_read_full_deadline y las escrituras dsm_send_full_deadline. */
 int dsm_connect_timeout(const struct sockaddr_in *addr, uint32_t timeout_ms);
 
 /* Modificación de banderas sobre descriptores */
@@ -39,6 +45,8 @@ int set_nonblock(int fd, bool nonblock);
 
 /* Gestión de UUID persistente en ~/.dsm/<cluster_id>-<hostname>-<tag>.uuid */
 int uuid_load_or_create_file(uint32_t cluster_id, const char *tag, uint8_t out[16]);
+/* UUID efímero con versión 4 y variante RFC 4122. */
+int uuid_generate(uint8_t out[16]);
 void uuid_to_str(const uint8_t uuid[16], char out[37]);
 
 #endif /* DSM_UTIL_H */

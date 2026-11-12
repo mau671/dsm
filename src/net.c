@@ -14,16 +14,34 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
+/* Cierra un descriptor de socket tolerando que ya no sea valido. */
+static void fd_close_quiet(int *fd)
+{
+    if (*fd >= 0) {
+        close(*fd);
+        *fd = -1;
+    }
+}
+
 int net_init(dsm_ctx_t *ctx)
 {
     dsm_net_t *n = &ctx->net;
     n->listen_fd = -1;
-    pthread_mutex_init(&n->pending_mu, NULL);
+    if (pthread_mutex_init(&n->pending_mu, NULL) != 0) {
+        return DSM_ERR_MEM;
+    }
 
     for (uint32_t i = 0; i < MAX_NODES; i++) {
         n->peers[i].slot   = i;
         n->peers[i].out_fd = -1;
-        pthread_mutex_init(&n->peers[i].send_mu, NULL);
+        if (pthread_mutex_init(&n->peers[i].send_mu, NULL) != 0) {
+            /* Solo los mutex ya creados pueden destruirse. */
+            pthread_mutex_destroy(&n->pending_mu);
+            for (uint32_t j = 0; j < i; j++) {
+                pthread_mutex_destroy(&n->peers[j].send_mu);
+            }
+            return DSM_ERR_MEM;
+        }
         atomic_store(&n->peers[i].connected, false);
 
         n->inbound[i].fd   = -1;
@@ -87,7 +105,11 @@ static int pending_complete(dsm_ctx_t *ctx, const msg_header_t *hdr,
         memcpy(pending->rx_payload, payload, hdr->payload_len);
     }
     pending->completed = 1;
-    sem_post(&pending->sem);
+    /* El emisor puede haber agotado el plazo y liberado el semaforo: el
+     * post solo debe ocurrir mientras el mutex garantiza su existencia. */
+    if (sem_post(&pending->sem) != 0) {
+        pending->result = DSM_ERR_NET;
+    }
     pthread_mutex_unlock(&ctx->net.pending_mu);
     return DSM_OK;
 }
@@ -99,8 +121,7 @@ void net_destroy(dsm_ctx_t *ctx)
         pthread_mutex_lock(&n->peers[i].send_mu);
         if (n->peers[i].out_fd >= 0) {
             shutdown(n->peers[i].out_fd, SHUT_RDWR);
-            close(n->peers[i].out_fd);
-            n->peers[i].out_fd = -1;
+            fd_close_quiet(&n->peers[i].out_fd);
         }
         atomic_store(&n->peers[i].connected, false);
         pthread_mutex_unlock(&n->peers[i].send_mu);
@@ -108,8 +129,7 @@ void net_destroy(dsm_ctx_t *ctx)
 
         if (n->inbound[i].fd >= 0) {
             shutdown(n->inbound[i].fd, SHUT_RDWR);
-            close(n->inbound[i].fd);
-            n->inbound[i].fd = -1;
+            fd_close_quiet(&n->inbound[i].fd);
         }
     }
     pthread_mutex_destroy(&n->pending_mu);
@@ -123,12 +143,36 @@ static void *listener_thread_main(void *arg)
     while (atomic_load(&ctx->running)) {
         struct pollfd pfd = { .fd = sfd, .events = POLLIN, .revents = 0 };
         int pr = poll(&pfd, 1, 500);
-        if (pr <= 0) continue;
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            DSM_LOG_ERR("poll sobre el listener fallo: %s", strerror(errno));
+            break;
+        }
+        if (pr == 0) continue;
+        if (pfd.revents & POLLNVAL) {
+            /* El cierre del descriptor de escucha es la senal de apagado. */
+            if (atomic_load(&ctx->running)) {
+                DSM_LOG_ERR("Descriptor de escucha invalido en el listener");
+            }
+            break;
+        }
 
         struct sockaddr_in cli_addr;
         socklen_t clen = sizeof(cli_addr);
         int cfd = accept(sfd, (struct sockaddr *)&cli_addr, &clen);
-        if (cfd < 0) continue;
+        if (cfd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
+                errno == ECONNABORTED) {
+                continue;
+            }
+            /* El socket de escucha dejo de ser utilizable: solo el cierre
+             * externo (net_stop_listener) produce este caso al apagar. */
+            if (atomic_load(&ctx->running)) {
+                DSM_LOG_ERR("accept sobre el listener fallo: %s", strerror(errno));
+                sleep_ms(10);
+            }
+            continue;
+        }
 
         set_cloexec(cfd);
 
@@ -193,14 +237,22 @@ static void *listener_thread_main(void *arg)
                 uint8_t raw_resp[DSM_HDR_LEN];
                 dsm_wire_finish(&resp_hdr, raw_resp, welcome_buf, (uint32_t)wlen);
 
-                dsm_send_full(cfd, raw_resp, DSM_HDR_LEN);
-                if (resp_hdr.status == DSM_ST_OK) {
-                    dsm_send_full(cfd, welcome_buf, wlen);
+                /* Un WELCOME truncado deja al solicitante esperando un
+                 * mensaje incompleto: se cuenta solo si salio entero. */
+                int welcome_ok = (dsm_send_full_deadline(cfd, raw_resp, DSM_HDR_LEN,
+                                                         ctx->cfg.send_timeout_ms) == 0);
+                if (welcome_ok && resp_hdr.status == DSM_ST_OK) {
+                    welcome_ok = (dsm_send_full_deadline(cfd, welcome_buf, wlen,
+                                                         ctx->cfg.send_timeout_ms) == 0);
                 }
-                atomic_fetch_add_explicit(&ctx->ctr.msgs_sent, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&ctx->ctr.bytes_sent, DSM_HDR_LEN + (resp_hdr.status == DSM_ST_OK ? wlen : 0), memory_order_relaxed);
+                if (welcome_ok) {
+                    atomic_fetch_add_explicit(&ctx->ctr.msgs_sent, 1, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&ctx->ctr.bytes_sent, DSM_HDR_LEN + (resp_hdr.status == DSM_ST_OK ? wlen : 0), memory_order_relaxed);
+                } else {
+                    DSM_LOG_WARN("No se pudo enviar WELCOME al solicitante: %s", strerror(errno));
+                }
             }
-            close(cfd);
+            fd_close_quiet(&cfd);
             continue;
         }
 
@@ -208,12 +260,18 @@ static void *listener_thread_main(void *arg)
         uint8_t *payload = NULL;
         if (hdr.payload_len > 0 && hdr.payload_len <= DSM_MAX_PAYLOAD) {
             payload = malloc(hdr.payload_len);
-            if (payload) {
-                if (dsm_read_full_deadline(cfd, payload, hdr.payload_len, ctx->cfg.send_timeout_ms) != DSM_OK) {
-                    free(payload);
-                    close(cfd);
-                    continue;
-                }
+            if (!payload) {
+                /* Sin buffer no se puede consumir la trama: cerrar la conexion
+                 * evita que el emisor quede esperando una respuesta. */
+                DSM_LOG_WARN("Sin memoria para el payload de %u bytes", hdr.payload_len);
+                fd_close_quiet(&cfd);
+                continue;
+            }
+            if (dsm_read_full_deadline(cfd, payload, hdr.payload_len,
+                                       ctx->cfg.send_timeout_ms) != DSM_OK) {
+                free(payload);
+                fd_close_quiet(&cfd);
+                continue;
             }
         }
 
@@ -225,7 +283,7 @@ static void *listener_thread_main(void *arg)
                 pending_complete(ctx, &hdr, payload) == DSM_OK) {
                 free(payload);
                 payload = NULL;
-                close(cfd);
+                fd_close_quiet(&cfd);
                 continue;
             }
             dsm_msg_t msg = { .hdr = hdr, .payload = payload };
@@ -237,10 +295,14 @@ static void *listener_thread_main(void *arg)
                 membership_on_leave(ctx, &msg);
             } else if (hdr.type == MSG_NODE_DOWN) {
                 membership_on_node_down(ctx, &msg);
+            } else if (hdr.type == MSG_QUERY_REQ) {
+                membership_handle_query_fd(ctx, &msg, cfd);
             } else {
                 int enqueue_rc = worker_enqueue(ctx, &msg, payload);
                 if (enqueue_rc == DSM_OK) {
                     payload = NULL; /* Transferencia de propiedad a worker */
+                } else {
+                    DSM_LOG_WARN("No se pudo encolar mensaje tipo %u: %d", hdr.type, enqueue_rc);
                 }
             }
         }
@@ -248,7 +310,7 @@ static void *listener_thread_main(void *arg)
         if (payload) {
             free(payload);
         }
-        close(cfd);
+        fd_close_quiet(&cfd);
     }
     return NULL;
 }
@@ -259,8 +321,11 @@ int net_start_listener(dsm_ctx_t *ctx)
         DSM_LOG_ERR("listen fallo: %s", strerror(errno));
         return DSM_ERR_NET;
     }
-    if (pthread_create(&ctx->net.listener, NULL, listener_thread_main, ctx) != 0) {
-        DSM_LOG_ERR("No se pudo crear hilo listener de red: %s", strerror(errno));
+    int rc = pthread_create(&ctx->net.listener, NULL, listener_thread_main, ctx);
+    if (rc != 0) {
+        /* pthread_create devuelve el codigo de error, no lo publica en errno. */
+        DSM_LOG_ERR("No se pudo crear hilo listener de red: %s", strerror(rc));
+        ctx->net.listener = 0;
         return DSM_ERR_MEM;
     }
     return DSM_OK;
@@ -268,16 +333,25 @@ int net_start_listener(dsm_ctx_t *ctx)
 
 int net_stop_listener(dsm_ctx_t *ctx)
 {
+    int rc = DSM_OK;
     if (ctx->net.listen_fd >= 0) {
         shutdown(ctx->net.listen_fd, SHUT_RDWR);
-        close(ctx->net.listen_fd);
+        /* Un cierre fallido no impide unir el hilo: el apagado continua. */
+        if (close(ctx->net.listen_fd) != 0) {
+            DSM_LOG_WARN("Cierre del socket de escucha fallo: %s", strerror(errno));
+            rc = DSM_ERR_NET;
+        }
         ctx->net.listen_fd = -1;
     }
     if (ctx->net.listener) {
-        pthread_join(ctx->net.listener, NULL);
+        int join_rc = pthread_join(ctx->net.listener, NULL);
+        if (join_rc != 0) {
+            DSM_LOG_ERR("No se pudo unir el hilo listener: %s", strerror(join_rc));
+            rc = DSM_ERR_NET;
+        }
         ctx->net.listener = 0;
     }
-    return DSM_OK;
+    return rc;
 }
 
 int peer_ensure_connected(dsm_ctx_t *ctx, uint32_t slot)
@@ -310,10 +384,18 @@ int peer_ensure_connected(dsm_ctx_t *ctx, uint32_t slot)
     addr.sin_addr.s_addr = ip;
     addr.sin_port        = htons(port);
 
-    int fd = dsm_connect_timeout(&addr, ctx->cfg.connect_timeout_ms);
+    /*
+     * La conexion ocurre dentro de send_mu para que dos emisores no abran
+     * descriptores distintos para el mismo par. El bloqueo esta acotado por
+     * dsm_connect_timeout: el socket es no bloqueante y poll() vence en
+     * connect_timeout_ms, asi que el mutex nunca queda retenido de forma
+     * indefinida. Un plazo de cero se sustituye por el valor por defecto.
+     */
+    uint32_t connect_ms = ctx->cfg.connect_timeout_ms ? ctx->cfg.connect_timeout_ms : 200u;
+    int fd = dsm_connect_timeout(&addr, connect_ms);
     if (fd < 0) {
         pthread_mutex_unlock(&p->send_mu);
-        return DSM_ERR_NET;
+        return (fd == DSM_ERR_TIMEOUT) ? DSM_ERR_TIMEOUT : DSM_ERR_NET;
     }
 
     p->out_fd = fd;
@@ -329,8 +411,7 @@ void peer_mark_down(dsm_ctx_t *ctx, uint32_t slot)
     pthread_mutex_lock(&p->send_mu);
     if (p->out_fd >= 0) {
         shutdown(p->out_fd, SHUT_RDWR);
-        close(p->out_fd);
-        p->out_fd = -1;
+        fd_close_quiet(&p->out_fd);
     }
     atomic_store(&p->connected, false);
     pthread_mutex_unlock(&p->send_mu);
@@ -339,8 +420,11 @@ void peer_mark_down(dsm_ctx_t *ctx, uint32_t slot)
 int dsm_net_send(dsm_ctx_t *ctx, uint32_t dst, const msg_header_t *hdr, const void *payload)
 {
     if (dst >= MAX_NODES) return DSM_ERR_INVALID;
-    if (peer_ensure_connected(ctx, dst) != DSM_OK) {
-        return DSM_ERR_NET;
+    if (hdr->payload_len > 0 && !payload) return DSM_ERR_INVALID;
+
+    int conn_rc = peer_ensure_connected(ctx, dst);
+    if (conn_rc != DSM_OK) {
+        return conn_rc;
     }
 
     dsm_peer_t *p = &ctx->net.peers[dst];
@@ -354,10 +438,14 @@ int dsm_net_send(dsm_ctx_t *ctx, uint32_t dst, const msg_header_t *hdr, const vo
     uint8_t raw_hdr[DSM_HDR_LEN];
     dsm_wire_finish(&h, raw_hdr, payload, hdr->payload_len);
 
-    if (dsm_send_full(p->out_fd, raw_hdr, DSM_HDR_LEN) != 0 ||
-        (payload && hdr->payload_len > 0 && dsm_send_full(p->out_fd, payload, hdr->payload_len) != 0)) {
-        close(p->out_fd);
-        p->out_fd = -1;
+    /* La escritura hereda el plazo de envio: un par que deja de leer no
+     * puede retener send_mu ni el hilo emisor de forma indefinida. */
+    uint32_t send_ms = ctx->cfg.send_timeout_ms ? ctx->cfg.send_timeout_ms : 2000u;
+    if (dsm_send_full_deadline(p->out_fd, raw_hdr, DSM_HDR_LEN, send_ms) != 0 ||
+        (payload && hdr->payload_len > 0 &&
+         dsm_send_full_deadline(p->out_fd, payload, hdr->payload_len, send_ms) != 0)) {
+        shutdown(p->out_fd, SHUT_RDWR);
+        fd_close_quiet(&p->out_fd);
         atomic_store(&p->connected, false);
         pthread_mutex_unlock(&p->send_mu);
         return DSM_ERR_NET;
@@ -372,8 +460,7 @@ int dsm_net_send(dsm_ctx_t *ctx, uint32_t dst, const msg_header_t *hdr, const vo
      * un socket que el receptor ya cerró.
      */
     shutdown(p->out_fd, SHUT_RDWR);
-    close(p->out_fd);
-    p->out_fd = -1;
+    fd_close_quiet(&p->out_fd);
     atomic_store(&p->connected, false);
     pthread_mutex_unlock(&p->send_mu);
     return DSM_OK;
@@ -417,25 +504,22 @@ int net_send_nack(dsm_ctx_t *ctx, uint32_t dst, uint32_t req_id, uint16_t status
     return dsm_net_send(ctx, dst, &hdr, NULL);
 }
 
-int dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
-                 uint32_t tseq, uint8_t access, uint8_t flags,
-                 const void *tx_payload, uint32_t tx_len,
-                 uint16_t *out_status, void *rx_payload, uint32_t *rx_len)
+/* Ejecuta un intento completo de RPC: registra la solicitud pendiente con un
+ * req_id nuevo, envia la trama y espera la respuesta hasta
+ * REQUEST_TIMEOUT_MS. Devuelve DSM_ERR_TIMEOUT o DSM_ERR_NET ante fallos de
+ * transporte, que son los unicos sobre los que tiene sentido reintentar. */
+static int net_rpc_attempt(dsm_ctx_t *ctx, uint32_t dst, uint16_t type,
+                           uint32_t page_id, uint32_t tseq, uint8_t access,
+                           uint8_t flags, const void *tx_payload, uint32_t tx_len,
+                           uint16_t *out_status, void *rx_payload,
+                           uint32_t rx_capacity, uint32_t *rx_len)
 {
-    if (!ctx || dst >= MAX_NODES || tx_len > DSM_MAX_PAYLOAD ||
-        (tx_len > 0 && !tx_payload) || !rx_len) {
-        return DSM_ERR_INVALID;
-    }
-    if (rx_payload == NULL && *rx_len != 0) {
-        return DSM_ERR_INVALID;
-    }
-
     pending_req_t pending;
     memset(&pending, 0, sizeof(pending));
     pending.req_id      = (uint32_t)atomic_fetch_add(&ctx->net.req_counter, 1) + 1u;
     pending.page_id     = page_id;
     pending.rx_payload  = rx_payload;
-    pending.rx_capacity = *rx_len;
+    pending.rx_capacity = rx_capacity;
     pending.result      = DSM_ERR_TIMEOUT;
     if (sem_init(&pending.sem, 0, 0) != 0) {
         return DSM_ERR_MEM;
@@ -461,11 +545,14 @@ int dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
     hdr.access        = access;
     hdr.flags         = flags;
     hdr.epoch         = ctx->memb.epoch;
+    hdr.payload_len   = tx_len;
 
     int send_rc = dsm_net_send(ctx, dst, &hdr, tx_payload);
     if (send_rc != DSM_OK) {
         pending_remove(ctx, &pending);
-        sem_destroy(&pending.sem);
+        if (sem_destroy(&pending.sem) != 0) {
+            DSM_LOG_WARN("sem_destroy de la solicitud %u fallo", pending.req_id);
+        }
         return send_rc;
     }
 
@@ -484,25 +571,93 @@ int dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
     } while (wait_rc != 0 && errno == EINTR);
 
     if (wait_rc != 0) {
+        int wait_errno = errno;
         pending_remove(ctx, &pending);
-        sem_destroy(&pending.sem);
-        return (errno == ETIMEDOUT) ? DSM_ERR_TIMEOUT : DSM_ERR_NET;
+        if (sem_destroy(&pending.sem) != 0) {
+            DSM_LOG_WARN("sem_destroy de la solicitud %u fallo", pending.req_id);
+        }
+        return (wait_errno == ETIMEDOUT) ? DSM_ERR_TIMEOUT : DSM_ERR_NET;
     }
 
     pending_remove(ctx, &pending);
     if (out_status) *out_status = pending.status;
-    *rx_len = pending.rx_len;
     int result = pending.result;
-    sem_destroy(&pending.sem);
+    /* El emisor declara la capacidad del buffer: una respuesta mayor no debe
+     * anunciarse como valida. */
+    if (pending.rx_len > rx_capacity) {
+        result = DSM_ERR_NO_SPACE;
+        pending.rx_len = 0;
+    }
+    *rx_len = pending.rx_len;
+    if (sem_destroy(&pending.sem) != 0) {
+        DSM_LOG_WARN("sem_destroy de la solicitud %u fallo", pending.req_id);
+        if (result == DSM_OK) {
+            result = DSM_ERR_NET;
+        }
+    }
     return result;
 }
+
+int dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
+                 uint32_t tseq, uint8_t access, uint8_t flags,
+                 const void *tx_payload, uint32_t tx_len,
+                 uint16_t *out_status, void *rx_payload, uint32_t *rx_len)
+{
+    if (!ctx || dst >= MAX_NODES || tx_len > DSM_MAX_PAYLOAD ||
+        (tx_len > 0 && !tx_payload) || !rx_len) {
+        return DSM_ERR_INVALID;
+    }
+    if (rx_payload == NULL && *rx_len != 0) {
+        return DSM_ERR_INVALID;
+    }
+
+    /* Solo los fallos de transporte justifican reenviar: una respuesta con
+     * estado distinto de OK es una respuesta del protocolo y llegaria igual
+     * en el siguiente intento. */
+    uint32_t attempts = ctx->cfg.request_retries ? ctx->cfg.request_retries : 1u;
+    uint32_t capacity = *rx_len;
+    int rc = DSM_ERR_NET;
+
+    for (uint32_t attempt = 0; attempt < attempts; attempt++) {
+        if (attempt > 0) {
+            /* Espera exponencial acotada por RECONNECT_MAX_MS; cada reintento
+             * abre un enlace nuevo porque dsm_net_send cierra el descriptor
+             * al terminar cada trama. */
+            uint32_t backoff = ctx->cfg.reconnect_min_ms;
+            for (uint32_t i = 1; i < attempt && backoff < ctx->cfg.reconnect_max_ms; i++) {
+                backoff = (backoff > UINT32_MAX / 2u) ? UINT32_MAX : backoff * 2u;
+            }
+            if (backoff > ctx->cfg.reconnect_max_ms) {
+                backoff = ctx->cfg.reconnect_max_ms;
+            }
+            if (backoff > 0) {
+                sleep_ms(backoff);
+            }
+        }
+
+        *rx_len = capacity;
+        rc = net_rpc_attempt(ctx, dst, type, page_id, tseq, access, flags,
+                             tx_payload, tx_len, out_status, rx_payload,
+                             capacity, rx_len);
+        if (rc != DSM_ERR_TIMEOUT && rc != DSM_ERR_NET) {
+            break;
+        }
+    }
+
+    return rc;
+}
+
+/* Plazo de lectura de una trama cuando el llamador no aporta configuración. */
+#define NET_READ_ONE_TIMEOUT_MS 3000u
 
 int dsm_net_read_one(int fd, uint32_t cluster_id, dsm_msg_t *out, uint8_t **owned)
 {
     if (fd < 0 || !out || !owned) return DSM_ERR_INVALID;
+    /* El llamador libera *owned solo si esta ruta lo asigna. */
+    *owned = NULL;
 
     uint8_t raw_hdr[DSM_HDR_LEN];
-    int rc = dsm_read_full_deadline(fd, raw_hdr, DSM_HDR_LEN, 3000);
+    int rc = dsm_read_full_deadline(fd, raw_hdr, DSM_HDR_LEN, NET_READ_ONE_TIMEOUT_MS);
     if (rc != DSM_OK) return rc;
 
     msg_header_t hdr;
@@ -514,7 +669,7 @@ int dsm_net_read_one(int fd, uint32_t cluster_id, dsm_msg_t *out, uint8_t **owne
         if (hdr.payload_len > DSM_MAX_PAYLOAD) return DSM_ERR_PROTO;
         payload = malloc(hdr.payload_len);
         if (!payload) return DSM_ERR_MEM;
-        rc = dsm_read_full_deadline(fd, payload, hdr.payload_len, 3000);
+        rc = dsm_read_full_deadline(fd, payload, hdr.payload_len, NET_READ_ONE_TIMEOUT_MS);
         if (rc != DSM_OK) {
             free(payload);
             return rc;

@@ -27,7 +27,9 @@ void sleep_ms(uint32_t ms)
     struct timespec ts;
     ts.tv_sec  = (time_t)(ms / 1000);
     ts.tv_nsec = (long)((ms % 1000) * 1000000);
-    nanosleep(&ts, NULL);
+    /* nanosleep se reanuda tras una señal para respetar la espera completa. */
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
 }
 
 int dsm_write_full(int fd, const void *buf, size_t len)
@@ -74,6 +76,69 @@ int dsm_send_full(int fd, const void *buf, size_t len)
         remaining -= (size_t)n;
     }
     return 0;
+}
+
+int dsm_send_full_deadline(int fd, const void *buf, size_t len, uint32_t timeout_ms)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t remaining = len;
+    uint64_t deadline = mono_ms() + timeout_ms;
+    int rc = 0;
+
+    while (remaining > 0) {
+        uint64_t now = mono_ms();
+        if (now >= deadline) {
+            rc = -1;
+            break;
+        }
+
+        int timeout_rem = (int)(deadline - now);
+        struct pollfd pfd = { .fd = fd, .events = POLLOUT, .revents = 0 };
+        int pr = poll(&pfd, 1, timeout_rem);
+
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            rc = -1;
+            break;
+        }
+        if (pr == 0) {
+            rc = -1;
+            break;
+        }
+        if (pfd.revents & POLLNVAL) {
+            rc = -1;
+            break;
+        }
+        if (!(pfd.revents & (POLLOUT | POLLHUP | POLLERR))) {
+            continue;
+        }
+
+        /* La espera ya acoto el bloqueo: MSG_DONTWAIT impide que send() se
+         * duerma si el peer deja de drenar entre poll() y la escritura. */
+        ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            rc = -1;
+            break;
+        }
+        if (n == 0) {
+            rc = -1;
+            break;
+        }
+        p += n;
+        remaining -= (size_t)n;
+    }
+
+    /* El descriptor se entrega en modo bloqueante al resto de la pila. */
+    int flags = fcntl(fd, F_GETFL);
+    if (flags >= 0 && (flags & O_NONBLOCK)) {
+        fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+    }
+    return rc;
 }
 
 int dsm_read_full(int fd, void *buf, size_t len)
@@ -129,7 +194,7 @@ int dsm_read_full_deadline(int fd, void *buf, size_t len, uint32_t timeout_ms)
 
         ssize_t n = read(fd, p, remaining);
         if (n < 0) {
-            if (errno == EINTR) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                 continue;
             }
             return DSM_ERR_NET;
@@ -242,6 +307,16 @@ static int get_random_bytes(void *buf, size_t len)
     return rc;
 }
 
+int uuid_generate(uint8_t out[16])
+{
+    if (get_random_bytes(out, 16) != 0) {
+        return DSM_ERR_MEM;
+    }
+    out[6] = (uint8_t)((out[6] & 0x0F) | 0x40);
+    out[8] = (uint8_t)((out[8] & 0x3F) | 0x80);
+    return DSM_OK;
+}
+
 int uuid_load_or_create_file(uint32_t cluster_id, const char *tag, uint8_t out[16])
 {
     const char *home = getenv("HOME");
@@ -251,7 +326,10 @@ int uuid_load_or_create_file(uint32_t cluster_id, const char *tag, uint8_t out[1
 
     char dir_path[PATH_MAX];
     snprintf(dir_path, sizeof(dir_path), "%s/.dsm", home);
-    mkdir(dir_path, 0700);
+    /* EEXIST es el caso normal; cualquier otro error impide persistir el UUID. */
+    if (mkdir(dir_path, 0700) != 0 && errno != EEXIST) {
+        return DSM_ERR_MEM;
+    }
 
     char hostname[128];
     if (gethostname(hostname, sizeof(hostname)) != 0) {
@@ -283,16 +361,12 @@ int uuid_load_or_create_file(uint32_t cluster_id, const char *tag, uint8_t out[1
         }
     }
 
-    /* Generar nuevo UUID */
-    if (get_random_bytes(out, 16) != 0) {
+    if (uuid_generate(out) != DSM_OK) {
         return DSM_ERR_MEM;
     }
 
-    /* Versión 4 y variante RFC 4122 para ser un UUID formal válido */
-    out[6] = (out[6] & 0x0F) | 0x40;
-    out[8] = (out[8] & 0x3F) | 0x80;
-
-    /* Escribir temporalmente y renombrar atómicamente */
+    /* Escribir en un temporal y renombrar atómicamente: el archivo final
+     * nunca queda a medio escribir aunque el proceso muera. */
     char tmp_path[PATH_MAX];
     int tp_len = snprintf(tmp_path, sizeof(tmp_path), "%.4000s.tmp.%d", file_path, (int)getpid());
     if (tp_len < 0 || (size_t)tp_len >= sizeof(tmp_path)) {
@@ -309,7 +383,11 @@ int uuid_load_or_create_file(uint32_t cluster_id, const char *tag, uint8_t out[1
         unlink(tmp_path);
         return DSM_ERR_MEM;
     }
-    close(wfd);
+    /* Un cierre fallido deja el UUID sin garantizar en disco. */
+    if (close(wfd) != 0) {
+        unlink(tmp_path);
+        return DSM_ERR_MEM;
+    }
 
     if (rename(tmp_path, file_path) != 0) {
         /* Si otro proceso ganó la carrera, leer el que quedó */

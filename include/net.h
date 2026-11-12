@@ -28,7 +28,7 @@ typedef struct dsm_inbound {
     atomic_bool     alive;
 } dsm_inbound_t;
 
-/* Solicitud pendiente de respuesta asíncrona */
+/* Solicitud a la espera de respuesta asíncrona */
 typedef struct dsm_pending {
     uint32_t            req_id;
     uint32_t            page_id;
