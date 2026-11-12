@@ -83,7 +83,10 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext_raw)
     s->access = access;
     s->done   = 0;
 
-    faultq_push(s);
+    if (!faultq_push(s)) {
+        _exit(128 + SIGSEGV);
+    }
+    atomic_fetch_add_explicit(&ctx->ctr.slots_enqueued, 1, memory_order_relaxed);
 
     if (access == DSM_ACCESS_WRITE) {
         atomic_fetch_add_explicit(&ctx->ctr.write_faults, 1, memory_order_relaxed);

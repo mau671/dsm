@@ -177,13 +177,17 @@ bool wire_payload_ok(uint16_t type, uint8_t flags, uint32_t len, uint32_t page_s
         return len >= 12u && len <= DSM_MAX_PAYLOAD &&
                ((len - 12u) % DSM_MEMBERSHIP_WIRE_LEN) == 0;
     case MSG_PAGE_REQUEST:
-    case MSG_GRANT:
     case MSG_DOWNGRADE:
     case MSG_WRITEBACK_ACK:
     case MSG_LOCK_REQ:
     case MSG_LOCK_GRANT:
     case MSG_LOCK_REL:
     case MSG_NACK:
+        return len == 0;
+    case MSG_GRANT:
+        if (flags & DSM_FLAG_HAS_DATA) {
+            return page_size != 0 && len == page_size;
+        }
         return len == 0;
     case MSG_PAGE_DATA:
     case MSG_WRITEBACK:
