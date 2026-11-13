@@ -38,6 +38,8 @@ typedef struct {
 typedef struct dsm_msi {
     dir_entry_t     *dir;
     size_t           cap;
+    /* Último home calculado para cada página (cap entradas). */
+    uint32_t        *home_map;
     uint32_t        *frames_free;
     uint32_t         nframes_free;
     home_wait_t     *wait_pool;
