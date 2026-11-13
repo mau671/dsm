@@ -7,6 +7,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 
 static _Atomic(dsm_ctx_t *) g_ctxp = NULL;
@@ -34,8 +35,14 @@ dsm_ctx_t *dsm_ctx_create_test(void)
         membership_init(ctx);
         net_init(ctx);
         sync_init(ctx);
+        pthread_mutex_init(&ctx->alloc.mu, NULL);
     }
     return ctx;
+}
+
+void dsm_ctx_install_test(dsm_ctx_t *ctx)
+{
+    atomic_store(&g_ctxp, ctx);
 }
 #endif
 
@@ -97,6 +104,7 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
     /* 5. Inicializar estructuras internas */
     membership_init(ctx);
     net_init(ctx);
+    pthread_mutex_init(&ctx->alloc.mu, NULL);
     rc = msi_init(ctx);
     if (rc != DSM_OK) {
         net_destroy(ctx);
@@ -157,7 +165,7 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
     if (rc != DSM_OK) {
         DSM_LOG_ERR("Fallo durante el proceso de descubrimiento y union al cluster: %d", rc);
         /* discovery_join ya creo el hilo listener, que itera mientras
-         * ctx->running sea true. Hay que apagarlo y unirlo ANTES de liberar
+         * ctx->running sea true. Hay que apagarlo y unirlo antes de liberar
          * ctx, o el hilo sigue leyendo ctx->cfg (use-after-free). */
         atomic_store(&ctx->running, false);
         dispatcher_stop(ctx);
@@ -208,7 +216,9 @@ dsm_status_t dsm_finalize(void)
     /* 6. Destruir modulos restantes */
     msi_destroy(ctx);
     sync_destroy(ctx);
+    ring_free(&ctx->ring);
     membership_destroy(ctx);
+    pthread_mutex_destroy(&ctx->alloc.mu);
 
     atomic_store(&g_ctxp, NULL);
     free(ctx);
@@ -233,30 +243,132 @@ dsm_status_t dsm_thread_detach(void)
 
 /* --- Gestión de memoria compartida --- */
 
+/* Paginas que ocupa un bloque de size bytes redondeado al alza. */
+static uint32_t alloc_pages_for(uint64_t size, uint32_t page_size)
+{
+    return (uint32_t)((size + page_size - 1) / page_size);
+}
+
+/* Deja una pagina en cero, inaccesible y sin copia valida antes de devolverla
+ * al espacio libre, de modo que la proxima reserva que la ocupe no observe el
+ * contenido del bloque anterior. */
+static void alloc_page_release(dsm_ctx_t *ctx, uint32_t page)
+{
+    dsm_mem_stripe_lock(&ctx->mem, page);
+    memset(dsm_mem_page_ptr(&ctx->mem, page), 0, ctx->mem.page_size);
+    (void)dsm_mem_set_prot(&ctx->mem, page, PROT_NONE);
+    ctx->mem.local[page].state = DSM_PAGE_I;
+    dsm_mem_stripe_unlock(&ctx->mem, page);
+}
+
+/* Une los huecos contiguos que hayan quedado tras una insercion, de modo que
+ * dos liberaciones consecutivas se comporten como un solo rango libre. */
+static void alloc_holes_normalize(dsm_alloc_t *a)
+{
+    uint32_t out = 0;
+
+    for (uint32_t i = 0; i < a->nholes; i++) {
+        uint32_t prev_end = 0;
+        if (out > 0) {
+            prev_end = a->holes[out - 1].first_page + a->holes[out - 1].npages;
+        }
+        if (out > 0 && prev_end == a->holes[i].first_page) {
+            a->holes[out - 1].npages += a->holes[i].npages;
+            continue;
+        }
+        a->holes[out++] = a->holes[i];
+    }
+    a->nholes = out;
+}
+
+/* Inserta un rango en la lista ordenada por first_page. El llamador comprueba
+ * antes que quede capacidad para una entrada mas. */
+static void alloc_hole_add(dsm_alloc_t *a, uint32_t first, uint32_t npages)
+{
+    uint32_t pos = a->nholes;
+    while (pos > 0 && a->holes[pos - 1].first_page > first) {
+        a->holes[pos] = a->holes[pos - 1];
+        pos--;
+    }
+    a->holes[pos].first_page = first;
+    a->holes[pos].npages     = npages;
+    a->nholes++;
+
+    alloc_holes_normalize(a);
+}
+
+/* Toma npages de la lista de huecos con first-fit. Devuelve la primera pagina
+ * del rango o DSM_PAGE_ID_NONE si ningun hueco alcanza el tamaño pedido; si el
+ * hueco es mayor, el resto queda como hueco de menor tamaño. */
+static uint32_t alloc_hole_take(dsm_alloc_t *a, uint32_t npages)
+{
+    for (uint32_t i = 0; i < a->nholes; i++) {
+        alloc_hole_t *h = &a->holes[i];
+        if (h->npages < npages) continue;
+
+        uint32_t first = h->first_page;
+        if (h->npages == npages) {
+            for (uint32_t j = i + 1; j < a->nholes; j++) {
+                a->holes[j - 1] = a->holes[j];
+            }
+            a->nholes--;
+        } else {
+            h->first_page += npages;
+            h->npages     -= npages;
+        }
+        return first;
+    }
+    return DSM_PAGE_ID_NONE;
+}
+
+/* Entrada libre de la pila de bloques o ALLOC_STACK_MAX si no hay ninguna. */
+static uint32_t alloc_stack_slot(dsm_alloc_t *a)
+{
+    for (uint32_t i = 0; i < a->depth; i++) {
+        if (a->stack[i].npages == 0) return i;
+    }
+    if (a->depth < ALLOC_STACK_MAX) return a->depth;
+    return ALLOC_STACK_MAX;
+}
+
 dsm_status_t dsm_alloc(uint64_t size, void **out)
 {
     dsm_ctx_t *ctx = dsm_ctx_get();
     if (!ctx) return DSM_ERR_NOT_INIT;
     if (!out || size == 0) return DSM_ERR_INVALID;
+    if (ctx->cfg.page_size == 0 || ctx->mem.npages == 0) return DSM_ERR_INVALID;
+    if (size > ctx->mem.view_size) return DSM_ERR_NO_SPACE;
 
-    uint32_t npages = (uint32_t)((size + ctx->cfg.page_size - 1) / ctx->cfg.page_size);
+    uint32_t npages = alloc_pages_for(size, ctx->cfg.page_size);
+    if (npages == 0) return DSM_ERR_NO_SPACE;
 
     pthread_mutex_lock(&ctx->alloc.mu);
-    if (ctx->alloc.next_page + npages > ctx->mem.npages) {
+
+    uint32_t slot = alloc_stack_slot(&ctx->alloc);
+    if (slot == ALLOC_STACK_MAX) {
         pthread_mutex_unlock(&ctx->alloc.mu);
         return DSM_ERR_NO_SPACE;
     }
 
-    uint32_t first = ctx->alloc.next_page;
-    ctx->alloc.next_page += npages;
-    ctx->alloc.alloc_id++;
-
-    if (ctx->alloc.depth < ALLOC_STACK_MAX) {
-        alloc_block_t *b = &ctx->alloc.stack[ctx->alloc.depth++];
-        b->first_page = first;
-        b->npages     = npages;
-        b->alloc_id   = ctx->alloc.alloc_id;
+    uint32_t first = alloc_hole_take(&ctx->alloc, npages);
+    if (first == DSM_PAGE_ID_NONE) {
+        if ((uint64_t)ctx->alloc.next_page + npages > ctx->mem.npages) {
+            pthread_mutex_unlock(&ctx->alloc.mu);
+            return DSM_ERR_NO_SPACE;
+        }
+        first = ctx->alloc.next_page;
+        ctx->alloc.next_page += npages;
     }
+
+    ctx->alloc.alloc_id++;
+    if (slot == ctx->alloc.depth) {
+        ctx->alloc.depth++;
+    }
+    alloc_block_t *b = &ctx->alloc.stack[slot];
+    b->first_page = first;
+    b->npages     = npages;
+    b->alloc_id   = ctx->alloc.alloc_id;
+
     pthread_mutex_unlock(&ctx->alloc.mu);
 
     *out = ctx->mem.view + ((uint64_t)first * ctx->cfg.page_size);
@@ -267,8 +379,49 @@ dsm_status_t dsm_free(void *ptr, uint64_t size)
 {
     dsm_ctx_t *ctx = dsm_ctx_get();
     if (!ctx) return DSM_ERR_NOT_INIT;
-    (void)ptr;
-    (void)size;
+    if (!ptr || size == 0 || size > ctx->mem.view_size) return DSM_ERR_INVALID;
+    if (ctx->cfg.page_size == 0 || ctx->mem.npages == 0) return DSM_ERR_INVALID;
+
+    uintptr_t base = (uintptr_t)ctx->mem.view;
+    uintptr_t addr = (uintptr_t)ptr;
+    if (addr < base || addr - base >= ctx->mem.view_size) return DSM_ERR_INVALID;
+
+    uint64_t off = (uint64_t)(addr - base);
+    if (off % ctx->cfg.page_size != 0) return DSM_ERR_INVALID;
+
+    uint32_t npages = alloc_pages_for(size, ctx->cfg.page_size);
+    uint32_t first  = (uint32_t)(off / ctx->cfg.page_size);
+    if ((uint64_t)first + npages > ctx->mem.npages) return DSM_ERR_INVALID;
+
+    pthread_mutex_lock(&ctx->alloc.mu);
+
+    alloc_block_t *blk = NULL;
+    for (uint32_t i = 0; i < ctx->alloc.depth; i++) {
+        if (ctx->alloc.stack[i].npages != 0 &&
+            ctx->alloc.stack[i].first_page == first) {
+            blk = &ctx->alloc.stack[i];
+            break;
+        }
+    }
+    if (!blk || blk->npages != npages) {
+        pthread_mutex_unlock(&ctx->alloc.mu);
+        return DSM_ERR_INVALID;
+    }
+
+    /* La capacidad se comprueba antes de tocar las paginas: una vez marcadas
+     * como libres, la insercion del rango no puede fallar. */
+    if (ctx->alloc.nholes >= ALLOC_HOLE_MAX) {
+        pthread_mutex_unlock(&ctx->alloc.mu);
+        return DSM_ERR_NO_SPACE;
+    }
+
+    blk->npages = 0;
+    for (uint32_t p = first; p < first + npages; p++) {
+        alloc_page_release(ctx, p);
+    }
+    (void)alloc_hole_add(&ctx->alloc, first, npages);
+
+    pthread_mutex_unlock(&ctx->alloc.mu);
     return DSM_OK;
 }
 
@@ -277,14 +430,22 @@ dsm_status_t dsm_sync(void)
     dsm_ctx_t *ctx = dsm_ctx_get();
     if (!ctx) return DSM_ERR_NOT_INIT;
 
-    /* Persistir todas las páginas que este nodo tenga en estado M */
+    /*
+     * Persistir todas las paginas que este nodo tenga en estado M. Un fallo
+     * en cualquiera de ellas deja el respaldo del home desactualizado, asi que
+     * se propaga al llamador en vez de reportar exito parcial.
+     */
+    dsm_status_t result = DSM_OK;
     for (uint32_t p = 0; p < ctx->mem.npages; p++) {
         page_local_t *loc = dsm_mem_local(&ctx->mem, p);
         if (loc && loc->state == DSM_PAGE_M) {
-            msi_writeback_page(ctx, p);
+            int rc = msi_writeback_page(ctx, p);
+            if (rc != DSM_OK && result == DSM_OK) {
+                result = (dsm_status_t)rc;
+            }
         }
     }
-    return DSM_OK;
+    return result;
 }
 
 /* --- Sincronización distribuida --- */
@@ -293,25 +454,21 @@ dsm_status_t dsm_lock(uint32_t lock_id)
 {
     dsm_ctx_t *ctx = dsm_ctx_get();
     if (!ctx) return DSM_ERR_NOT_INIT;
-    (void)lock_id;
-    return DSM_OK;
+    return (dsm_status_t)sync_lock(ctx, lock_id);
 }
 
 dsm_status_t dsm_unlock(uint32_t lock_id)
 {
     dsm_ctx_t *ctx = dsm_ctx_get();
     if (!ctx) return DSM_ERR_NOT_INIT;
-    (void)lock_id;
-    return DSM_OK;
+    return (dsm_status_t)sync_unlock(ctx, lock_id);
 }
 
 dsm_status_t dsm_barrier(uint32_t barrier_id, uint32_t n)
 {
     dsm_ctx_t *ctx = dsm_ctx_get();
     if (!ctx) return DSM_ERR_NOT_INIT;
-    (void)barrier_id;
-    (void)n;
-    return DSM_OK;
+    return (dsm_status_t)sync_barrier(ctx, barrier_id, n);
 }
 
 /* --- Consultas y diagnósticos --- */
@@ -334,9 +491,12 @@ dsm_status_t dsm_node_count(uint32_t *out)
     uint32_t count = 0;
     pthread_rwlock_rdlock(&ctx->memb.rw);
     for (uint32_t s = 0; s < MAX_NODES; s++) {
-        if (membership_slot_present(ctx, s) && ctx->memb.nodes[s].state != DSM_NODE_DEAD) {
-            count++;
-        }
+        if (!membership_slot_present(ctx, s)) continue;
+        if (ctx->memb.nodes[s].state == DSM_NODE_DEAD) continue;
+        /* Un cliente usa la memoria del cluster pero no la aporta: no cuenta
+         * como nodo del cluster en las consultas. */
+        if (ctx->memb.nodes[s].is_client || ctx->memb.nodes[s].mem_pages == 0) continue;
+        count++;
     }
     pthread_rwlock_unlock(&ctx->memb.rw);
 
@@ -370,6 +530,10 @@ dsm_status_t dsm_stats(dsm_stats_t *out)
     out->bytes_recv             = atomic_load_explicit(&ctx->ctr.bytes_recv, memory_order_relaxed);
     out->invalidations          = atomic_load_explicit(&ctx->ctr.invalidations, memory_order_relaxed);
     out->fault_latency_us_total = atomic_load_explicit(&ctx->ctr.fault_latency_us_total, memory_order_relaxed);
+    out->faults_serviced        = atomic_load_explicit(&ctx->ctr.faults_serviced, memory_order_relaxed);
+    out->fault_latency_us_avg   = (out->faults_serviced == 0)
+                                      ? 0
+                                      : out->fault_latency_us_total / out->faults_serviced;
     out->pending_count          = atomic_load_explicit(&ctx->ctr.pending_count, memory_order_relaxed);
     out->wait_pool_used         = atomic_load_explicit(&ctx->ctr.wait_pool_used, memory_order_relaxed);
     out->slots_enqueued         = atomic_load_explicit(&ctx->ctr.slots_enqueued, memory_order_relaxed);
