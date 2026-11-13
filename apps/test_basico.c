@@ -19,7 +19,9 @@ static void print_stats(const char *label)
 
     printf("%s stats read_faults=%lu write_faults=%lu "
            "pages_m=%lu pages_s=%lu pages_i=%lu "
-           "msgs_sent=%lu msgs_recv=%lu\n",
+           "msgs_sent=%lu msgs_recv=%lu invalidations=%lu "
+           "faults_serviced=%lu fault_latency_us_total=%lu "
+           "fault_latency_us_avg=%lu\n",
            label,
            (unsigned long)stats.read_faults,
            (unsigned long)stats.write_faults,
@@ -27,7 +29,11 @@ static void print_stats(const char *label)
            (unsigned long)stats.pages_s,
            (unsigned long)stats.pages_i,
            (unsigned long)stats.msgs_sent,
-           (unsigned long)stats.msgs_recv);
+           (unsigned long)stats.msgs_recv,
+           (unsigned long)stats.invalidations,
+           (unsigned long)stats.faults_serviced,
+           (unsigned long)stats.fault_latency_us_total,
+           (unsigned long)stats.fault_latency_us_avg);
     fflush(stdout);
 }
 
