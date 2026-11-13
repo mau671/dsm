@@ -1,4 +1,5 @@
 #include "discovery.h"
+#include "dsm.h"
 #include "dsm_internal.h"
 #include "wire.h"
 #include "log.h"
@@ -12,10 +13,85 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/file.h>
+#include <fcntl.h>
+
+/*
+ * Vueltas maximas del reparto de ranuras. Cada vuelta recorre el rango de
+ * puertos una vez y envia un JOIN por par conocido, de modo que el reparto
+ * converge en tantas vueltas como nodos simultaneos haya; el limite solo
+ * acota un caso patologico y lo reporta como error.
+ */
+#define DISCOVERY_RESOLVE_ROUNDS 32u
+
+/* Pausa entre pasadas de la ventana de asentamiento del primer nodo. */
+#define DISCOVERY_SETTLE_STEP_MS 20u
+
+/*
+ * Cerrojo de descubrimiento del cluster.
+ *
+ * El reparto de ranuras es una decision sobre una vista compartida: cuantos mas
+ * nodos la consultan a la vez, mas vueltas necesita para converger. Serializar
+ * el descubrimiento entre los nodos de un mismo equipo convierte un arranque
+ * simultaneo en una secuencia de uniones, de modo que cada nodo ve las ranuras
+ * ya reclamadas y elige la siguiente sin competir. Entre equipos distintos el
+ * cerrojo no aplica y el reparto se resuelve igualmente con el desempate por
+ * UUID y los JOIN rechazados.
+ *
+ * El cerrojo se toma solo durante discovery_join y lo libera el sistema al
+ * cerrar el descriptor, incluso si el proceso muere.
+ */
+static int discovery_lock_acquire(dsm_ctx_t *ctx)
+{
+    char dir[256];
+    const char *home = getenv("HOME");
+    snprintf(dir, sizeof(dir), "%s/.dsm", home ? home : "/tmp");
+
+    char path[320];
+    snprintf(path, sizeof(path), "%s/%08x-%u-%u.lock", dir,
+             ctx->cfg.cluster_id, ctx->cfg.port_min, ctx->cfg.port_max);
+
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return -1; /* sin cerrojo: el reparto sigue por el desempate por UUID */
+    }
+
+    int rc;
+    do {
+        rc = flock(fd, LOCK_EX);
+    } while (rc != 0 && errno == EINTR);
+
+    if (rc != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void discovery_lock_release(int fd)
+{
+    if (fd >= 0) {
+        close(fd);
+    }
+}
 
 int uuid_load_or_create(dsm_ctx_t *ctx, uint8_t out[16])
 {
     const char *tag = getenv("DSM_NODE_TAG");
+
+    /*
+     * Un cliente no representa una identidad estable del cluster: mientras no
+     * se le asigne una etiqueta explicita, cada ejecucion recibe un UUID
+     * efimero. Si reutilizara el archivo del nodo local, el descubrimiento lo
+     * descartaria por duplicado y no podria unirse.
+     */
+    if (ctx->cfg.client_mode && (!tag || tag[0] == '\0')) {
+        if (uuid_generate(out) != DSM_OK) {
+            return DSM_ERR_MEM;
+        }
+        return DSM_OK;
+    }
+
     return uuid_load_or_create_file(ctx->cfg.cluster_id, tag, out);
 }
 
@@ -41,10 +117,19 @@ int discovery_bind_first_free(dsm_ctx_t *ctx)
         addr.sin_port        = htons(port);
 
         if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-            ctx->net.listen_fd   = fd;
-            ctx->net.listen_port = port;
-            DSM_LOG_INFO("Puerto de escucha asignado localmente: %u", port);
-            return DSM_OK;
+            /*
+             * SO_REUSEADDR permite que dos sockets se enlacen al mismo puerto
+             * mientras ninguno este escuchando, de modo que dos nodos que
+             * arrancan a la vez pueden salir del bind con el mismo puerto. El
+             * listen es lo que reserva el puerto de forma exclusiva: si falla,
+             * otro proceso lo gano y se prueba el siguiente.
+             */
+            if (listen(fd, 128) == 0) {
+                ctx->net.listen_fd   = fd;
+                ctx->net.listen_port = port;
+                DSM_LOG_INFO("Puerto de escucha asignado localmente: %u", port);
+                return DSM_OK;
+            }
         }
 
         close(fd);
@@ -60,8 +145,7 @@ static int probe_peer(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t 
     int fd = dsm_connect_timeout(addr, ctx->cfg.connect_timeout_ms);
     if (fd < 0) return DSM_ERR_NET;
 
-    /* Enviar mensaje HELLO: 20 bytes (uuid[16] + raw_hash[4]) */
-    uint8_t hello_payload[20];
+    /* Enviar mensaje HELLO: 20 bytes (uuid[16] + raw_hash[4]) */    uint8_t hello_payload[20];
     memcpy(hello_payload, ctx->memb.self_uuid, 16);
     uint32_t hash_net = htonl(ctx->cfg.raw_hash);
     memcpy(hello_payload + 16, &hash_net, 4);
@@ -84,8 +168,7 @@ static int probe_peer(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t 
         return DSM_ERR_NET;
     }
 
-    /* Recibir respuesta WELCOME */
-    uint8_t rx_hdr_buf[DSM_HDR_LEN];
+    /* Recibir respuesta WELCOME */    uint8_t rx_hdr_buf[DSM_HDR_LEN];
     if (dsm_read_full_deadline(fd, rx_hdr_buf, DSM_HDR_LEN, ctx->cfg.discovery_timeout_ms) != DSM_OK) {
         close(fd);
         return DSM_ERR_NET;
@@ -138,7 +221,137 @@ static int probe_peer(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t 
     return (unpack_rc == DSM_OK) ? DSM_OK : DSM_ERR_PROTO;
 }
 
-int discovery_scan(dsm_ctx_t *ctx, welcome_t *out)
+/*
+ * Reclamacion de ranura observada en una pasada de escaneo.
+ *
+ * 'seen' evita contar dos veces al mismo nodo cuando PEER_HOSTS resuelve varias
+ * direcciones al mismo equipo. 'claims' reune la ranura que publica cada par
+ * en su WELCOME: es la vista con la que se decide el desempate por UUID.
+ */
+typedef struct {
+    uint8_t  uuid[16];
+    uint32_t slot;
+    uint32_t ip;      /* orden de red */
+    uint16_t port;    /* orden de host */
+} slot_claim_t;
+
+/* Direccion de escucha de un par descubierto y la ranura que publica. */
+typedef struct {
+    uint8_t  uuid[16];
+    uint32_t ip;      /* orden de red */
+    uint16_t port;    /* orden de host */
+    uint32_t slot;    /* ranura que el par publica en su tabla */
+} peer_ep_t;
+
+typedef struct {
+    welcome_t   *first;
+    bool         capture_first;
+    bool         have_first;
+    uint32_t     peers;
+    uint64_t     max_epoch;
+    bool         merge;
+    uint8_t      seen[MAX_NODES][16];
+    slot_claim_t claims[MAX_NODES];
+    uint32_t     nclaims;
+    peer_ep_t    ep[MAX_NODES];
+    uint32_t     nep;
+} discovery_walk_t;
+
+/*
+ * Registra la reclamacion de ranura de un par.
+ *
+ * Solo cuenta la fila que el par publica de si mismo: es la unica que el nodo
+ * garantiza, porque la escribio tras obtener el visto bueno de sus pares. Las
+ * filas de terceros que viajan en el WELCOME son vistas que pueden estar
+ * obsoletas, y usarlas como reclamacion bloquearia ranuras de nodos que ya no
+ * las ocupan.
+ */
+static void discovery_record_claim(dsm_ctx_t *ctx, discovery_walk_t *walk,
+                                  const welcome_t *w)
+{
+    if (memcmp(w->origin_uuid, ctx->memb.self_uuid, 16) == 0) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < walk->nclaims; i++) {
+        if (memcmp(walk->claims[i].uuid, w->origin_uuid, 16) == 0) {
+            return;
+        }
+    }
+    if (walk->nclaims >= MAX_NODES) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < w->count; i++) {
+        const membership_wire_t *m = &w->members[i];
+        if (memcmp(m->uuid, w->origin_uuid, 16) != 0) {
+            continue;
+        }
+
+        slot_claim_t *c = &walk->claims[walk->nclaims++];
+        memcpy(c->uuid, m->uuid, 16);
+        c->slot = m->slot;
+        c->ip   = m->ip;
+        c->port = m->port;
+        return;
+    }
+}
+
+static int discovery_visit_peer(dsm_ctx_t *ctx, const welcome_t *w,
+                                const struct sockaddr_in *addr,
+                                discovery_walk_t *walk)
+{
+    for (uint32_t i = 0; i < walk->peers && i < MAX_NODES; i++) {
+        if (memcmp(walk->seen[i], w->origin_uuid, 16) == 0) {
+            return DSM_OK;
+        }
+    }
+
+    if (walk->peers < MAX_NODES) {
+        memcpy(walk->seen[walk->peers], w->origin_uuid, 16);
+    }
+    walk->peers++;
+
+    if (walk->nep < MAX_NODES) {
+        peer_ep_t *ep = &walk->ep[walk->nep++];
+        memcpy(ep->uuid, w->origin_uuid, 16);
+        ep->ip   = addr->sin_addr.s_addr;
+        ep->port = ntohs(addr->sin_port);
+        ep->slot = DSM_SLOT_NONE;
+        for (uint32_t i = 0; i < w->count; i++) {
+            if (memcmp(w->members[i].uuid, w->origin_uuid, 16) == 0) {
+                ep->slot = w->members[i].slot;
+                break;
+            }
+        }
+    }
+
+    discovery_record_claim(ctx, walk, w);
+
+    if (w->epoch > walk->max_epoch) {
+        walk->max_epoch = w->epoch;
+    }
+    if (walk->merge) {
+        membership_merge_wire(&ctx->memb, w);
+    }
+    if (walk->capture_first && !walk->have_first) {
+        *walk->first = *w;
+        walk->have_first = true;
+    }
+    return DSM_OK;
+}
+
+/*
+ * Recorre una vez todas las direcciones de PEER_HOSTS y todos los puertos del
+ * rango asignado. Cada par que responde se entrega a discovery_visit_peer, de
+ * modo que el escaneo completo deja la tabla local fusionada con todos los
+ * pares alcanzables y no solo con el primero.
+ *
+ * Un par con la tabla vacia cuenta como par vivo aunque no aporte ninguna
+ * reclamacion de ranura: acaba de abrir su listener y publica su reclamo en
+ * discovery_join.
+ */
+static int discovery_walk(dsm_ctx_t *ctx, discovery_walk_t *walk)
 {
     dsm_config_t *cfg = &ctx->cfg;
 
@@ -167,28 +380,97 @@ int discovery_scan(dsm_ctx_t *ctx, welcome_t *out)
             welcome_t w;
             int pr = probe_peer(ctx, &addr, &w);
             if (pr == DSM_ERR_CONFIG) {
-                DSM_LOG_ERR("probe_peer devolvio DSM_ERR_CONFIG en %s:%u", cfg->peer_hosts[h], port);
+                DSM_LOG_ERR("probe_peer devolvio DSM_ERR_CONFIG en %s:%u",
+                            cfg->peer_hosts[h], port);
                 return DSM_ERR_CONFIG;
             }
-            if (pr == DSM_OK) {
-                /* Descartar si el par tiene nuestro mismo UUID */
-                if (memcmp(w.origin_uuid, ctx->memb.self_uuid, 16) == 0) {
-                    continue;
-                }
-                *out = w;
-                DSM_LOG_INFO("Par descubierto en %s:%u (epoch=%lu, nodos=%u)",
-                             cfg->peer_hosts[h], port, (unsigned long)w.epoch, w.count);
-                return DSM_OK;
+            if (pr != DSM_OK) {
+                continue;
+            }
+
+            /*
+             * La membresia identifica a cada nodo por su UUID, de modo que dos
+             * procesos con el mismo UUID (mismo archivo de identidad, puerto
+             * distinto) no se pueden distinguir entre si. Ese caso se reporta
+             * en lugar de ignorar al par: ignorarlo deja a los dos procesos
+             * creyendose el primer nodo del cluster.
+             */
+            if (memcmp(w.origin_uuid, ctx->memb.self_uuid, 16) == 0) {
+                char own_uuid[37];
+                uuid_to_str(w.origin_uuid, own_uuid);
+                DSM_LOG_ERR("Otro proceso escucha en %s:%u con el mismo UUID (%s); "
+                            "cada nodo necesita un DSM_NODE_TAG distinto",
+                            cfg->peer_hosts[h], port, own_uuid);
+                return DSM_ERR_CONFIG;
+            }
+
+            int rc = discovery_visit_peer(ctx, &w, &addr, walk);
+            if (rc != DSM_OK) {
+                return rc;
             }
         }
     }
 
-    return DSM_ERR_NOT_FOUND;
+    return DSM_OK;
 }
 
-int discovery_send_join_all(dsm_ctx_t *ctx, const welcome_t *w, uint16_t *status)
+int discovery_scan(dsm_ctx_t *ctx, welcome_t *out)
+{
+    discovery_walk_t walk;
+    memset(&walk, 0, sizeof(walk));
+    walk.first         = out;
+    walk.capture_first = true;
+
+    int rc = discovery_walk(ctx, &walk);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+    if (!walk.have_first) {
+        return DSM_ERR_NOT_FOUND;
+    }
+
+    DSM_LOG_INFO("Par descubierto (epoch=%lu, nodos=%u)",
+                 (unsigned long)out->epoch, out->count);
+    return DSM_OK;
+}
+
+/*
+ * Pasada de escaneo con fusion: deja en la membresia local la union de las
+ * tablas de todos los pares alcanzables y devuelve en 'walk' cuantos pares
+ * distintos respondieron y que ranuras reclamaron. 'max_epoch' acumula la
+ * epoca mayor observada entre todas las pasadas.
+ */
+static int discovery_pass(dsm_ctx_t *ctx, discovery_walk_t *walk, uint64_t *max_epoch)
+{
+    memset(walk, 0, sizeof(*walk));
+    walk->merge     = true;
+    walk->max_epoch = *max_epoch;
+
+    int rc = discovery_walk(ctx, walk);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+
+    *max_epoch = walk->max_epoch;
+    return DSM_OK;
+}
+
+/*
+ * Envia un JOIN a cada par alcanzable en la pasada y espera su JOIN_ACK o
+ * NACK.
+ *
+ * Los destinos salen de las direcciones escaneadas y no de la tabla local: un
+ * nodo que llega a la vez puede haber publicado una ranura que esta tabla aun no
+ * registra, y sin el JOIN ese par no sabria que su ranura esta disputada.
+ * 'acked' cuenta las respuestas favorables; 'status' conserva el primer rechazo
+ * y lo decide el par, que es la unica autoridad sobre su propia tabla.
+ */
+static int discovery_send_join_all(dsm_ctx_t *ctx, const discovery_walk_t *walk,
+                                   uint16_t *status, uint32_t *acked)
 {
     *status = DSM_ST_OK;
+    *acked  = 0;
+
     membership_wire_t my_wire;
     memset(&my_wire, 0, sizeof(my_wire));
     memcpy(my_wire.uuid, ctx->memb.self_uuid, 16);
@@ -197,20 +479,26 @@ int discovery_send_join_all(dsm_ctx_t *ctx, const welcome_t *w, uint16_t *status
     my_wire.slot        = (uint8_t)ctx->memb.self_slot;
     my_wire.state       = DSM_NODE_ALIVE;
     my_wire.incarnation = 1;
-    my_wire.mem_pages   = (uint32_t)(ctx->cfg.node_mem / ctx->cfg.page_size);
+    /* El JOIN publica la memoria aportada: un cliente no aporta ninguna y el
+     * campo viaja en cero, que es como los pares lo reconocen. */
+    my_wire.mem_pages   = ctx->cfg.client_mode
+                              ? 0u
+                              : (uint32_t)(ctx->cfg.node_mem / ctx->cfg.page_size);
 
     uint8_t join_payload[DSM_MEMBERSHIP_WIRE_LEN];
     dsm_pack_membership(&my_wire, join_payload);
 
-    for (uint32_t i = 0; i < w->count; i++) {
-        const membership_wire_t *m = &w->members[i];
-        if (m->slot == ctx->memb.self_slot) continue;
+    for (uint32_t i = 0; i < walk->nep; i++) {
+        const peer_ep_t *ep = &walk->ep[i];
+        if (memcmp(ep->uuid, ctx->memb.self_uuid, 16) == 0) {
+            continue;
+        }
 
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = m->ip;
-        addr.sin_port        = htons(m->port);
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = ep->ip;
+        addr.sin_port        = htons(ep->port);
 
         int fd = dsm_connect_timeout(&addr, ctx->cfg.connect_timeout_ms);
         if (fd < 0) {
@@ -224,8 +512,8 @@ int discovery_send_join_all(dsm_ctx_t *ctx, const welcome_t *w, uint16_t *status
         hdr.proto_version = DSM_PROTO_VERSION;
         hdr.type          = MSG_JOIN;
         hdr.src_slot      = ctx->memb.self_slot;
-        hdr.dst_slot      = m->slot;
-        hdr.epoch         = w->epoch;
+        hdr.dst_slot      = ep->slot;
+        hdr.epoch         = ctx->memb.epoch;
         hdr.payload_len   = DSM_MEMBERSHIP_WIRE_LEN;
 
         uint8_t raw_hdr[DSM_HDR_LEN];
@@ -239,24 +527,445 @@ int discovery_send_join_all(dsm_ctx_t *ctx, const welcome_t *w, uint16_t *status
 
         /* Esperar JOIN_ACK o NACK */
         uint8_t rx_hdr_buf[DSM_HDR_LEN];
-        if (dsm_read_full_deadline(fd, rx_hdr_buf, DSM_HDR_LEN, ctx->cfg.request_timeout_ms) == DSM_OK) {
+        int read_rc = dsm_read_full_deadline(fd, rx_hdr_buf, DSM_HDR_LEN,
+                                             ctx->cfg.discovery_timeout_ms);
+        if (read_rc == DSM_OK) {
             msg_header_t rx_hdr;
             if (dsm_wire_unpack(rx_hdr_buf, &rx_hdr) == DSM_OK) {
-                if (rx_hdr.type == MSG_NACK && rx_hdr.status == DSM_ST_SLOT_TAKEN) {
-                    *status = DSM_ST_SLOT_TAKEN;
-                    close(fd);
-                    return DSM_OK;
-                }
-                if (rx_hdr.type == MSG_JOIN_ACK) {
+                if (rx_hdr.type == MSG_NACK) {
+                    if (*status == DSM_ST_OK) {
+                        *status = rx_hdr.status;
+                    }
+                } else if (rx_hdr.type == MSG_JOIN_ACK) {
+                    (*acked)++;
+                    pthread_rwlock_wrlock(&ctx->memb.rw);
                     if (rx_hdr.epoch > ctx->memb.epoch) {
                         ctx->memb.epoch = rx_hdr.epoch;
                     }
+                    pthread_rwlock_unlock(&ctx->memb.rw);
                 }
             }
         }
         close(fd);
     }
 
+    return DSM_OK;
+}
+
+/* Reclamacion de menor UUID para 'slot' dentro de una pasada, o NULL si nadie
+ * la pide. Varios nodos pueden reclamar la misma ranura a la vez, y el
+ * desempate solo es determinista si se compara contra el menor de ellos. */
+static const slot_claim_t *walk_claim_for_slot(const discovery_walk_t *walk,
+                                               uint32_t slot)
+{
+    const slot_claim_t *best = NULL;
+
+    for (uint32_t i = 0; i < walk->nclaims; i++) {
+        const slot_claim_t *c = &walk->claims[i];
+        if (c->slot != slot) {
+            continue;
+        }
+        if (!best || memcmp(c->uuid, best->uuid, 16) < 0) {
+            best = c;
+        }
+    }
+    return best;
+}
+
+static bool uuid_less(const uint8_t a[16], const uint8_t b[16])
+{
+    return memcmp(a, b, 16) < 0;
+}
+
+/* Ranura que la tabla local asigno a 'uuid', o DSM_SLOT_NONE si no figura. */
+static uint32_t membership_slot_of_uuid(dsm_ctx_t *ctx, const uint8_t uuid[16])
+{
+    uint32_t found = DSM_SLOT_NONE;
+
+    pthread_rwlock_rdlock(&ctx->memb.rw);
+    for (uint32_t s = 0; s < MAX_NODES; s++) {
+        if (!membership_slot_present(ctx, s)) continue;
+        if (memcmp(ctx->memb.nodes[s].uuid, uuid, 16) != 0) continue;
+        found = s;
+        break;
+    }
+    pthread_rwlock_unlock(&ctx->memb.rw);
+    return found;
+}
+
+/* Ranura 's' ocupada por otro nodo vivo en la tabla local. */
+static bool slot_occupied_by_other(dsm_ctx_t *ctx, uint32_t s)
+{
+    bool occupied = false;
+
+    pthread_rwlock_rdlock(&ctx->memb.rw);
+    if (membership_slot_present(ctx, s) &&
+        ctx->memb.nodes[s].state != DSM_NODE_DEAD &&
+        memcmp(ctx->memb.nodes[s].uuid, ctx->memb.self_uuid, 16) != 0) {
+        occupied = true;
+    }
+    pthread_rwlock_unlock(&ctx->memb.rw);
+    return occupied;
+}
+
+/* Ranura propia y epoca bajo el candado de la tabla. */
+static uint32_t membership_self_slot(dsm_ctx_t *ctx)
+{
+    uint32_t slot;
+
+    pthread_rwlock_rdlock(&ctx->memb.rw);
+    slot = ctx->memb.self_slot;
+    pthread_rwlock_unlock(&ctx->memb.rw);
+    return slot;
+}
+
+/*
+ * Ranura que este nodo adopta buscando desde la primera, saltando las que
+ * 'rejected' marca como rechazadas por un par confirmado.
+ *
+ * Una ranura reclamada por otro nodo no se adopta: el reclamo es la prueba de
+ * que su titular la esta usando, y pisarlo obligaria a renumerar dos nodos. La
+ * ranura propia se conserva si nadie la reclama, de modo que un nodo solo no
+ * paga ninguna reubicacion.
+ */
+static uint32_t discovery_pick_slot(dsm_ctx_t *ctx, const discovery_walk_t *walk,
+                                    const bool *rejected)
+{
+    uint32_t max_nodes = ctx->cfg.max_runtime_nodes;
+    if (max_nodes > MAX_NODES) {
+        max_nodes = MAX_NODES;
+    }
+
+    uint32_t self = membership_self_slot(ctx);
+
+    for (uint32_t s = 0; s < max_nodes; s++) {
+        if (rejected && rejected[s]) {
+            continue;
+        }
+        if (walk_claim_for_slot(walk, s) != NULL) {
+            continue;
+        }
+        if (s == self) {
+            return s;
+        }
+        if (slot_occupied_by_other(ctx, s)) {
+            continue;
+        }
+        return s;
+    }
+
+    return DSM_SLOT_NONE;
+}
+
+/*
+ * Ventana de asentamiento del primer nodo.
+ *
+ * Un nodo que no ve ningun par publica su reclamo de la ranura 0 y vuelve a
+ * escanear hasta que vence discovery_timeout_ms. La ventana cubre el caso de
+ * dos nodos que abren su listener casi a la vez: el segundo publica su propio
+ * reclamo dentro de la ventana del primero y el desempate por UUID ve a los dos
+ * candidatos. La espera termina en cuanto un par responde, y un nodo solo paga
+ * como maximo discovery_timeout_ms. La correccion no depende de esta ventana:
+ * discovery_resolve_slots repara cualquier reclamo que aparezca despues.
+ */
+static int discovery_settle(dsm_ctx_t *ctx, discovery_walk_t *walk,
+                            uint64_t *max_epoch)
+{
+    uint64_t deadline = mono_ms() + ctx->cfg.discovery_timeout_ms;
+
+    for (;;) {
+        int rc = discovery_pass(ctx, walk, max_epoch);
+        if (rc != DSM_OK) {
+            return rc;
+        }
+        if (walk->peers > 0) {
+            return DSM_OK;
+        }
+
+        uint64_t now = mono_ms();
+        if (now >= deadline) {
+            return DSM_OK;
+        }
+        uint64_t remaining = deadline - now;
+        sleep_ms((uint32_t)(remaining < DISCOVERY_SETTLE_STEP_MS
+                                ? remaining
+                                : DISCOVERY_SETTLE_STEP_MS));
+    }
+}
+
+/* Todos los pares alcanzables publicaron su propia ranura y este nodo la
+ * registra: la vista local es la del cluster y los latidos encuentran entrada
+ * en ambos lados. */
+static bool discovery_converged(dsm_ctx_t *ctx, const discovery_walk_t *walk)
+{
+    for (uint32_t i = 0; i < walk->nep; i++) {
+        if (walk->ep[i].slot == DSM_SLOT_NONE) {
+            return false; /* el par aun no publica su reclamacion */
+        }
+        uint32_t s = membership_slot_of_uuid(ctx, walk->ep[i].uuid);
+        if (s == DSM_SLOT_NONE || s != walk->ep[i].slot) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Espera a que la vista local coincida con la de los pares alcanzables.
+ *
+ * Un nodo que arranca mientras el resto sigue escaneando ve pares cuyo WELCOME
+ * todavia no incluye su propia ranura. Esa tabla no aporta nada a la fusion y,
+ * si el nodo termina su union en ese momento, se queda con una vista minima
+ * hasta el siguiente descubrimiento. La espera vuelve a escanear hasta que cada
+ * par publica su ranura y esta queda registrada aqui, y esta acotada por dos
+ * veces discovery_timeout_ms para que un par que se cae no retrase el arranque.
+ */
+static int discovery_converge(dsm_ctx_t *ctx, uint64_t *max_epoch)
+{
+    uint64_t deadline = mono_ms() + 2u * ctx->cfg.discovery_timeout_ms;
+    discovery_walk_t walk;
+
+    for (;;) {
+        int rc = discovery_pass(ctx, &walk, max_epoch);
+        if (rc != DSM_OK) {
+            return rc;
+        }
+        if (walk.nep == 0 || discovery_converged(ctx, &walk)) {
+            return DSM_OK;
+        }
+
+        uint64_t now = mono_ms();
+        if (now >= deadline) {
+            DSM_LOG_WARN("La vista local no convergio con %u par(es) en %u ms",
+                         walk.nep, 2u * ctx->cfg.discovery_timeout_ms);
+            return DSM_OK;
+        }
+        sleep_ms(DISCOVERY_SETTLE_STEP_MS);
+    }
+}
+
+/*
+ * Reparto definitivo de la ranura propia.
+ *
+ * Cada vuelta reune la tabla de todos los pares alcanzables y envia un JOIN con
+ * la ranura propia. Los dos lados aplican el mismo desempate por UUID:
+ *
+ *  - Una reclamacion rival de UUID menor se cede en el acto. La cesion la
+ *    ejecuta siempre este hilo, de modo que la ranura propia tiene un unico
+ *    escritor.
+ *  - Una reclamacion rival de UUID mayor se mantiene: su titular responde BUSY
+ *    mientras su reparto es provisional y cede en su propia vuelta; cuando ya
+ *    confirmo el reparto responde SLOT_TAKEN y es este nodo el que repliega su
+ *    reclamacion.
+ *
+ * 'floor' solo avanza: una ranura cedida o rechazada no se vuelve a pedir, de
+ * modo que la busqueda es monotona y el bucle no puede oscilar entre dos
+ * ranuras. El reparto termina cuando los pares alcanzables registraron la
+ * ranura propia o cuando no queda ninguno.
+ */
+static int discovery_resolve_slots(dsm_ctx_t *ctx, uint32_t *peers_out)
+{
+    dsm_membership_t *m = &ctx->memb;
+    bool rejected[MAX_NODES];
+    memset(rejected, 0, sizeof(rejected));
+
+    for (uint32_t round = 0; round < DISCOVERY_RESOLVE_ROUNDS; round++) {
+        uint64_t max_epoch = m->epoch;
+        discovery_walk_t walk;
+        int rc = discovery_pass(ctx, &walk, &max_epoch);
+        if (rc != DSM_OK) {
+            return rc;
+        }
+        if (max_epoch > m->epoch) {
+            m->epoch = max_epoch;
+        }
+
+        uint32_t self = membership_self_slot(ctx);
+        bool cede = false;
+
+        const slot_claim_t *rival = walk_claim_for_slot(&walk, self);
+        if (rival && uuid_less(rival->uuid, m->self_uuid)) {
+            char rival_uuid[37];
+            uuid_to_str(rival->uuid, rival_uuid);
+            DSM_LOG_INFO("Ranura %u reclamada por el nodo %s (UUID menor); se cede",
+                         self, rival_uuid);
+            cede = true;
+        } else {
+            uint16_t status = DSM_ST_OK;
+            uint32_t acked = 0;
+            rc = discovery_send_join_all(ctx, &walk, &status, &acked);
+            if (rc != DSM_OK) {
+                return rc;
+            }
+
+            if (walk.nep == 0) {
+                /* Sin pares alcanzables la ranura no tiene con quien
+                 * confirmarse: el nodo queda como unico miembro. */
+                *peers_out = 0;
+                return DSM_OK;
+            }
+            if (acked >= walk.nep) {
+                /* Todos los pares alcanzables registraron la ranura propia, de
+                 * modo que los latidos encuentran entrada en ambos lados y la
+                 * tabla converge sin depender de un nuevo escaneo. */
+                for (uint32_t i = 0; i < walk.nep; i++) {
+                    uint32_t s = membership_slot_of_uuid(ctx, walk.ep[i].uuid);
+                    if (s != DSM_SLOT_NONE) {
+                        peer_ensure_connected(ctx, s);
+                    }
+                }
+                *peers_out = walk.peers;
+                return DSM_OK;
+            }
+            if (status == DSM_ST_BUSY) {
+                /* El titular de la ranura aun no confirmo su reparto y la cede
+                 * en su propia vuelta; se le da tiempo a completarla. */
+                sleep_ms(DISCOVERY_SETTLE_STEP_MS);
+                continue;
+            }
+            if (status == DSM_ST_NO_SPACE) {
+                DSM_LOG_ERR("El cluster no tiene ranuras libres");
+                return DSM_ERR_NO_SPACE;
+            }
+            if (status != DSM_ST_OK && status != DSM_ST_SLOT_TAKEN) {
+                DSM_LOG_ERR("Rechazo inesperado al solicitar la ranura %u: %u",
+                            self, status);
+                return DSM_ERR_PROTO;
+            }
+            /* Un par confirmado rechazo la ranura: se descarta para siempre,
+             * porque volver a pedirla solo repite el intercambio. */
+            rejected[self] = true;
+            cede = true;
+        }
+
+        if (!cede) {
+            return DSM_ERR_BUSY;
+        }
+
+        uint32_t next = discovery_pick_slot(ctx, &walk, rejected);
+        if (next == DSM_SLOT_NONE) {
+            DSM_LOG_ERR("No hay slots libres en el cluster");
+            return DSM_ERR_NO_SPACE;
+        }
+        DSM_LOG_INFO("Ranura %u no disponible; se solicita la ranura %u", self, next);
+        membership_claim_slot(ctx, next);
+    }
+
+    DSM_LOG_ERR("El reparto de ranuras no convergio tras %u vueltas",
+                (unsigned)DISCOVERY_RESOLVE_ROUNDS);
+    return DSM_ERR_BUSY;
+}
+
+/* Hay al menos un miembro del cluster que aporta memoria y puede custodiar
+ * páginas. Un cliente solo puede operar contra ese cluster: el anillo necesita
+ * al menos un nodo con memoria. Un nodo completo cuenta por si mismo aunque su
+ * ranura todavia no figure en la tabla. */
+static bool membership_has_memory_node(dsm_ctx_t *ctx)
+{
+    if (!ctx->cfg.client_mode) {
+        return true;
+    }
+
+    dsm_membership_t *m = &ctx->memb;
+    bool found = false;
+
+    pthread_rwlock_rdlock(&m->rw);
+    for (uint32_t s = 0; s < MAX_NODES; s++) {
+        if (!membership_slot_present(ctx, s)) continue;
+        if (m->nodes[s].state == DSM_NODE_DEAD) continue;
+        if (m->nodes[s].is_client || m->nodes[s].mem_pages == 0) continue;
+        found = true;
+        break;
+    }
+    pthread_rwlock_unlock(&m->rw);
+    return found;
+}
+
+/* Cuerpo de discovery_join, con el cerrojo de descubrimiento ya tomado. */
+static int discovery_join_locked(dsm_ctx_t *ctx)
+{
+    dsm_membership_t *m = &ctx->memb;
+    int rc;
+
+    atomic_store(&m->claim_pending, true);
+
+    uint64_t max_epoch = 0;
+    discovery_walk_t walk;
+    rc = discovery_pass(ctx, &walk, &max_epoch);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+
+    if (walk.peers == 0) {
+        if (ctx->cfg.client_mode) {
+            /* Un cliente no puede asumir el rol de primer nodo: no aporta
+             * memoria y ninguna página tendria custodio. Se le concede la
+             * misma ventana de asentamiento que a un nodo para que un par que
+             * arranca a la vez alcance a publicar su tabla. */
+            rc = discovery_settle(ctx, &walk, &max_epoch);
+            if (rc != DSM_OK) {
+                return rc;
+            }
+        } else {
+            DSM_LOG_INFO("No se detectaron pares activos: se reclama la ranura 0 y se "
+                         "verifica que siga libre durante %u ms",
+                         ctx->cfg.discovery_timeout_ms);
+            if (max_epoch >= m->epoch) {
+                m->epoch = max_epoch + 1;
+            }
+            membership_claim_slot(ctx, 0);
+
+            rc = discovery_settle(ctx, &walk, &max_epoch);
+            if (rc != DSM_OK) {
+                return rc;
+            }
+        }
+    }
+
+    if (!membership_has_memory_node(ctx)) {
+        if (ctx->cfg.client_mode) {
+            DSM_LOG_ERR("modo cliente: no se encontro ningun nodo con memoria en el cluster");
+            return DSM_ERR_NO_SPACE;
+        }
+        DSM_LOG_ERR("No hay ningun nodo con memoria en el cluster");
+        return DSM_ERR_NO_SPACE;
+    }
+
+    if (max_epoch >= m->epoch) {
+        m->epoch = max_epoch + 1;
+    }
+
+    uint32_t peers = walk.peers;
+    uint32_t slot = discovery_pick_slot(ctx, &walk, NULL);
+    if (slot == DSM_SLOT_NONE) {
+        DSM_LOG_ERR("No hay slots libres en el cluster");
+        return DSM_ERR_NO_SPACE;
+    }
+    if (slot != m->self_slot) {
+        membership_claim_slot(ctx, slot);
+    }
+
+    rc = discovery_resolve_slots(ctx, &peers);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+
+    atomic_store(&m->claim_pending, false);
+
+    uint64_t converge_epoch = m->epoch;
+    rc = discovery_converge(ctx, &converge_epoch);
+    if (rc != DSM_OK) {
+        return rc;
+    }
+    if (converge_epoch > m->epoch) {
+        m->epoch = converge_epoch;
+    }
+
+    DSM_LOG_INFO("Union completada exitosamente: Slot asignado = %u, Epoch = %lu, "
+                 "pares alcanzables = %u",
+                 m->self_slot, (unsigned long)m->epoch, peers);
+
+    hb_start(ctx);
     return DSM_OK;
 }
 
@@ -277,66 +986,21 @@ int discovery_join(dsm_ctx_t *ctx)
         return rc;
     }
 
+    /* El listener queda activo con el cerrojo aun sin tomar: los nodos que ya
+     * lo tienen necesitan que este responda sus HELLO para verlo candidato. */
     if ((rc = net_start_listener(ctx)) != DSM_OK) {
         return rc;
     }
 
-    welcome_t w;
-    memset(&w, 0, sizeof(w));
-    rc = discovery_scan(ctx, &w);
-
-    if (rc == DSM_ERR_NOT_FOUND) {
-        DSM_LOG_INFO("No se detectaron pares activos. Asumiendo rol de primer nodo (Slot 0, Epoch 1)");
-        m->self_slot = 0;
-        m->epoch     = 1;
-        membership_add_self(ctx);
-        hb_start(ctx);
-        return DSM_OK;
-    }
-    if (rc != DSM_OK) {
-        return rc;
+    int lock_fd = discovery_lock_acquire(ctx);
+    if (lock_fd < 0) {
+        DSM_LOG_WARN("Sin cerrojo de descubrimiento; el reparto depende del desempate por UUID");
     }
 
-    /* Fusionar lo recibido en el WELCOME */
-    membership_merge_wire(m, &w);
-    m->self_slot = membership_first_free_slot(ctx);
+    rc = discovery_join_locked(ctx);
 
-    for (uint32_t attempt = 0; attempt < MAX_NODES; attempt++) {
-        uint16_t status = DSM_ST_OK;
-        rc = discovery_send_join_all(ctx, &w, &status);
-        if (rc != DSM_OK) {
-            return rc;
-        }
-        if (status != DSM_ST_SLOT_TAKEN) {
-            break;
-        }
-        DSM_LOG_WARN("Slot %u ocupado. Solicitando siguiente slot libre...", m->self_slot);
-        m->self_slot = membership_next_free_slot(ctx, m->self_slot + 1);
-    }
-
-    if (m->self_slot == DSM_SLOT_NONE) {
-        DSM_LOG_ERR("No hay slots libres en el cluster");
-        return DSM_ERR_NO_SPACE;
-    }
-
-    if (m->epoch <= w.epoch) {
-        m->epoch = w.epoch + 1;
-    }
-    membership_add_self(ctx);
-
-    /* Establecer de inmediato conexiones salientes con los pares descubiertos */
-    for (uint32_t i = 0; i < w.count; i++) {
-        uint32_t s = w.members[i].slot;
-        if (s != m->self_slot && membership_slot_present(ctx, s)) {
-            peer_ensure_connected(ctx, s);
-        }
-    }
-
-    DSM_LOG_INFO("Union completada exitosamente: Slot asignado = %u, Epoch = %lu",
-                 m->self_slot, (unsigned long)m->epoch);
-
-    hb_start(ctx);
-    return DSM_OK;
+    discovery_lock_release(lock_fd);
+    return rc;
 }
 
 void discovery_leave(dsm_ctx_t *ctx)
@@ -402,6 +1066,7 @@ int membership_init(dsm_ctx_t *ctx)
     memset(m, 0, sizeof(*m));
     pthread_rwlock_init(&m->rw, NULL);
     m->self_slot = DSM_SLOT_NONE;
+    m->cfg       = &ctx->cfg;
     return DSM_OK;
 }
 
@@ -425,8 +1090,10 @@ void membership_add_self(dsm_ctx_t *ctx)
         ni->port        = ctx->net.listen_port;
         ni->state       = DSM_NODE_ALIVE;
         ni->incarnation = 1;
-        ni->mem_pages   = (uint32_t)(ctx->cfg.node_mem / ps);
+        /* Un cliente no aporta memoria: ni páginas propias ni libres. */
+        ni->mem_pages   = ctx->cfg.client_mode ? 0u : (uint32_t)(ctx->cfg.node_mem / ps);
         ni->free_pages  = ni->mem_pages;
+        ni->is_client   = ctx->cfg.client_mode ? 1u : 0u;
         ni->last_hb_ms  = mono_ms();
         ni->missed_hb   = 0;
 
@@ -434,6 +1101,40 @@ void membership_add_self(dsm_ctx_t *ctx)
     }
 
     pthread_rwlock_unlock(&m->rw);
+}
+
+/*
+ * Publica la ranura propia: retira la entrada previa y escribe la nueva. La
+ * tabla no puede quedar con la entrada vieja presente, o el nodo apareceria dos
+ * veces ante los pares. La epoca la fija el llamador, que es quien conoce la
+ * vista del cluster con la que se reclama.
+ */
+void membership_claim_slot(dsm_ctx_t *ctx, uint32_t slot)
+{
+    dsm_membership_t *m = &ctx->memb;
+    pthread_rwlock_wrlock(&m->rw);
+
+    uint32_t prev = m->self_slot;
+    if (prev < MAX_NODES && prev != slot &&
+        (m->present[prev / 8] & (1u << (prev % 8))) &&
+        memcmp(m->nodes[prev].uuid, m->self_uuid, 16) == 0) {
+        m->nodes[prev].state = DSM_NODE_DEAD;
+        m->present[prev / 8] &= (uint8_t)~(1u << (prev % 8));
+        m->reusable_after_ms[prev] = 0;
+        /* Reubicarse cambia el reparto de la tabla: la vista previa deja de
+         * ser valida y la nueva publicacion debe superar a cualquier epoca
+         * observada. */
+        m->epoch++;
+    }
+
+    m->self_slot = slot;
+    if (slot < MAX_NODES) {
+        m->present[slot / 8] |= (uint8_t)(1u << (slot % 8));
+    }
+
+    pthread_rwlock_unlock(&m->rw);
+
+    membership_add_self(ctx);
 }
 
 uint32_t membership_first_free_slot(dsm_ctx_t *ctx)
@@ -476,17 +1177,47 @@ bool membership_is_alive(dsm_ctx_t *ctx, uint32_t slot)
     return alive;
 }
 
+/*
+ * Fusiona la tabla que publico un par en su WELCOME.
+ *
+ * La tabla de membresia es una vista replicada y la fusion tiene que ser
+ * conmutativa para que todos los nodos converjan al mismo mapa de uuid a
+ * ranura; los latidos solo refrescan entradas existentes, asi que la vista
+ * completa de cada par es la unica via por la que un nodo descubre a los demas.
+ *
+ * Las tres reglas de la fusion:
+ *  - La entrada propia no se copia: la ranura de este nodo la decide el mismo.
+ *  - Un uuid aparece una sola vez; la fila de su ranura previa se retira.
+ *  - Ante dos nodos que reclaman la misma ranura se conserva el de UUID
+ *    lexicograficamente menor, igual que en el JOIN.
+ */
 void membership_merge_wire(dsm_membership_t *m, const welcome_t *w)
 {
     pthread_rwlock_wrlock(&m->rw);
-    if (w->epoch > m->epoch) {
-        m->epoch = w->epoch;
-    }
 
     for (uint32_t i = 0; i < w->count; i++) {
         const membership_wire_t *wire = &w->members[i];
         uint32_t s = wire->slot;
         if (s >= MAX_NODES) continue;
+        if (memcmp(wire->uuid, m->self_uuid, 16) == 0) continue;
+        if (s == m->self_slot) continue;
+
+        /* El uuid se reubico: la fila de su ranura previa es una vista vieja. */
+        for (uint32_t other = 0; other < MAX_NODES; other++) {
+            if (other == s || other == m->self_slot) continue;
+            if (!(m->present[other / 8] & (1u << (other % 8)))) continue;
+            if (memcmp(m->nodes[other].uuid, wire->uuid, 16) != 0) continue;
+            m->nodes[other].state = DSM_NODE_DEAD;
+            m->present[other / 8] &= (uint8_t)~(1u << (other % 8));
+            m->reusable_after_ms[other] = 0;
+        }
+
+        bool present = (m->present[s / 8] & (1u << (s % 8))) != 0;
+        if (present && memcmp(m->nodes[s].uuid, wire->uuid, 16) != 0) {
+            if (memcmp(m->nodes[s].uuid, wire->uuid, 16) < 0) {
+                continue; /* la ranura pertenece al nodo de UUID menor */
+            }
+        }
 
         node_info_t *ni = &m->nodes[s];
         memcpy(ni->uuid, wire->uuid, 16);
@@ -497,11 +1228,15 @@ void membership_merge_wire(dsm_membership_t *m, const welcome_t *w)
         ni->incarnation = wire->incarnation;
         ni->mem_pages   = wire->mem_pages;
         ni->free_pages  = wire->mem_pages;
+        /* El rol no viaja en el cable: un nodo que publica cero páginas es un
+         * cliente, que usa la memoria del cluster pero no la aporta. */
+        ni->is_client   = (wire->mem_pages == 0) ? 1u : 0u;
         ni->last_hb_ms  = mono_ms();
         ni->missed_hb   = 0;
 
         m->present[s / 8] |= (uint8_t)(1u << (s % 8));
     }
+
     pthread_rwlock_unlock(&m->rw);
 }
 
@@ -528,6 +1263,44 @@ void membership_on_heartbeat(dsm_ctx_t *ctx, const dsm_msg_t *m)
     pthread_rwlock_unlock(&ctx->memb.rw);
 }
 
+/* Responde al solicitante de un JOIN con el rechazo indicado. */
+static void join_reply_nack(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd,
+                            uint16_t status)
+{
+    if (cfd >= 0) {
+        msg_header_t nack_hdr;
+        memset(&nack_hdr, 0, sizeof(nack_hdr));
+        nack_hdr.magic         = DSM_MAGIC;
+        nack_hdr.cluster_id    = ctx->cfg.cluster_id;
+        nack_hdr.proto_version = DSM_PROTO_VERSION;
+        nack_hdr.type          = MSG_NACK;
+        nack_hdr.src_slot      = ctx->memb.self_slot;
+        nack_hdr.dst_slot      = m->hdr.src_slot;
+        nack_hdr.req_id        = m->hdr.req_id;
+        nack_hdr.status        = status;
+        uint8_t nack_raw[DSM_HDR_LEN];
+        dsm_wire_finish(&nack_hdr, nack_raw, NULL, 0);
+        dsm_send_full(cfd, nack_raw, DSM_HDR_LEN);
+    } else {
+        net_send_nack(ctx, m->hdr.src_slot, m->hdr.req_id, status);
+    }
+}
+
+/*
+ * Procesa un JOIN de otro nodo.
+ *
+ * El receptor es la autoridad sobre su propia tabla, y aplica el mismo
+ * desempate por UUID que el solicitante:
+ *
+ *  - La ranura esta libre: se registra al nodo y se responde JOIN_ACK.
+ *  - La ranura la ocupa este nodo y el solicitante tiene UUID menor, mientras
+ *    el reparto local sigue provisional: se responde BUSY. El titular cede la
+ *    ranura en su propio bucle de descubrimiento y el solicitante reintenta,
+ *    de modo que la ranura propia tiene un unico escritor.
+ *  - Cualquier otra colision se rechaza con SLOT_TAKEN, y el solicitante toma
+ *    la siguiente ranura libre. Una ranura ya confirmada no se renumera: el
+ *    cluster en marcha conserva el reparto que sus pares ya publicaron.
+ */
 void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
 {
     if (!m->payload || m->hdr.payload_len < DSM_MEMBERSHIP_WIRE_LEN) return;
@@ -537,49 +1310,32 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
 
     uint32_t s = wire.slot;
     if (s >= MAX_NODES) {
-        if (cfd >= 0) {
-            msg_header_t nack_hdr;
-            memset(&nack_hdr, 0, sizeof(nack_hdr));
-            nack_hdr.magic         = DSM_MAGIC;
-            nack_hdr.cluster_id    = ctx->cfg.cluster_id;
-            nack_hdr.proto_version = DSM_PROTO_VERSION;
-            nack_hdr.type          = MSG_NACK;
-            nack_hdr.src_slot      = ctx->memb.self_slot;
-            nack_hdr.dst_slot      = m->hdr.src_slot;
-            nack_hdr.req_id        = m->hdr.req_id;
-            nack_hdr.status        = DSM_ST_NO_SPACE;
-            uint8_t nack_raw[DSM_HDR_LEN];
-            dsm_wire_finish(&nack_hdr, nack_raw, NULL, 0);
-            dsm_send_full(cfd, nack_raw, DSM_HDR_LEN);
-        } else {
-            net_send_nack(ctx, m->hdr.src_slot, m->hdr.req_id, DSM_ST_NO_SPACE);
-        }
+        join_reply_nack(ctx, m, cfd, DSM_ST_NO_SPACE);
         return;
     }
 
     pthread_rwlock_wrlock(&ctx->memb.rw);
+
+    /* El nodo que se reubica deja una vista vieja en su ranura previa: se
+     * retira para que no figure dos veces. La ranura propia nunca se toca. */
+    for (uint32_t other = 0; other < MAX_NODES; other++) {
+        if (other == s || other == ctx->memb.self_slot) continue;
+        if (!membership_slot_present(ctx, other)) continue;
+        if (memcmp(ctx->memb.nodes[other].uuid, wire.uuid, 16) != 0) continue;
+        ctx->memb.nodes[other].state = DSM_NODE_DEAD;
+        ctx->memb.present[other / 8] &= (uint8_t)~(1u << (other % 8));
+        ctx->memb.reusable_after_ms[other] = 0;
+    }
+
     bool taken = membership_slot_present(ctx, s) &&
                  (memcmp(ctx->memb.nodes[s].uuid, wire.uuid, 16) != 0);
+    bool own = (s == ctx->memb.self_slot);
+    bool busy = taken && own && atomic_load(&ctx->memb.claim_pending) &&
+                memcmp(wire.uuid, ctx->memb.self_uuid, 16) < 0;
 
     if (taken) {
         pthread_rwlock_unlock(&ctx->memb.rw);
-        if (cfd >= 0) {
-            msg_header_t nack_hdr;
-            memset(&nack_hdr, 0, sizeof(nack_hdr));
-            nack_hdr.magic         = DSM_MAGIC;
-            nack_hdr.cluster_id    = ctx->cfg.cluster_id;
-            nack_hdr.proto_version = DSM_PROTO_VERSION;
-            nack_hdr.type          = MSG_NACK;
-            nack_hdr.src_slot      = ctx->memb.self_slot;
-            nack_hdr.dst_slot      = m->hdr.src_slot;
-            nack_hdr.req_id        = m->hdr.req_id;
-            nack_hdr.status        = DSM_ST_SLOT_TAKEN;
-            uint8_t nack_raw[DSM_HDR_LEN];
-            dsm_wire_finish(&nack_hdr, nack_raw, NULL, 0);
-            dsm_send_full(cfd, nack_raw, DSM_HDR_LEN);
-        } else {
-            net_send_nack(ctx, m->hdr.src_slot, m->hdr.req_id, DSM_ST_SLOT_TAKEN);
-        }
+        join_reply_nack(ctx, m, cfd, busy ? DSM_ST_BUSY : DSM_ST_SLOT_TAKEN);
         return;
     }
 
@@ -592,6 +1348,8 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
     ni->incarnation = wire.incarnation;
     ni->mem_pages   = wire.mem_pages;
     ni->free_pages  = wire.mem_pages;
+    /* Cero páginas publicadas identifica a un cliente en la membresía local. */
+    ni->is_client   = (wire.mem_pages == 0) ? 1u : 0u;
     ni->last_hb_ms  = mono_ms();
     ni->missed_hb   = 0;
     ctx->memb.present[s / 8] |= (uint8_t)(1u << (s % 8));
@@ -599,10 +1357,11 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
     if (m->hdr.epoch >= ctx->memb.epoch) {
         ctx->memb.epoch = m->hdr.epoch + 1;
     }
+    uint64_t epoch = ctx->memb.epoch;
 
     pthread_rwlock_unlock(&ctx->memb.rw);
 
-    /* Establecer conexion saliente de vuelta hacia el nuevo nodo */
+    /* Establecer conexion saliente de vuelta hacia el nodo que se incorpora */
     peer_ensure_connected(ctx, s);
 
     /* Responder con JOIN_ACK directamente en el socket abierto si existe */
@@ -612,9 +1371,9 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
     ack_hdr.cluster_id    = ctx->cfg.cluster_id;
     ack_hdr.proto_version = DSM_PROTO_VERSION;
     ack_hdr.type          = MSG_JOIN_ACK;
-    ack_hdr.src_slot      = ctx->memb.self_slot;
+    ack_hdr.src_slot      = membership_self_slot(ctx);
     ack_hdr.dst_slot      = s;
-    ack_hdr.epoch         = ctx->memb.epoch;
+    ack_hdr.epoch         = epoch;
     ack_hdr.req_id        = m->hdr.req_id;
     ack_hdr.status        = DSM_ST_OK;
 
@@ -683,6 +1442,235 @@ void membership_send_resp(dsm_ctx_t *ctx, uint32_t dst)
     (void)dst;
 }
 
+/* --- Servicio de consultas de diagnóstico (dsmctl) ---
+ *
+ * El nodo responde QUERY_REQ sobre la conexión efímera en la que llegó la
+ * petición. No se valida el epoch ni el slot del solicitante: dsmctl no es un
+ * miembro del clúster y la respuesta es de solo lectura, por lo que no puede
+ * alterar el estado. La validación de magic, cluster_id y CRC32 ya la hizo la
+ * capa de red. */
+
+#define QUERY_RESP_MAX_RECS 128u
+
+/* Registro más grande del protocolo de consulta; dimensiona el búfer de
+ * respuesta sin reservar el máximo de 1 MiB del cable. */
+#define QUERY_RESP_MAX_BYTES \
+    (DSM_QUERY_RESP_HDR_LEN + QUERY_RESP_MAX_RECS * DSM_NODE_REC_LEN)
+
+typedef struct {
+    uint8_t *buf;
+    size_t   len;
+    size_t   cap;
+    bool     overflow;
+} query_builder_t;
+
+static void query_builder_put(query_builder_t *b, const uint8_t *src, size_t n)
+{
+    if (b->len + n > b->cap) {
+        b->overflow = true;
+        return;
+    }
+    memcpy(b->buf + b->len, src, n);
+    b->len += n;
+}
+
+static void query_builder_put_node(query_builder_t *b, const node_info_t *ni,
+                                   uint32_t slot, uint64_t epoch)
+{
+    node_rec_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.slot       = slot;
+    memcpy(rec.uuid, ni->uuid, 16);
+    rec.ip         = ni->ip;
+    rec.port       = ni->port;
+    rec.state      = ni->state;
+    rec.missed_hb  = ni->missed_hb;
+    rec.mem_pages  = ni->mem_pages;
+    rec.free_pages = ni->free_pages;
+    rec.epoch      = epoch;
+    rec.last_hb_ms = ni->last_hb_ms;
+
+    uint8_t raw[DSM_NODE_REC_LEN];
+    dsm_pack_node_rec(&rec, raw);
+    query_builder_put(b, raw, sizeof(raw));
+}
+
+/* Copia hasta 'limit' nodos de la membresía, en orden de slot. */
+static uint32_t query_collect_nodes(dsm_ctx_t *ctx, uint32_t first, uint32_t max,
+                                    query_builder_t *b)
+{
+    uint32_t emitted = 0;
+    uint32_t seen = 0;
+
+    pthread_rwlock_rdlock(&ctx->memb.rw);
+    for (uint32_t s = 0; s < MAX_NODES && emitted < max; s++) {
+        if (!membership_slot_present(ctx, s)) continue;
+        if (seen++ < first) continue;
+        query_builder_put_node(b, &ctx->memb.nodes[s], s, ctx->memb.epoch);
+        emitted++;
+    }
+    pthread_rwlock_unlock(&ctx->memb.rw);
+    return emitted;
+}
+
+/* Copia hasta 'limit' páginas de la tabla local en el rango pedido. */
+static uint32_t query_collect_pages(dsm_ctx_t *ctx, uint32_t first, uint32_t max,
+                                    query_builder_t *b)
+{
+    uint32_t emitted = 0;
+    uint32_t total = ctx->mem.npages;
+    if (first >= total) return 0;
+
+    uint32_t last = first + max;
+    if (last > total || last < first) last = total;
+
+    for (uint32_t p = first; p < last; p++) {
+        page_local_t *loc = dsm_mem_local(&ctx->mem, p);
+        if (!loc) break;
+
+        page_rec_t rec;
+        memset(&rec, 0, sizeof(rec));
+        rec.page_id    = p;
+        rec.home       = ring_home_of(ctx, p);
+        rec.version    = loc->version;
+        rec.state      = loc->state;
+        rec.pend_inval = loc->pend_inval;
+        rec.pend_down  = loc->pend_down;
+
+        uint8_t raw[DSM_PAGE_REC_LEN];
+        dsm_pack_page_rec(&rec, raw);
+        query_builder_put(b, raw, sizeof(raw));
+        emitted++;
+    }
+    return emitted;
+}
+
+static uint16_t query_fill_global(dsm_ctx_t *ctx, query_builder_t *b)
+{
+    (void)ctx;
+    dsm_stats_t st;
+    if (dsm_stats(&st) != DSM_OK) return DSM_ST_BUSY;
+
+    uint64_t bytes[6] = {
+        st.read_faults, st.write_faults, st.msgs_sent,
+        st.msgs_recv, st.bytes_sent, st.bytes_recv
+    };
+    uint8_t raw[48];
+    for (uint32_t i = 0; i < 6; i++) {
+        uint64_t v = dsm_htonll(bytes[i]);
+        memcpy(raw + i * 8, &v, 8);
+    }
+    query_builder_put(b, raw, sizeof(raw));
+    return DSM_ST_OK;
+}
+
+static uint16_t query_build_resp(dsm_ctx_t *ctx, const query_req_t *q,
+                                 query_builder_t *b, uint32_t *out_count,
+                                 uint8_t *out_more)
+{
+    uint32_t max = q->max;
+    if (max == 0 || max > QUERY_RESP_MAX_RECS) {
+        max = QUERY_RESP_MAX_RECS;
+    }
+
+    uint32_t count = 0;
+    uint8_t more = 0;
+
+    switch (q->kind) {
+    case DSM_QUERY_NODES:
+        count = query_collect_nodes(ctx, q->first, max, b);
+        if (count == max) {
+            /* Queda al menos un nodo si el recorrido completo supera max. */
+            uint32_t total = 0;
+            pthread_rwlock_rdlock(&ctx->memb.rw);
+            for (uint32_t s = 0; s < MAX_NODES; s++) {
+                if (membership_slot_present(ctx, s)) total++;
+            }
+            pthread_rwlock_unlock(&ctx->memb.rw);
+            more = (q->first + count < total) ? 1 : 0;
+        }
+        break;
+    case DSM_QUERY_STATS:
+        if (q->scope == DSM_QUERY_GLOBAL) {
+            uint16_t st = query_fill_global(ctx, b);
+            if (st != DSM_ST_OK) return st;
+            count = 1;
+        }
+        break;
+    case DSM_QUERY_PAGES:
+        count = query_collect_pages(ctx, q->first, max, b);
+        more = (q->first + count < ctx->mem.npages) ? 1 : 0;
+        break;
+    default:
+        return DSM_ST_BAD_STATE;
+    }
+
+    if (b->overflow) return DSM_ST_NO_SPACE;
+    *out_count = count;
+    *out_more  = more;
+    return DSM_ST_OK;
+}
+
+void membership_handle_query_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
+{
+    if (cfd < 0) return;
+
+    msg_header_t resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.magic         = DSM_MAGIC;
+    resp.cluster_id    = ctx->cfg.cluster_id;
+    resp.proto_version = DSM_PROTO_VERSION;
+    resp.type          = MSG_QUERY_RESP;
+    resp.src_slot      = ctx->memb.self_slot;
+    resp.dst_slot      = m->hdr.src_slot;
+    resp.req_id        = m->hdr.req_id;
+
+    uint8_t payload[QUERY_RESP_MAX_BYTES];
+    query_resp_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+
+    if (!m->payload || m->hdr.payload_len != DSM_QUERY_REQ_LEN) {
+        resp.status = DSM_ST_BAD_STATE;
+    } else {
+        query_req_t q;
+        dsm_unpack_query_req(m->payload, &q);
+
+        query_builder_t b = {
+            .buf      = payload + DSM_QUERY_RESP_HDR_LEN,
+            .len      = 0,
+            .cap      = sizeof(payload) - DSM_QUERY_RESP_HDR_LEN,
+            .overflow = false
+        };
+
+        uint32_t count = 0;
+        uint8_t more = 0;
+        resp.status = query_build_resp(ctx, &q, &b, &count, &more);
+        if (resp.status == DSM_ST_OK) {
+            hdr.kind  = q.kind;
+            hdr.more  = more;
+            hdr.count = count;
+        }
+    }
+
+    size_t total = DSM_QUERY_RESP_HDR_LEN;
+    if (resp.status == DSM_ST_OK) {
+        dsm_pack_query_resp(&hdr, payload);
+        total += (size_t)hdr.count *
+                 ((hdr.kind == DSM_QUERY_NODES) ? DSM_NODE_REC_LEN :
+                  (hdr.kind == DSM_QUERY_PAGES) ? DSM_PAGE_REC_LEN : 0u);
+        if (hdr.kind == DSM_QUERY_STATS) total += 48u;
+    }
+
+    uint8_t raw_hdr[DSM_HDR_LEN];
+    dsm_wire_finish(&resp, raw_hdr, payload, (uint32_t)total);
+    if (dsm_send_full(cfd, raw_hdr, DSM_HDR_LEN) == 0) {
+        dsm_send_full(cfd, payload, total);
+    }
+
+    atomic_fetch_add_explicit(&ctx->ctr.msgs_sent, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&ctx->ctr.bytes_sent, DSM_HDR_LEN + total, memory_order_relaxed);
+}
+
 uint32_t membership_total_pages(dsm_ctx_t *ctx)
 {
     dsm_membership_t *m = &ctx->memb;
@@ -731,7 +1719,7 @@ void membership_evaluate(dsm_ctx_t *ctx, uint64_t now_ms)
     }
     pthread_rwlock_unlock(&m->rw);
 
-    /* Difundir NODE_DOWN para nodos declarados muertos */
+    /* Difundir NODE_DOWN para los nodos declarados muertos */
     for (uint32_t d = 0; d < dead_count; d++) {
         msg_header_t hdr;
         memset(&hdr, 0, sizeof(hdr));

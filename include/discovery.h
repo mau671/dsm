@@ -16,10 +16,12 @@ typedef struct {
     uint32_t ip;              /* Orden de red IPv4 */
     uint32_t mem_pages;
     uint32_t free_pages;
-    uint32_t vnodes;
     uint16_t port;            /* Orden de host */
     uint8_t  state;           /* ALIVE, SUSPECT, DEAD */
     uint8_t  missed_hb;
+    /* Un cliente se une para usar la memoria del cluster sin aportar páginas:
+     * no proyecta vnodes en el anillo y nunca es custodio. */
+    uint8_t  is_client;
 } node_info_t;
 
 _Static_assert(sizeof(node_info_t) == 56, "node_info_t debe ocupar 56 bytes");
@@ -32,6 +34,14 @@ typedef struct {
     uint8_t          self_uuid[16];
     uint64_t         epoch;
     uint64_t         election_tiebreak;
+    /*
+     * Una ranura reclamada mientras discovery_join no confirma el reparto es
+     * provisional: el titular la cede a un nodo de UUID menor que todavia esta
+     * arrancando. Ya confirmada, la defiende con un rechazo para que un nodo
+     * nuevo no reubique al cluster en marcha.
+     */
+    atomic_bool      claim_pending;
+    const struct dsm_config *cfg;   /* Página y vnodes por MiB del cluster */
     pthread_rwlock_t rw;
 } dsm_membership_t;
 
@@ -44,7 +54,6 @@ typedef struct dsm_ctx dsm_ctx_t;
 int  uuid_load_or_create(dsm_ctx_t *ctx, uint8_t out[16]);
 int  discovery_bind_first_free(dsm_ctx_t *ctx);
 int  discovery_scan(dsm_ctx_t *ctx, welcome_t *out);
-int  discovery_send_join_all(dsm_ctx_t *ctx, const welcome_t *w, uint16_t *status);
 int  discovery_join(dsm_ctx_t *ctx);
 void discovery_leave(dsm_ctx_t *ctx);
 
@@ -53,6 +62,7 @@ void discovery_leave(dsm_ctx_t *ctx);
 int  membership_init(dsm_ctx_t *ctx);
 void membership_destroy(dsm_ctx_t *ctx);
 void membership_add_self(dsm_ctx_t *ctx);
+void membership_claim_slot(dsm_ctx_t *ctx, uint32_t slot);
 uint32_t membership_first_free_slot(dsm_ctx_t *ctx);
 uint32_t membership_next_free_slot(dsm_ctx_t *ctx, uint32_t from);
 
@@ -64,6 +74,9 @@ void membership_on_node_down(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void membership_on_leave(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void membership_on_resp(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void membership_send_resp(dsm_ctx_t *ctx, uint32_t dst);
+
+/* Atiende una QUERY_REQ de dsmctl y responde por el socket de la petición. */
+void membership_handle_query_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd);
 
 void membership_merge_wire(dsm_membership_t *m, const welcome_t *w);
 bool membership_is_alive(dsm_ctx_t *ctx, uint32_t slot);
