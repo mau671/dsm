@@ -159,6 +159,16 @@ static int test_load_repo_config(void)
     CHECK(cfg.raw_hash == dsm_crc32(0, buf, n));
     CHECK(cfg.raw_hash == 0xBB8AFAE5u);
 
+    /* Dos lecturas identicas del mismo archivo producen el mismo hash exacto.
+     * Esto es la base del handshake HELLO: si dos nodos leen el mismo byte
+     * stream deben coincidir bit a bit, no solo en los campos parseados. */
+    dsm_config_t again;
+    REQUIRE(config_load(&again, "dsm.conf") == DSM_OK);
+    CHECK(again.raw_hash == cfg.raw_hash);
+    CHECK(memcmp(&again.peer_hosts, &cfg.peer_hosts, sizeof(cfg.peer_hosts)) == 0);
+    CHECK(again.peer_host_count == cfg.peer_host_count);
+
+    config_free(&again);
     config_free(&cfg);
     return 0;
 }
@@ -1201,6 +1211,72 @@ static int test_rig_validacion_directa(void)
     return 0;
 }
 
+/* ----------------------------------------------------------------------------
+ * 14. raw_hash disponible incluso cuando el parseo rechaza el archivo
+ *
+ * Un nodo que recibe un dsm.conf con una clave desconocida debe poder
+ * reportar contra que hash fallo: el hash es del byte stream, no del
+ * resultado del parseo, asi que se calcula antes de procesar las lineas.
+ * ------------------------------------------------------------------------- */
+
+static int test_rig_hash_sobrevive_al_rechazo(void)
+{
+    dsm_config_t cfg;
+    char path[256];
+
+    /* Clave desconocida en la linea 3: parseo rechazado, hash presente. */
+    const char *bad_unknown =
+        "PAGE_SIZE = 4096\n"
+        "\n"
+        "CLAVE_INVENTADA = 7\n";
+    const char *p = write_fixture("hash_reject_unknown.conf", bad_unknown, path);
+    REQUIRE(p != NULL);
+    memset(&cfg, 0, sizeof(cfg));
+    CHECK(config_load(&cfg, p) == DSM_ERR_CONFIG);
+    CHECK(cfg.raw_hash == dsm_crc32(0, bad_unknown, strlen(bad_unknown)));
+
+    /* Linea sin '=': mismo contrato. */
+    const char *bad_syntax = "PORT_MIN 27600\n";
+    p = write_fixture("hash_reject_syntax.conf", bad_syntax, path);
+    REQUIRE(p != NULL);
+    memset(&cfg, 0, sizeof(cfg));
+    CHECK(config_load(&cfg, p) == DSM_ERR_CONFIG);
+    CHECK(cfg.raw_hash == dsm_crc32(0, bad_syntax, strlen(bad_syntax)));
+
+    /* Valor invalido: idem. */
+    const char *bad_value = "PAGE_SIZE = cuatro mil\n";
+    p = write_fixture("hash_reject_value.conf", bad_value, path);
+    REQUIRE(p != NULL);
+    memset(&cfg, 0, sizeof(cfg));
+    CHECK(config_load(&cfg, p) == DSM_ERR_CONFIG);
+    CHECK(cfg.raw_hash == dsm_crc32(0, bad_value, strlen(bad_value)));
+
+    /* Dos archivos distintos que fallan en la misma linea tienen hashes
+     * distintos: el hash identifica el contenido, no el tipo de error. */
+    const char *bad_a = "PAGE_SIZE = 4096\nFOO = 1\n";
+    const char *bad_b = "PAGE_SIZE = 4096\nBAR = 1\n";
+    dsm_config_t ca;
+    dsm_config_t cb;
+    memset(&ca, 0, sizeof(ca));
+    memset(&cb, 0, sizeof(cb));
+    p = write_fixture("hash_reject_a.conf", bad_a, path);
+    REQUIRE(p != NULL);
+    CHECK(config_load(&ca, p) == DSM_ERR_CONFIG);
+    p = write_fixture("hash_reject_b.conf", bad_b, path);
+    REQUIRE(p != NULL);
+    CHECK(config_load(&cb, p) == DSM_ERR_CONFIG);
+    CHECK(ca.raw_hash == dsm_crc32(0, bad_a, strlen(bad_a)));
+    CHECK(cb.raw_hash == dsm_crc32(0, bad_b, strlen(bad_b)));
+    CHECK(ca.raw_hash != cb.raw_hash);
+
+    /* Un archivo inexistente no tiene bytes: no hay hash que reportar. */
+    memset(&cfg, 0, sizeof(cfg));
+    CHECK(config_load(&cfg, FIXTURE_DIR "/hash_reject_missing.conf") == DSM_ERR_CONFIG);
+    CHECK(cfg.raw_hash == 0);
+
+    return 0;
+}
+
 /* ------------------------------------------------------------------------- */
 
 int main(void)
@@ -1224,6 +1300,7 @@ int main(void)
     RUN_TEST(test_rig_limites_sistema);
     RUN_TEST(test_rig_archivo_enorme_y_no_regular);
     RUN_TEST(test_rig_validacion_directa);
+    RUN_TEST(test_rig_hash_sobrevive_al_rechazo);
 
     printf("%d pruebas ejecutadas, %d fallos\n", g_tests, g_fails);
     return g_fails ? 1 : 0;
