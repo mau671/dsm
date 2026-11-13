@@ -19,40 +19,86 @@ static __thread fault_slot_t g_thread_slot __attribute__((tls_model("initial-exe
 static __thread bool g_thread_attached = false;
 static __thread void *g_altstack_buf = NULL;
 
-/* Cola de fallos lock-free para paso al despachador */
-static fault_slot_t *g_fault_queue[DSM_FAULTQ_CAP];
+/* Cola de fallos MPMC acotada para paso al despachador.
+ *
+ * Varios hilos de aplicacion pueden fallar a la vez, y con mas de un
+ * despachador tambien hay varios consumidores, de modo que productor y
+ * consumidor reservan su posicion con compare-and-swap y cada celda lleva un
+ * contador de secuencia que indica si esta libre para la generacion en curso.
+ * La implementacion no toma cerrojos porque push se ejecuta dentro del
+ * manejador de SIGSEGV, donde solo son validas las operaciones atomicas. */
+typedef struct {
+    fault_slot_t *slot;
+    _Atomic uint32_t seq;
+} fault_cell_t;
+
+static fault_cell_t g_fault_queue[DSM_FAULTQ_CAP];
 static _Atomic uint32_t g_fq_head = 0;
 static _Atomic uint32_t g_fq_tail = 0;
+
+_Static_assert((DSM_FAULTQ_CAP & (DSM_FAULTQ_CAP - 1)) == 0,
+               "DSM_FAULTQ_CAP debe ser potencia de dos");
 
 int faultq_init(void)
 {
     atomic_store(&g_fq_head, 0);
     atomic_store(&g_fq_tail, 0);
+    for (uint32_t i = 0; i < DSM_FAULTQ_CAP; i++) {
+        g_fault_queue[i].slot = NULL;
+        atomic_store_explicit(&g_fault_queue[i].seq, i, memory_order_relaxed);
+    }
     return 0;
 }
 
 bool faultq_push(fault_slot_t *s)
 {
-    uint32_t tail = atomic_load_explicit(&g_fq_tail, memory_order_relaxed);
-    uint32_t head = atomic_load_explicit(&g_fq_head, memory_order_acquire);
-    if (tail - head >= DSM_FAULTQ_CAP) {
-        return false;
+    const uint32_t mask = DSM_FAULTQ_CAP - 1;
+    uint32_t pos = atomic_load_explicit(&g_fq_tail, memory_order_relaxed);
+
+    for (;;) {
+        fault_cell_t *cell = &g_fault_queue[pos & mask];
+        uint32_t seq = atomic_load_explicit(&cell->seq, memory_order_acquire);
+        int32_t dif = (int32_t)(seq - pos);
+        if (dif == 0) {
+            if (atomic_compare_exchange_weak_explicit(&g_fq_tail, &pos, pos + 1,
+                                                      memory_order_relaxed,
+                                                      memory_order_relaxed)) {
+                cell->slot = s;
+                atomic_store_explicit(&cell->seq, pos + 1, memory_order_release);
+                return true;
+            }
+        } else if (dif < 0) {
+            return false; /* cola llena */
+        } else {
+            pos = atomic_load_explicit(&g_fq_tail, memory_order_relaxed);
+        }
     }
-    g_fault_queue[tail % DSM_FAULTQ_CAP] = s;
-    atomic_store_explicit(&g_fq_tail, tail + 1, memory_order_release);
-    return true;
 }
 
 fault_slot_t *faultq_pop(void)
 {
-    uint32_t head = atomic_load_explicit(&g_fq_head, memory_order_relaxed);
-    uint32_t tail = atomic_load_explicit(&g_fq_tail, memory_order_acquire);
-    if (head == tail) {
-        return NULL;
+    const uint32_t mask = DSM_FAULTQ_CAP - 1;
+    uint32_t pos = atomic_load_explicit(&g_fq_head, memory_order_relaxed);
+
+    for (;;) {
+        fault_cell_t *cell = &g_fault_queue[pos & mask];
+        uint32_t seq = atomic_load_explicit(&cell->seq, memory_order_acquire);
+        int32_t dif = (int32_t)(seq - (pos + 1));
+        if (dif == 0) {
+            if (atomic_compare_exchange_weak_explicit(&g_fq_head, &pos, pos + 1,
+                                                      memory_order_relaxed,
+                                                      memory_order_relaxed)) {
+                fault_slot_t *s = cell->slot;
+                atomic_store_explicit(&cell->seq, pos + mask + 1,
+                                      memory_order_release);
+                return s;
+            }
+        } else if (dif < 0) {
+            return NULL; /* cola vacia */
+        } else {
+            pos = atomic_load_explicit(&g_fq_head, memory_order_relaxed);
+        }
     }
-    fault_slot_t *s = g_fault_queue[head % DSM_FAULTQ_CAP];
-    atomic_store_explicit(&g_fq_head, head + 1, memory_order_release);
-    return s;
 }
 
 static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext_raw)
