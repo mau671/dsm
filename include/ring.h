@@ -6,13 +6,20 @@
 #include "dsm_types.h"
 #include "discovery.h"
 
+/* Anillo de dispersión consistente de 64 bits ponderado por memoria.
+ *
+ * Cada nodo vivo proyecta varios vnodes sobre el anillo, en cantidad
+ * proporcional a su memoria (VNODES_PER_MB por mebibyte aportado). Los vnodes
+ * se guardan ordenados por posición para resolver el home de una página con
+ * búsqueda binaria. */
 typedef struct {
-    uint64_t *vpos;
-    uint8_t  *vslot;
-    uint32_t  n;
-    uint64_t  epoch;
-    uint32_t  cache_home[4096];
-    uint32_t  cache_epoch[4096];
+    uint64_t *vpos;          /* Posición de cada vnode, ascendente */
+    uint32_t *vslot;         /* Ranura dueña de la posición homóloga */
+    uint32_t  n;             /* Vnodes actuales */
+    uint32_t  cap;           /* Capacidad reservada de vpos y vslot */
+    uint64_t  epoch;         /* Época de membresía con la que se construyó */
+    uint64_t  sig;           /* Firma de la membresía usada al construir */
+    bool      built;         /* El arreglo refleja una membresía no vacía */
 } dsm_ring_t;
 
 struct dsm_ctx;
