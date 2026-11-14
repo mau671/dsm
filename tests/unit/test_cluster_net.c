@@ -31,9 +31,7 @@ static void write_node_conf(const char *path, uint16_t port_min, uint16_t port_m
         "VIEW_SIZE           = 4294967296\n"
         "MAX_RUNTIME_NODES   = 256\n"
         "VNODES_PER_MB       = 16\n"
-        "CHUNK_PAGES         = 256\n"
         "REDUNDANCY          = NONE\n"
-        "RAID_K              = 2\n"
         "NODE_MEM            = 268435456\n"
         "PORT_MIN            = %u\n"
         "PORT_MAX            = %u\n"
@@ -52,11 +50,8 @@ static void write_node_conf(const char *path, uint16_t port_min, uint16_t port_m
         "DISPATCHER_THREADS  = 1\n"
         "PAGE_LOCK_STRIPES   = 64\n"
         "HOME_SLACK          = 1.25\n"
-        "WAIT_POOL_ENTRIES   = 1024\n"
         "LOCK_TIMEOUT_MS     = 5000\n"
         "WORKER_QUEUE_CAP    = 1024\n"
-        "SYNC_THREADS        = 2\n"
-        "OUTPUT_DIR          = /tmp\n"
         "DSM_LOG_LEVEL       = ERROR\n",
         port_min, port_max, reconnect_max_ms, hb_ms
     );
@@ -167,10 +162,16 @@ static int test_cluster_discovery_and_join_two_nodes(void)
     read(pipe_b_status[0], b_res, sizeof(b_res));
     close(pipe_b_status[0]);
 
-    /* Nodo B es aceptado como Slot 1 con Epoch 2 y ve 2 nodos vivos */
+    /*
+     * B se une como slot 1 y ve 2 nodos vivos. El epoch es una version de la
+     * membresia y crece con cada fusion o convergencia: su valor exacto
+     * depende de cuantas rondas de descubrimiento hicieron falta, asi que la
+     * invariante verificable es que sea posterior al epoch inicial del primer
+     * nodo (1), no un numero fijo.
+     */
     CHECK(b_res[0] == 1);
     CHECK(b_res[1] == 2);
-    CHECK(b_res[2] == 2);
+    CHECK(b_res[2] >= 2);
 
     /* Esperar sincronización y verificar que Nodo A también ve 2 nodos vivos */
     usleep(250000);
@@ -205,7 +206,7 @@ static int test_cluster_discovery_and_join_two_nodes(void)
  *  - Simula la detención/desconexión abrupta del Nodo B.
  *  - Comprueba que tras 3 latidos perdidos (~1.5 s) Nodo A marca Nodo B como SUSPECT.
  *  - Comprueba que tras 6 latidos perdidos (~3.0 s) Nodo A marca Nodo B como DEAD,
- *    difunde NODE_DOWN, y la ranura 1 queda temporalmente bloqueada para reutilización
+ *    difunde NODE_DOWN, y la ranura 1 queda bloqueada para reutilización
  *    hasta transcurrir reconnect_max_ms.
  * ============================================================================
  */
@@ -339,7 +340,7 @@ static int test_cluster_heartbeat_and_timeout_degradation(void)
     /*
      * 4. Comprobar que tras 6 latidos perdidos (~1500 ms acumulados),
      *    el Nodo A marca al Nodo B como DEAD, difunde NODE_DOWN,
-     *    y la ranura 1 queda temporalmente bloqueada para reutilización
+     *    y la ranura 1 queda bloqueada para reutilización
      *    hasta transcurrir reconnect_max_ms.
      */
     usleep(950000); /* Total acumulado = 1.8 s (> 6 latidos de 250ms = 1.5s) */
@@ -353,7 +354,7 @@ static int test_cluster_heartbeat_and_timeout_degradation(void)
     CHECK(dsm_node_count(&live_count) == DSM_OK);
     CHECK(live_count == 1);
 
-    /* Ranura 1 retenida en cuarentena */
+    /* Ranura 1 retenida en cuarentena durante reconnect_max_ms */
     uint64_t now_ms = mono_ms();
     CHECK(reusable_ms > now_ms);
     uint32_t next_free = membership_first_free_slot(ctx_a);
@@ -467,7 +468,8 @@ static int test_cluster_orderly_leave(void)
     /*
      * El MSG_LEAVE viaja por red antes de que el proceso hijo finalice.
      * En breve intervalo (< 250ms), Nodo A debe haber procesado el LEAVE
-     * y marcado la ranura 1 como DEAD limpiamente sin esperar los 3.0s de latidos.
+     * y marcado la ranura 1 como DEAD limpiamente sin esperar los timeouts
+     * de latidos.
      */
     usleep(250000);
 

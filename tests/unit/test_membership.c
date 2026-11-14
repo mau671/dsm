@@ -112,9 +112,9 @@ static int test_membership_reusable_slot_delay(void)
     CHECK(membership_slot_present(&ctx, 1) == false);
     CHECK(ctx.memb.reusable_after_ms[1] == 5000 + 2000);
 
-    /* En t = 6000 (< 7000), el slot 1 aún está en periodo de gracia/cuarentena */
-    /* membership_first_free_slot consulta mono_ms(), pero podemos probar membership_next_free_slot
-     * o ver que reusable_after_ms[1] es mayor al tiempo actual */
+    /* En t = 6000 (< 7000), el slot 1 aún está en periodo de gracia/cuarentena.
+     * membership_first_free_slot consulta mono_ms(), asi que se verifica el
+     * vencimiento directamente sobre reusable_after_ms. */
     CHECK(ctx.memb.reusable_after_ms[1] > 6000);
 
     membership_destroy(&ctx);

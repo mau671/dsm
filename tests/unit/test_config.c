@@ -20,15 +20,25 @@
  *      un espacio final, dos lecturas identicas), limites de sistema uno por
  *      uno con VIEW_SIZE/NODE_MEM coherentes, archivo de 1 MiB exacto y
  *      1 MiB + 1, rutas no regulares, y config_validate() mutada campo a campo.
+ *  10. REQUEST_RETRIES: un par que descarta la primera peticion y responde la
+ *      segunda demuestra el reenvio real de dsm_net_rpc() con req_id nuevo y
+ *      espera de backoff, y con REQUEST_RETRIES = 1 no hay segundo intento.
  * ============================================================================== */
 
 #include "test.h"
 #include "config.h"
 #include "wire.h"
+#include "net.h"
+#include "util.h"
+#include "dsm_internal.h"
 
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include <errno.h>
 
 /* ----------------------------------------------------------------------------
@@ -111,9 +121,7 @@ static int test_load_repo_config(void)
     CHECK(cfg.node_mem == 268435456ULL);
     CHECK(cfg.max_runtime_nodes == 256);
     CHECK(cfg.vnodes_per_mb == 16);
-    CHECK(cfg.chunk_pages == 256);
     CHECK(cfg.redundancy_raid5 == false);
-    CHECK(cfg.raid_k == 2);
 
     /* Red */
     CHECK(cfg.port_min == 27600);
@@ -140,13 +148,10 @@ static int test_load_repo_config(void)
     CHECK(cfg.dispatcher_threads == 2);
     CHECK(cfg.page_lock_stripes == 256);
     CHECK(cfg.home_slack_permille == 1250);       /* 1.25 -> 1250 */
-    CHECK(cfg.wait_pool_entries == 4096);
     CHECK(cfg.lock_timeout_ms == 10000);
     CHECK(cfg.worker_queue_cap == 4096);
-    CHECK(cfg.sync_threads == 4);                 /* clave que antes no existia */
 
     /* Diagnostico */
-    CHECK(strcmp(cfg.output_dir, "./reportes") == 0);
     CHECK(strcmp(cfg.log_level, "INFO") == 0);
 
     /* raw_hash == CRC32 exacto del archivo, no un valor cualquiera */
@@ -155,9 +160,9 @@ static int test_load_repo_config(void)
     static uint8_t buf[1 << 20];
     size_t n = fread(buf, 1, sizeof(buf), f);
     fclose(f);
-    CHECK(n == 1933);
+    CHECK(n == 1852);
     CHECK(cfg.raw_hash == dsm_crc32(0, buf, n));
-    CHECK(cfg.raw_hash == 0xBB8AFAE5u);
+    CHECK(cfg.raw_hash == 0x6B51CA15u);
 
     /* Dos lecturas identicas del mismo archivo producen el mismo hash exacto.
      * Esto es la base del handshake HELLO: si dos nodos leen el mismo byte
@@ -336,13 +341,13 @@ static int test_numeric_overflow(void)
     /* Hex y octal implicito (base 0) */
     CHECK(load_fixture("hex.conf", "CLUSTER_ID = 0xDEADBEEF\n", &cfg) == DSM_OK);
     CHECK(cfg.cluster_id == 0xDEADBEEF);
-    CHECK(load_fixture("octal.conf", "CHUNK_PAGES = 010\n", &cfg) == DSM_OK);
-    CHECK(cfg.chunk_pages == 8);                  /* 010 octal == 8 */
+    CHECK(load_fixture("octal.conf", "WORKER_QUEUE_CAP = 010\n", &cfg) == DSM_OK);
+    CHECK(cfg.worker_queue_cap == 8);             /* 010 octal == 8 */
     CHECK(load_fixture("hex_over.conf", "CLUSTER_ID = 0x1FFFFFFFF\n", &cfg) == DSM_ERR_CONFIG);
 
     /* +N explicito: strtoull lo acepta; debe seguir siendo un valor valido */
-    CHECK(load_fixture("plus.conf", "CHUNK_PAGES = +512\n", &cfg) == DSM_OK);
-    CHECK(cfg.chunk_pages == 512);
+    CHECK(load_fixture("plus.conf", "WORKER_QUEUE_CAP = +512\n", &cfg) == DSM_OK);
+    CHECK(cfg.worker_queue_cap == 512);
 
     /* Numero flotante donde se espera entero */
     CHECK(load_fixture("float_int.conf", "PAGE_SIZE = 4096.0\n", &cfg) == DSM_ERR_CONFIG);
@@ -699,14 +704,20 @@ static int test_cross_validation_rules(void)
     EXPECT_OK("MAX_RUNTIME_NODES = 1\n");
     EXPECT_OK("MAX_RUNTIME_NODES = 256\n");
 
-    /* RAID5 no soportado en P1 */
+    /* RAID5 no soportado */
     EXPECT_BAD("cv_raid5.conf", "REDUNDANCY = RAID5\n");
     EXPECT_OK("REDUNDANCY = NONE\n");
     EXPECT_OK("REDUNDANCY = none\n");       /* case-insensitive */
 
-    /* REQUEST_RETRIES >= 1 */
+    /* REQUEST_RETRIES >= 1 y acotado por DSM_MAX_REQUEST_RETRIES */
     EXPECT_BAD("cv_retries_zero.conf", "REQUEST_RETRIES = 0\n");
     EXPECT_OK("REQUEST_RETRIES = 1\n");
+    EXPECT_BAD("cv_retries_over.conf", "REQUEST_RETRIES = 11\n");
+    EXPECT_OK("REQUEST_RETRIES = 10\n");
+
+    /* El backoff exponencial exige min <= max */
+    EXPECT_BAD("cv_backoff_inv.conf", "RECONNECT_MIN_MS = 3000\nRECONNECT_MAX_MS = 2000\n");
+    EXPECT_OK("RECONNECT_MIN_MS = 500\nRECONNECT_MAX_MS = 500\n");
 
     /* HOME_SLACK < 1.0 mediante el entero ya convertido */
     EXPECT_BAD("cv_slack_small.conf", "HOME_SLACK = 0.5\n");
@@ -770,7 +781,7 @@ static int test_reload_and_null_safety(void)
     cfg.raw_hash = 0xDEADBEEF;
     REQUIRE(config_load(&cfg, "dsm.conf") == DSM_OK);
     CHECK(cfg.peer_host_count == 5);
-    CHECK(cfg.raw_hash == 0xBB8AFAE5u);
+    CHECK(cfg.raw_hash == 0x6B51CA15u);
     CHECK(cfg.page_size == 4096);
 
     /* config_free es idempotente y tolera NULL */
@@ -1103,7 +1114,7 @@ static int test_rig_archivo_enorme_y_no_regular(void)
     CHECK(cfg.page_size == 4096);
     CHECK(cfg.raw_hash == dsm_crc32(0, buf, exact));
 
-    /* Un byte mas supera el limite: rechazo antes de parsear. */
+    /* Un byte mas supera el limite: rechazo por tamano, antes de parsear. */
     uint8_t *big = malloc(exact + 1);
     REQUIRE(big != NULL);
     memset(big, '#', exact + 1);
@@ -1198,6 +1209,10 @@ static int test_rig_validacion_directa(void)
     /* Resto de reglas cruzadas. */
     RIG_MUT(home_slack_permille, 999u);
     RIG_MUT(request_retries, 0u);
+    RIG_MUT(request_retries, DSM_MAX_REQUEST_RETRIES + 1u);
+    RIG_MUT_OK(request_retries, DSM_MAX_REQUEST_RETRIES);
+    RIG_MUT(reconnect_min_ms, base.reconnect_max_ms + 1u);
+    RIG_MUT_OK(reconnect_min_ms, base.reconnect_max_ms);
     RIG_MUT(max_runtime_nodes, (uint32_t)MAX_NODES + 1u);
     RIG_MUT(redundancy_raid5, true);
 
@@ -1277,6 +1292,277 @@ static int test_rig_hash_sobrevive_al_rechazo(void)
     return 0;
 }
 
+/* ----------------------------------------------------------------------------
+ * 15. REQUEST_RETRIES gobierna reintentos reales de dsm_net_rpc()
+ *
+ * El par de prueba acepta conexiones en el bloque del grupo. La primera
+ * peticion se cierra sin respuesta (fallo de transporte) y la segunda se
+ * responde con MSG_NACK, de modo que el exito solo es posible si el emisor
+ * reenvio la solicitud. El listener real del nodo completa la peticion
+ * pendiente cuando la respuesta llega por TCP.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+    int      listen_fd;
+    int      nconn;         /* conexiones que atiende antes de salir */
+    bool     reply_last;    /* responde la ultima conexion */
+    uint16_t reply_port;    /* puerto de escucha del nodo emisor */
+    uint16_t reply_status;
+    uint32_t seen_req[4];
+    int      nseen;
+} rpc_peer_t;
+
+/* Acepta una conexion con plazo, para que un cliente que no reintenta no
+ * deje el hilo del par bloqueado. */
+static int peer_accept(int listen_fd)
+{
+    struct pollfd pfd = { .fd = listen_fd, .events = POLLIN, .revents = 0 };
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 5000);
+    } while (rc < 0 && errno == EINTR);
+    if (rc <= 0) return -1;
+    return accept(listen_fd, NULL, NULL);
+}
+
+/* Lee cabecera y carga de una trama con la misma ruta que usa el daemon. */
+static int peer_read_msg(int fd, msg_header_t *hdr)
+{
+    uint8_t raw[DSM_HDR_LEN];
+    if (dsm_read_full_deadline(fd, raw, DSM_HDR_LEN, 2000) != DSM_OK) return -1;
+    if (dsm_wire_unpack(raw, hdr) != DSM_OK) return -1;
+
+    if (hdr->payload_len > 0) {
+        uint8_t *payload = malloc(hdr->payload_len);
+        if (!payload) return -1;
+        int rc = dsm_read_full_deadline(fd, payload, hdr->payload_len, 2000);
+        free(payload);
+        if (rc != DSM_OK) return -1;
+    }
+    return 0;
+}
+
+static void *rpc_peer_main(void *arg)
+{
+    rpc_peer_t *p = (rpc_peer_t *)arg;
+
+    for (int i = 0; i < p->nconn; i++) {
+        int cfd = peer_accept(p->listen_fd);
+        if (cfd < 0) break;
+
+        msg_header_t hdr;
+        if (peer_read_msg(cfd, &hdr) != 0) {
+            close(cfd);
+            continue;
+        }
+        if (p->nseen < 4) {
+            p->seen_req[p->nseen++] = hdr.req_id;
+        }
+
+        if (!p->reply_last || i != p->nconn - 1) {
+            close(cfd);
+            continue;
+        }
+
+        /* El protocolo responde por una conexion nueva hacia el puerto de
+         * escucha del solicitante, no por el socket de la peticion. */
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port        = htons(p->reply_port);
+
+        int out_fd = dsm_connect_timeout(&addr, 500);
+        if (out_fd >= 0) {
+            msg_header_t resp;
+            memset(&resp, 0, sizeof(resp));
+            resp.magic         = DSM_MAGIC;
+            resp.cluster_id    = hdr.cluster_id;
+            resp.proto_version = DSM_PROTO_VERSION;
+            resp.type          = MSG_NACK;
+            resp.src_slot      = hdr.dst_slot;
+            resp.dst_slot      = hdr.src_slot;
+            resp.req_id        = hdr.req_id;
+            resp.status        = p->reply_status;
+            resp.epoch         = hdr.epoch;
+
+            uint8_t raw[DSM_HDR_LEN];
+            dsm_wire_finish(&resp, raw, NULL, 0);
+            dsm_send_full(out_fd, raw, DSM_HDR_LEN);
+            shutdown(out_fd, SHUT_RDWR);
+            close(out_fd);
+        }
+        close(cfd);
+    }
+    return NULL;
+}
+
+/* Reserva un puerto libre del bloque asignado y lo deja escuchando. */
+static int peer_listen(uint16_t *port_out)
+{
+    for (uint16_t port = DSM_PORT_BLOCK_MIN; port <= DSM_PORT_BLOCK_MAX; port++) {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+
+        int opt = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port        = htons(port);
+
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
+            listen(fd, 8) == 0) {
+            *port_out = port;
+            return fd;
+        }
+        close(fd);
+    }
+    return -1;
+}
+
+/* Prepara un contexto de prueba con un par alcanzable en 'peer_port'. */
+static dsm_ctx_t *rpc_ctx_create(uint16_t peer_port, uint32_t retries,
+                                 uint32_t request_timeout_ms)
+{
+    dsm_ctx_t *ctx = dsm_ctx_create_test();
+    if (!ctx) return NULL;
+
+    ctx->cfg.cluster_id         = 0x534F3031u;
+    ctx->cfg.page_size          = 4096;
+    ctx->cfg.request_timeout_ms = request_timeout_ms;
+    ctx->cfg.request_retries    = retries;
+    ctx->cfg.reconnect_min_ms   = 10;
+    ctx->cfg.reconnect_max_ms   = 40;
+    ctx->cfg.connect_timeout_ms = 200;
+    ctx->cfg.send_timeout_ms    = 500;
+    ctx->memb.self_slot         = 0;
+
+    uint16_t listen_port = 0;
+    ctx->net.listen_fd = peer_listen(&listen_port);
+    if (ctx->net.listen_fd < 0) {
+        net_destroy(ctx);
+        sync_destroy(ctx);
+        membership_destroy(ctx);
+        free(ctx);
+        return NULL;
+    }
+    ctx->net.listen_port = listen_port;
+
+    pthread_rwlock_wrlock(&ctx->memb.rw);
+    node_info_t *ni = &ctx->memb.nodes[1];
+    memset(ni, 0, sizeof(*ni));
+    ni->slot  = 1;
+    ni->ip    = htonl(INADDR_LOOPBACK);
+    ni->port  = peer_port;
+    ni->state = DSM_NODE_ALIVE;
+    ctx->memb.present[1 / 8] |= (uint8_t)(1u << (1 % 8));
+    pthread_rwlock_unlock(&ctx->memb.rw);
+
+    atomic_store(&ctx->running, true);
+    if (net_start_listener(ctx) != DSM_OK) {
+        close(ctx->net.listen_fd);
+        ctx->net.listen_fd = -1;
+        net_destroy(ctx);
+        sync_destroy(ctx);
+        membership_destroy(ctx);
+        free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
+static void rpc_ctx_destroy(dsm_ctx_t *ctx)
+{
+    atomic_store(&ctx->running, false);
+    net_stop_listener(ctx);
+    net_destroy(ctx);
+    sync_destroy(ctx);
+    membership_destroy(ctx);
+    ring_free(&ctx->ring);
+    free(ctx);
+}
+
+static int test_request_retries_reintenta(void)
+{
+    uint16_t peer_port = 0;
+    int peer_fd = peer_listen(&peer_port);
+    REQUIRE(peer_fd >= 0);
+
+    rpc_peer_t peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.listen_fd   = peer_fd;
+    peer.nconn       = 2;        /* primera sin respuesta, segunda con NACK */
+    peer.reply_last  = true;
+    peer.reply_status = DSM_ST_OK;
+
+    dsm_ctx_t *ctx = rpc_ctx_create(peer_port, 2, 200);
+    REQUIRE(ctx != NULL);
+    peer.reply_port = ctx->net.listen_port;
+
+    pthread_t tid;
+    REQUIRE(pthread_create(&tid, NULL, rpc_peer_main, &peer) == 0);
+
+    uint16_t status = 0xFFFF;
+    uint32_t rx_len = 0;
+    uint64_t t0 = mono_ms();
+    int rc = dsm_net_rpc(ctx, 1, MSG_PAGE_REQUEST, 0, 0, 0, 0,
+                         NULL, 0, &status, NULL, &rx_len);
+    uint64_t elapsed = mono_ms() - t0;
+
+    pthread_join(tid, NULL);
+
+    CHECK(rc == DSM_OK);
+    CHECK(status == DSM_ST_OK);
+    CHECK(peer.nseen == 2);
+    /* El reintento espera al menos RECONNECT_MIN_MS antes de reenviar. */
+    CHECK(elapsed >= ctx->cfg.reconnect_min_ms);
+    if (peer.nseen == 2) {
+        /* Cada reintento usa un req_id nuevo: el pendiente anterior ya fue
+         * retirado y reutilizar su identificador confundiria la correlacion. */
+        CHECK(peer.seen_req[0] != peer.seen_req[1]);
+    }
+
+    rpc_ctx_destroy(ctx);
+    close(peer_fd);
+    return 0;
+}
+
+static int test_request_retries_un_solo_intento(void)
+{
+    uint16_t peer_port = 0;
+    int peer_fd = peer_listen(&peer_port);
+    REQUIRE(peer_fd >= 0);
+
+    rpc_peer_t peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.listen_fd  = peer_fd;
+    peer.nconn      = 1;         /* solo una conexion: REQUEST_RETRIES = 1 */
+    peer.reply_last = false;
+
+    dsm_ctx_t *ctx = rpc_ctx_create(peer_port, 1, 200);
+    REQUIRE(ctx != NULL);
+
+    pthread_t tid;
+    REQUIRE(pthread_create(&tid, NULL, rpc_peer_main, &peer) == 0);
+
+    uint16_t status = 0xFFFF;
+    uint32_t rx_len = 0;
+    int rc = dsm_net_rpc(ctx, 1, MSG_PAGE_REQUEST, 0, 0, 0, 0,
+                         NULL, 0, &status, NULL, &rx_len);
+
+    pthread_join(tid, NULL);
+
+    CHECK(rc == DSM_ERR_TIMEOUT);
+    CHECK(peer.nseen == 1);
+
+    rpc_ctx_destroy(ctx);
+    close(peer_fd);
+    return 0;
+}
+
 /* ------------------------------------------------------------------------- */
 
 int main(void)
@@ -1301,6 +1587,8 @@ int main(void)
     RUN_TEST(test_rig_archivo_enorme_y_no_regular);
     RUN_TEST(test_rig_validacion_directa);
     RUN_TEST(test_rig_hash_sobrevive_al_rechazo);
+    RUN_TEST(test_request_retries_reintenta);
+    RUN_TEST(test_request_retries_un_solo_intento);
 
     printf("%d pruebas ejecutadas, %d fallos\n", g_tests, g_fails);
     return g_fails ? 1 : 0;

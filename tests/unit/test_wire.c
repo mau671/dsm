@@ -499,13 +499,13 @@ static int test_membership_matrix_roundtrip(void)
 
     /* Un cambio de un bit en cualquier registro no debe propagarse a los
      * registros vecinos al desempaquetar (cada uno ocupa exactamente 36 B). */
-    membership_wire_t antes, despues;
-    dsm_unpack_membership(packed + 10 * 36, &antes);
+    membership_wire_t previo, posterior;
+    dsm_unpack_membership(packed + 10 * 36, &previo);
     packed[10 * 36 + 22] ^= 0x01;   /* bit bajo del slot del nodo 10 */
-    dsm_unpack_membership(packed + 10 * 36, &despues);
-    CHECK(despues.slot == (antes.slot ^ 0x01));
-    dsm_unpack_membership(packed + 11 * 36, &despues);
-    CHECK(memcmp(despues.uuid, nodes[11].uuid, 16) == 0);
+    dsm_unpack_membership(packed + 10 * 36, &posterior);
+    CHECK(posterior.slot == (previo.slot ^ 0x01));
+    dsm_unpack_membership(packed + 11 * 36, &posterior);
+    CHECK(memcmp(posterior.uuid, nodes[11].uuid, 16) == 0);
 
     return 0;
 }
@@ -1374,7 +1374,7 @@ static int test_rig_payload_ok_por_tipo(void)
     CHECK(wire_payload_ok(MSG_HEARTBEAT, 0, 11, ps) == false);
     CHECK(wire_payload_ok(MSG_HEARTBEAT, 0, 13, ps) == false);
 
-    /* NODE_DOWN: 0 (implementacion actual) o 28 (slot + incarnation + uuid). */
+    /* NODE_DOWN: 0 (sin carga) o 28 (slot + incarnation + uuid). */
     CHECK(wire_payload_ok(MSG_NODE_DOWN, 0, 0, ps) == true);
     CHECK(wire_payload_ok(MSG_NODE_DOWN, 0, 28, ps) == true);
     CHECK(wire_payload_ok(MSG_NODE_DOWN, 0, 27, ps) == false);
@@ -1434,7 +1434,7 @@ static int test_rig_payload_ok_por_tipo(void)
     CHECK(wire_payload_ok(MSG_BARRIER_GO, 0, 0, ps) == false);
     CHECK(wire_payload_ok(MSG_BARRIER_GO, 0, 5, ps) == false);
 
-    /* Tipos solo acotados por DSM_MAX_PAYLOAD (P2/variables). */
+    /* Tipos solo acotados por DSM_MAX_PAYLOAD (carga variable). */
     static const uint16_t variables[] = {
         MSG_PAGE_MOVE, MSG_PAGE_MOVE_ACK, MSG_PARITY_DELTA, MSG_PARITY_ACK,
         MSG_STRIPE_PUT, MSG_STRIPE_PUT_ACK, MSG_STRIPE_READ, MSG_STRIPE_DATA,
@@ -1454,8 +1454,6 @@ static int test_rig_payload_ok_por_tipo(void)
 
     return 0;
 }
-
-/* ------------------------------------------------------------------------- */
 
 int main(void)
 {

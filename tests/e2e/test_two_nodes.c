@@ -11,7 +11,7 @@
 #include <unistd.h>
 
 #define CONF_PATH "/tmp/dsm_two_nodes_integration.conf"
-#define TEST_APP "./build/debug/test_basico"
+#define TEST_APP "./build/bin/debug/test_basico"
 #define LINE_TIMEOUT_MS 15000
 
 typedef struct {
@@ -32,9 +32,7 @@ static void write_config(void)
             "VIEW_SIZE=4294967296\n"
             "MAX_RUNTIME_NODES=256\n"
             "VNODES_PER_MB=16\n"
-            "CHUNK_PAGES=256\n"
             "REDUNDANCY=NONE\n"
-            "RAID_K=2\n"
             "NODE_MEM=67108864\n"
             "PORT_MIN=27660\n"
             "PORT_MAX=27699\n"
@@ -53,11 +51,8 @@ static void write_config(void)
             "DISPATCHER_THREADS=1\n"
             "PAGE_LOCK_STRIPES=64\n"
             "HOME_SLACK=1.25\n"
-            "WAIT_POOL_ENTRIES=1024\n"
             "LOCK_TIMEOUT_MS=5000\n"
             "WORKER_QUEUE_CAP=1024\n"
-            "SYNC_THREADS=2\n"
-            "OUTPUT_DIR=/tmp\n"
             "DSM_LOG_LEVEL=ERROR\n");
     fclose(file);
 }
@@ -125,6 +120,38 @@ static void send_command(child_t *child, const char *command)
     }
 }
 
+/* Lee una linea de estadisticas y exige que cada clave de `keys` aparezca con
+ * un valor mayor que cero. El formato lo produce print_stats() de
+ * apps/test_basico.c. */
+static bool expect_stats_positive(child_t *child, const char *const *keys,
+                                  size_t nkeys)
+{
+    char line[512];
+    if (!read_line(child, line, sizeof(line))) {
+        printf("  FAIL: no se recibio linea de stats dentro del timeout\n");
+        return false;
+    }
+    printf("  %s", line);
+
+    bool ok = true;
+    for (size_t i = 0; i < nkeys; i++) {
+        char pattern[64];
+        snprintf(pattern, sizeof(pattern), "%s=", keys[i]);
+        const char *pos = strstr(line, pattern);
+        if (!pos) {
+            printf("  FAIL: la linea de stats no incluye '%s'\n", keys[i]);
+            ok = false;
+            continue;
+        }
+        unsigned long long value = strtoull(pos + strlen(pattern), NULL, 10);
+        if (value == 0) {
+            printf("  FAIL: %s vale 0 y se esperaba un valor mayor\n", keys[i]);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 static void stop_child(child_t *child)
 {
     if (child->input) fclose(child->input);
@@ -170,7 +197,12 @@ int main(void)
         pass = expect_line(&node_b, "B_AFTER_WRITE stats") && pass;
         send_command(&node_a, "READ");
         pass = expect_line(&node_a, "A_AFTER_B_WRITE PASS") && pass;
-        pass = expect_line(&node_a, "A_AFTER_READ stats") && pass;
+        static const char *const a_read_keys[] = {
+            "invalidations", "faults_serviced", "fault_latency_us_avg"
+        };
+        pass = expect_stats_positive(&node_a, a_read_keys,
+                                     sizeof(a_read_keys) / sizeof(a_read_keys[0]))
+               && pass;
     }
 
     send_command(&node_a, "QUIT");
