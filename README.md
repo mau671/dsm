@@ -4,7 +4,7 @@
 
 # DSM
 
-**Memoria compartida distribuida con coherencia MSI sobre Linux.**
+**Memoria compartida distribuida sobre Linux.**
 
 Varios procesos independientes aportan memoria física a un espacio global y proyectan la
 misma vista virtual. La aplicación usa punteros normales: cuando toca una página que no
