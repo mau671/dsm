@@ -20,6 +20,70 @@ static void copyset_set(dir_entry_t *entry, uint32_t slot)
 
 static void page_invalidate_local(dsm_ctx_t *ctx, uint32_t page);
 
+#if defined(DSM_TEST_HOOKS)
+static pthread_mutex_t g_busy_test_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_busy_test_cv = PTHREAD_COND_INITIALIZER;
+static uint32_t g_busy_test_page = DSM_SLOT_NONE;
+static bool g_busy_test_entered;
+static bool g_busy_test_release;
+static bool g_busy_test_fail;
+static bool g_busy_test_second_seen;
+
+void msi_test_busy_hook_config(uint32_t page, bool fail)
+{
+    pthread_mutex_lock(&g_busy_test_mu);
+    g_busy_test_page = page;
+    g_busy_test_fail = fail;
+    g_busy_test_entered = false;
+    g_busy_test_release = false;
+    g_busy_test_second_seen = false;
+    pthread_mutex_unlock(&g_busy_test_mu);
+}
+
+void msi_test_busy_hook_wait_entered(void)
+{
+    pthread_mutex_lock(&g_busy_test_mu);
+    while (!g_busy_test_entered) {
+        pthread_cond_wait(&g_busy_test_cv, &g_busy_test_mu);
+    }
+    pthread_mutex_unlock(&g_busy_test_mu);
+}
+
+void msi_test_busy_hook_release(void)
+{
+    pthread_mutex_lock(&g_busy_test_mu);
+    g_busy_test_release = true;
+    pthread_cond_broadcast(&g_busy_test_cv);
+    pthread_mutex_unlock(&g_busy_test_mu);
+}
+
+bool msi_test_busy_hook_second_seen(void)
+{
+    pthread_mutex_lock(&g_busy_test_mu);
+    bool seen = g_busy_test_second_seen;
+    pthread_mutex_unlock(&g_busy_test_mu);
+    return seen;
+}
+
+static bool busy_test_wait(dsm_ctx_t *ctx, uint32_t page)
+{
+    (void)ctx;
+    pthread_mutex_lock(&g_busy_test_mu);
+    if (!g_busy_test_entered && g_busy_test_page == page) {
+        g_busy_test_entered = true;
+        pthread_cond_broadcast(&g_busy_test_cv);
+        while (!g_busy_test_release) {
+            pthread_cond_wait(&g_busy_test_cv, &g_busy_test_mu);
+        }
+        bool fail = g_busy_test_fail;
+        pthread_mutex_unlock(&g_busy_test_mu);
+        return fail;
+    }
+    pthread_mutex_unlock(&g_busy_test_mu);
+    return false;
+}
+#endif
+
 /* --- Identidad del home de cada página ---
  *
  * home_map guarda el último home calculado para cada página. Cuando el anillo
@@ -305,11 +369,25 @@ static int invalidate_remote_copies(dsm_ctx_t *ctx, uint32_t page,
 
 static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
 {
+    bool reserved = false;
+    int result = DSM_OK;
     dir_entry_t entry = dir_snapshot(ctx, page);
+
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    if (ctx->msi.dir[page].busy) {
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
+        return DSM_ERR_BUSY;
+    }
+    ctx->msi.dir[page].busy = 1;
+    reserved = true;
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
 
     uint32_t previous_owner = entry.owner;
     uint8_t *data = malloc(ctx->mem.page_size);
-    if (!data) return DSM_ERR_MEM;
+    if (!data) {
+        result = DSM_ERR_MEM;
+        goto out;
+    }
 
     bool remote_owner = (entry.state == DSM_DIR_MODIFIED &&
                          entry.owner != DSM_SLOT_NONE &&
@@ -328,7 +406,8 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
         if (rc != DSM_OK || status != DSM_ST_OK ||
             data_len != ctx->mem.page_size) {
             free(data);
-            return (rc == DSM_OK) ? DSM_ERR_NET : rc;
+            result = (rc == DSM_OK) ? DSM_ERR_NET : rc;
+            goto out;
         }
     } else if (local_owner) {
         /* Antes de copiar, cerrar escritura impide que un hilo pierda el
@@ -337,7 +416,8 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
         if (dsm_mem_set_prot(&ctx->mem, page, PROT_READ) != DSM_OK) {
             dsm_mem_stripe_unlock(&ctx->mem, page);
             free(data);
-            return DSM_ERR_MEM;
+            result = DSM_ERR_MEM;
+            goto out;
         }
         memcpy(data, dsm_mem_page_ptr(&ctx->mem, page),
                ctx->mem.page_size);
@@ -351,7 +431,8 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
         home_page_content(ctx, page, data, &known);
         if (!known) {
             free(data);
-            return DSM_ERR_NET;
+            result = DSM_ERR_NET;
+            goto out;
         }
     }
 
@@ -360,24 +441,32 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
          * viejas se invalidan antes de abrir la vista local en M. */
         if (dsm_mem_backing_store(&ctx->mem, page, data) != DSM_OK) {
             free(data);
-            return DSM_ERR_NO_SPACE;
+            result = DSM_ERR_NO_SPACE;
+            goto out;
         }
         int inv_rc = invalidate_remote_copies(ctx, page, &entry,
                                               ctx->memb.self_slot);
         if (inv_rc != DSM_OK) {
             free(data);
-            return inv_rc;
+            result = inv_rc;
+            goto out;
         }
 
         int rc = page_apply(ctx, page, DSM_PAGE_M,
                             data, ctx->mem.page_size);
         free(data);
-        if (rc != DSM_OK) return rc;
+        if (rc != DSM_OK) {
+            result = rc;
+            goto out;
+        }
     } else {
         int rc = page_apply(ctx, page, DSM_PAGE_S,
                             data, ctx->mem.page_size);
         free(data);
-        if (rc != DSM_OK) return rc;
+        if (rc != DSM_OK) {
+            result = rc;
+            goto out;
+        }
 
         /* En lectura la copia ya quedó aplicada y puede persistirse con
          * seguridad antes de publicar el directorio. */
@@ -404,7 +493,15 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
     }
     ctx->msi.dir[page] = entry;
     pthread_mutex_unlock(&ctx->msi.dir_mu);
-    return DSM_OK;
+    result = DSM_OK;
+
+out:
+    if (reserved) {
+        pthread_mutex_lock(&ctx->msi.dir_mu);
+        ctx->msi.dir[page].busy = 0;
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
+    }
+    return result;
 }
 
 /* --- Inicialización --- */
@@ -535,6 +632,9 @@ int msi_local_fault(dsm_ctx_t *ctx, fault_slot_t *s)
     if (rc == DSM_OK && status == DSM_ST_OK) {
         rc = page_apply(ctx, page, write ? DSM_PAGE_M : DSM_PAGE_S,
                         rx, rx_len);
+    } else if (rc == DSM_OK && status == DSM_ST_BUSY) {
+        page_invalidate_local(ctx, page);
+        rc = DSM_ERR_BUSY;
     } else if (rc == DSM_OK) {
         rc = DSM_ERR_NET;
     }
@@ -609,6 +709,7 @@ static void home_handle_probe(dsm_ctx_t *ctx, const dsm_msg_t *m)
 void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
 {
     if (!ctx || !m || m->hdr.page_id >= ctx->mem.npages) return;
+    bool reserved = false;
 
     /* Las sondas llegan a nodos que ya no son home y deben contestarse con el
      * contenido que conserven. */
@@ -628,6 +729,27 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
         return;
     }
 
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    if (ctx->msi.dir[page].busy) {
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
+#if defined(DSM_TEST_HOOKS)
+        pthread_mutex_lock(&g_busy_test_mu);
+        g_busy_test_second_seen = true;
+        pthread_mutex_unlock(&g_busy_test_mu);
+#endif
+        send_nack(ctx, m, DSM_ST_BUSY);
+        return;
+    }
+    ctx->msi.dir[page].busy = 1;
+    reserved = true;
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
+
+#if defined(DSM_TEST_HOOKS)
+    if (busy_test_wait(ctx, page)) {
+        goto out;
+    }
+#endif
+
     dir_entry_t entry = dir_snapshot(ctx, page);
 
     uint8_t *data = NULL;
@@ -642,7 +764,7 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
 
     if (owner_remote) {
         data = malloc(ctx->mem.page_size);
-        if (!data) return;
+        if (!data) goto out;
         data_len = ctx->mem.page_size;
         uint16_t status = DSM_ST_OK;
         rc = dsm_net_rpc(ctx, entry.owner, MSG_DOWNGRADE, page, entry.tseq,
@@ -652,19 +774,19 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
             data_len != ctx->mem.page_size) {
             free(data);
             send_nack(ctx, m, DSM_ST_BUSY);
-            return;
+            goto out;
         }
     } else if (owner_local) {
         /* El dueño local se degrada antes de copiar: así ningún hilo puede
          * modificar el alias mientras se produce el contenido que se concede. */
         data = malloc(ctx->mem.page_size);
-        if (!data) return;
+        if (!data) goto out;
         dsm_mem_stripe_lock(&ctx->mem, page);
         if (dsm_mem_set_prot(&ctx->mem, page, PROT_READ) != DSM_OK) {
             dsm_mem_stripe_unlock(&ctx->mem, page);
             free(data);
             send_nack(ctx, m, DSM_ST_BUSY);
-            return;
+            goto out;
         }
         memcpy(data, dsm_mem_page_ptr(&ctx->mem, page),
                ctx->mem.page_size);
@@ -678,12 +800,12 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
          * de respaldo, de un par que todavía lo conserve o de ceros. */
         bool known = true;
         data = malloc(ctx->mem.page_size);
-        if (!data) return;
+        if (!data) goto out;
         home_page_content(ctx, page, data, &known);
         if (!known) {
             free(data);
             send_nack(ctx, m, DSM_ST_BUSY);
-            return;
+            goto out;
         }
         data_len = ctx->mem.page_size;
     }
@@ -715,14 +837,14 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
         response.payload_len = data_len;
         (void)dsm_net_send(ctx, requester, &response, data);
         free(data);
-        return;
+        goto out;
     }
 
     rc = invalidate_remote_copies(ctx, page, &entry, requester);
     if (rc != DSM_OK) {
         free(data);
         send_nack(ctx, m, DSM_ST_BUSY);
-        return;
+        goto out;
     }
 
     /* El home conserva la versión entregada: si el anillo le quita la página,
@@ -755,6 +877,13 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
     response.payload_len = data_len;
     (void)dsm_net_send(ctx, requester, &response, data);
     free(data);
+
+out:
+    if (reserved) {
+        pthread_mutex_lock(&ctx->msi.dir_mu);
+        ctx->msi.dir[page].busy = 0;
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
+    }
 }
 
 /* --- Mensajes de coherencia --- */
@@ -857,6 +986,10 @@ void msi_on_writeback(dsm_ctx_t *ctx, const dsm_msg_t *m)
         status = DSM_ST_NOT_HOME;
     } else if (dsm_mem_backing_store(&ctx->mem, page, m->payload) != DSM_OK) {
         status = DSM_ST_NO_SPACE;
+    } else {
+        pthread_mutex_lock(&ctx->msi.dir_mu);
+        ctx->msi.dir[page].busy = 0;
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
     }
 
     msg_header_t ack;

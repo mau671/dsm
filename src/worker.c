@@ -21,6 +21,8 @@ static void fault_slot_wake(fault_slot_t *slot)
 static void *dispatcher_thread_main(void *arg)
 {
     dsm_ctx_t *ctx = (dsm_ctx_t *)arg;
+    uint32_t jitter_seed = (uint32_t)(uintptr_t)pthread_self();
+    if (jitter_seed == 0) jitter_seed = 1;
 
     while (atomic_load(&ctx->running)) {
         fault_slot_t *slot = faultq_pop();
@@ -40,7 +42,19 @@ static void *dispatcher_thread_main(void *arg)
         do {
             rc = msi_local_fault(ctx, slot);
             if (rc == DSM_ERR_BUSY) {
-                sleep_ms(1);
+                /* Limitación temporal: hasta que exista retry_at diferido,
+                 * este despachador reintenta con jitter sin conservar locks.
+                 * Cada hilo usa su propia semilla; no usa rand() global. */
+                jitter_seed ^= jitter_seed << 13;
+                jitter_seed ^= jitter_seed >> 17;
+                jitter_seed ^= jitter_seed << 5;
+                uint32_t us = 500u + (jitter_seed % 1501u);
+                struct timespec ts;
+                ts.tv_sec = 0;
+                ts.tv_nsec = (long)us * 1000L;
+                while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+                    /* EINTR conserva el tiempo restante en ts. */
+                }
             }
         } while (rc == DSM_ERR_BUSY && atomic_load(&ctx->running));
         uint64_t elapsed = mono_us() - t0;

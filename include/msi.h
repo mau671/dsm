@@ -59,6 +59,12 @@ void msi_destroy(dsm_ctx_t *ctx);
 int  msi_local_fault(dsm_ctx_t *ctx, fault_slot_t *s);
 
 void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m);
+#if defined(DSM_TEST_HOOKS)
+void msi_test_busy_hook_config(uint32_t page, bool fail);
+void msi_test_busy_hook_wait_entered(void);
+void msi_test_busy_hook_release(void);
+bool msi_test_busy_hook_second_seen(void);
+#endif
 void msi_on_page_data(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void msi_on_grant(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void msi_on_invalidate(dsm_ctx_t *ctx, const dsm_msg_t *m);
