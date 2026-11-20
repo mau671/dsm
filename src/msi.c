@@ -315,6 +315,8 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
                          entry.owner != DSM_SLOT_NONE &&
                          entry.owner != ctx->memb.self_slot &&
                          owner_alive(ctx, entry.owner));
+    bool local_owner = (entry.state == DSM_DIR_MODIFIED &&
+                        entry.owner == ctx->memb.self_slot);
 
     if (remote_owner) {
         uint16_t status = DSM_ST_OK;
@@ -328,6 +330,19 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
             free(data);
             return (rc == DSM_OK) ? DSM_ERR_NET : rc;
         }
+    } else if (local_owner) {
+        /* Antes de copiar, cerrar escritura impide que un hilo pierda el
+         * valor que debe entregar al degradarse de M a S. */
+        dsm_mem_stripe_lock(&ctx->mem, page);
+        if (dsm_mem_set_prot(&ctx->mem, page, PROT_READ) != DSM_OK) {
+            dsm_mem_stripe_unlock(&ctx->mem, page);
+            free(data);
+            return DSM_ERR_MEM;
+        }
+        memcpy(data, dsm_mem_page_ptr(&ctx->mem, page),
+               ctx->mem.page_size);
+        ctx->mem.local[page].state = DSM_PAGE_S;
+        dsm_mem_stripe_unlock(&ctx->mem, page);
     } else if (!page_can_serve(ctx, page, data)) {
         /* Página sin copia viva ni respaldo utilizable: el home la recupera de
          * un par que todavía la conserve o la sirve en ceros si nunca se
@@ -341,22 +356,33 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
     }
 
     if (write) {
-        int rc = invalidate_remote_copies(ctx, page, &entry,
-                                          ctx->memb.self_slot);
-        if (rc != DSM_OK) {
+        /* Conserva primero una copia propia del contenido. Las copias remotas
+         * viejas se invalidan antes de abrir la vista local en M. */
+        if (dsm_mem_backing_store(&ctx->mem, page, data) != DSM_OK) {
             free(data);
-            return rc;
+            return DSM_ERR_NO_SPACE;
         }
+        int inv_rc = invalidate_remote_copies(ctx, page, &entry,
+                                              ctx->memb.self_slot);
+        if (inv_rc != DSM_OK) {
+            free(data);
+            return inv_rc;
+        }
+
+        int rc = page_apply(ctx, page, DSM_PAGE_M,
+                            data, ctx->mem.page_size);
+        free(data);
+        if (rc != DSM_OK) return rc;
+    } else {
+        int rc = page_apply(ctx, page, DSM_PAGE_S,
+                            data, ctx->mem.page_size);
+        free(data);
+        if (rc != DSM_OK) return rc;
+
+        /* En lectura la copia ya quedó aplicada y puede persistirse con
+         * seguridad antes de publicar el directorio. */
+        page_persist_home(ctx, page);
     }
-
-    int rc = page_apply(ctx, page, write ? DSM_PAGE_M : DSM_PAGE_S,
-                        data, ctx->mem.page_size);
-    free(data);
-    if (rc != DSM_OK) return rc;
-
-    /* El home es la fuente del contenido: deja la versión vigente en el marco
-     * de respaldo antes de abrir la vista a otros nodos. */
-    page_persist_home(ctx, page);
 
     pthread_mutex_lock(&ctx->msi.dir_mu);
     entry = ctx->msi.dir[page];
@@ -611,6 +637,8 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
     bool owner_remote = (entry.state == DSM_DIR_MODIFIED &&
                          entry.owner != DSM_SLOT_NONE &&
                          entry.owner != ctx->memb.self_slot);
+    bool owner_local = (entry.state == DSM_DIR_MODIFIED &&
+                        entry.owner == ctx->memb.self_slot);
 
     if (owner_remote) {
         data = malloc(ctx->mem.page_size);
@@ -626,6 +654,23 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
             send_nack(ctx, m, DSM_ST_BUSY);
             return;
         }
+    } else if (owner_local) {
+        /* El dueño local se degrada antes de copiar: así ningún hilo puede
+         * modificar el alias mientras se produce el contenido que se concede. */
+        data = malloc(ctx->mem.page_size);
+        if (!data) return;
+        dsm_mem_stripe_lock(&ctx->mem, page);
+        if (dsm_mem_set_prot(&ctx->mem, page, PROT_READ) != DSM_OK) {
+            dsm_mem_stripe_unlock(&ctx->mem, page);
+            free(data);
+            send_nack(ctx, m, DSM_ST_BUSY);
+            return;
+        }
+        memcpy(data, dsm_mem_page_ptr(&ctx->mem, page),
+               ctx->mem.page_size);
+        ctx->mem.local[page].state = DSM_PAGE_S;
+        dsm_mem_stripe_unlock(&ctx->mem, page);
+        data_len = ctx->mem.page_size;
     }
 
     if (!data) {
@@ -765,9 +810,15 @@ void msi_on_downgrade(dsm_ctx_t *ctx, const dsm_msg_t *m)
     uint8_t *data = malloc(ctx->mem.page_size);
     if (!data) return;
     dsm_mem_stripe_lock(&ctx->mem, page);
+    /* Cerrar primero toda escritura impide que un hilo local modifique el
+     * alias durante la copia que viajará al custodio. */
+    if (dsm_mem_set_prot(&ctx->mem, page, PROT_READ) != DSM_OK) {
+        dsm_mem_stripe_unlock(&ctx->mem, page);
+        free(data);
+        return;
+    }
     memcpy(data, dsm_mem_page_ptr(&ctx->mem, page), ctx->mem.page_size);
     /* DOWNGRADE transforma M -> S después de copiar la versión más reciente. */
-    (void)dsm_mem_set_prot(&ctx->mem, page, PROT_READ);
     ctx->mem.local[page].state = DSM_PAGE_S;
     dsm_mem_stripe_unlock(&ctx->mem, page);
 
