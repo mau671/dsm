@@ -117,12 +117,18 @@ static bool leer_completo(int fd, void *dst, size_t n)
         size_t bloque = restante < sizeof(buffer) ? restante : sizeof(buffer);
         size_t leidos = 0;
         while (leidos < bloque) {
-            ssize_t r = read(fd, buffer + leidos, bloque - leidos);
+            size_t capacidad = sizeof(buffer) - leidos;
+            size_t por_leer = bloque - leidos;
+            if (por_leer > capacidad) por_leer = capacidad;
+            if (por_leer == 0) return false;
+
+            ssize_t r = read(fd, buffer + leidos, por_leer);
             if (r < 0) {
                 if (errno == EINTR) continue;
                 return false;
             }
             if (r == 0) return false;
+            if ((size_t)r > por_leer) return false;
             leidos += (size_t)r;
         }
         memcpy(p, buffer, bloque);
