@@ -28,6 +28,9 @@ static bool g_busy_test_entered;
 static bool g_busy_test_release;
 static bool g_busy_test_fail;
 static bool g_busy_test_second_seen;
+static uint16_t g_downgrade_test_status = DSM_ST_OK;
+static bool g_downgrade_test_override;
+static uint32_t g_downgrade_test_calls;
 
 void msi_test_busy_hook_config(uint32_t page, bool fail)
 {
@@ -63,6 +66,31 @@ bool msi_test_busy_hook_second_seen(void)
     bool seen = g_busy_test_second_seen;
     pthread_mutex_unlock(&g_busy_test_mu);
     return seen;
+}
+
+void msi_test_downgrade_config(uint16_t status)
+{
+    pthread_mutex_lock(&g_busy_test_mu);
+    g_downgrade_test_status = status;
+    g_downgrade_test_override = true;
+    g_downgrade_test_calls = 0;
+    pthread_mutex_unlock(&g_busy_test_mu);
+}
+
+void msi_test_downgrade_reset(void)
+{
+    pthread_mutex_lock(&g_busy_test_mu);
+    g_downgrade_test_override = false;
+    g_downgrade_test_calls = 0;
+    pthread_mutex_unlock(&g_busy_test_mu);
+}
+
+uint32_t msi_test_downgrade_calls(void)
+{
+    pthread_mutex_lock(&g_busy_test_mu);
+    uint32_t calls = g_downgrade_test_calls;
+    pthread_mutex_unlock(&g_busy_test_mu);
+    return calls;
 }
 
 static bool busy_test_wait(dsm_ctx_t *ctx, uint32_t page)
@@ -371,6 +399,7 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
 {
     bool reserved = false;
     int result = DSM_OK;
+    bool recovered_owner = false;
     dir_entry_t entry = dir_snapshot(ctx, page);
 
     pthread_mutex_lock(&ctx->msi.dir_mu);
@@ -403,12 +432,48 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
                              entry.tseq, write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
                              DSM_FLAG_HAS_DATA, NULL, 0, &status, data,
                              &data_len);
-        if (rc != DSM_OK || status != DSM_ST_OK ||
-            data_len != ctx->mem.page_size) {
+        if (rc != DSM_OK) {
             free(data);
             result = (rc == DSM_OK) ? DSM_ERR_NET : rc;
             goto out;
         }
+        if (status == DSM_ST_BUSY) {
+            free(data);
+            result = DSM_ERR_BUSY;
+            goto out;
+        }
+        if (status == DSM_ST_BAD_STATE) {
+            /* LIMITACIÓN: dir_entry_t no guarda la incarnation del owner.
+             * La membresía solo conoce la incarnation vigente, no cuál tenía
+             * el owner cuando otorgó M, por lo que no puede invalidarse un
+             * reinicio con el mismo slot. */
+            free(data);
+            data = malloc(ctx->mem.page_size);
+            if (!data) {
+                result = DSM_ERR_MEM;
+                goto out;
+            }
+            if (dsm_mem_backing_load(&ctx->mem, page, data) != DSM_OK) {
+                free(data);
+                data = NULL;
+                result = DSM_ERR_BUSY;
+                goto out;
+            }
+            recovered_owner = true;
+        } else if (status != DSM_ST_OK ||
+                   data_len != ctx->mem.page_size) {
+            free(data);
+            result = DSM_ERR_NET;
+            goto out;
+        }
+    } else if (entry.state == DSM_DIR_MODIFIED &&
+               entry.owner != DSM_SLOT_NONE &&
+               entry.owner != ctx->memb.self_slot &&
+               !owner_alive(ctx, entry.owner)) {
+        /* LIMITACIÓN: owner muerto en M: el respaldo no se usa porque puede
+         * contener una versión anterior a la única escritura pendiente. */
+        result = DSM_ERR_BUSY;
+        goto out;
     } else if (local_owner) {
         /* Antes de copiar, cerrar escritura impide que un hilo pierda el
          * valor que debe entregar al degradarse de M a S. */
@@ -486,8 +551,11 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
         /* Downgrade M->S: el dueño entrega la versión y conserva lectura. */
         entry.state = DSM_DIR_SHARED;
         entry.owner = DSM_SLOT_NONE;
+        if (recovered_owner) {
+            memset(entry.copyset, 0, sizeof(entry.copyset));
+        }
         copyset_set(&entry, ctx->memb.self_slot);
-        if (previous_owner != DSM_SLOT_NONE) {
+        if (!recovered_owner && previous_owner != DSM_SLOT_NONE) {
             copyset_set(&entry, previous_owner);
         }
     }
@@ -755,6 +823,15 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
     uint8_t *data = NULL;
     uint32_t data_len = 0;
     int rc = DSM_OK;
+    bool phantom_owner = false;
+    bool recovered_owner = false;
+
+    /* Regla exacta: el fantasma solo existe en M y el owner coincide con
+     * el solicitante. SHARED/UNCACHED no contienen ese significado aunque
+     * el owner conservado no sea significativo. */
+    phantom_owner = (entry.state == DSM_DIR_MODIFIED &&
+                     entry.owner == requester &&
+                     owner_alive(ctx, requester));
 
     bool owner_remote = (entry.state == DSM_DIR_MODIFIED &&
                          entry.owner != DSM_SLOT_NONE &&
@@ -762,16 +839,75 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
     bool owner_local = (entry.state == DSM_DIR_MODIFIED &&
                         entry.owner == ctx->memb.self_slot);
 
-    if (owner_remote) {
+    if (phantom_owner) {
+        data = malloc(ctx->mem.page_size);
+        if (!data) goto out;
+        if (dsm_mem_backing_load(&ctx->mem, page, data) != DSM_OK) {
+            free(data);
+            data = NULL;
+            send_nack(ctx, m, DSM_ST_BUSY);
+            goto out;
+        }
+        data_len = ctx->mem.page_size;
+    } else if (entry.state == DSM_DIR_MODIFIED &&
+               entry.owner != DSM_SLOT_NONE &&
+               entry.owner != ctx->memb.self_slot &&
+               !owner_alive(ctx, entry.owner)) {
+        /* LIMITACIÓN: owner muerto en M. El respaldo puede ser anterior a la
+         * escritura pendiente y no se usa. */
+        send_nack(ctx, m, DSM_ST_BUSY);
+        goto out;
+    } else if (owner_remote) {
         data = malloc(ctx->mem.page_size);
         if (!data) goto out;
         data_len = ctx->mem.page_size;
         uint16_t status = DSM_ST_OK;
+#if defined(DSM_TEST_HOOKS)
+        pthread_mutex_lock(&g_busy_test_mu);
+        if (g_downgrade_test_override) {
+            g_downgrade_test_calls++;
+            status = g_downgrade_test_status;
+            rc = DSM_OK;
+            data_len = (status == DSM_ST_OK) ? ctx->mem.page_size : 0;
+        } else {
+            rc = dsm_net_rpc(ctx, entry.owner, MSG_DOWNGRADE, page, entry.tseq,
+                             write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
+                             DSM_FLAG_HAS_DATA, NULL, 0, &status, data, &data_len);
+        }
+        pthread_mutex_unlock(&g_busy_test_mu);
+#else
         rc = dsm_net_rpc(ctx, entry.owner, MSG_DOWNGRADE, page, entry.tseq,
                          write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
                          DSM_FLAG_HAS_DATA, NULL, 0, &status, data, &data_len);
-        if (rc != DSM_OK || status != DSM_ST_OK ||
-            data_len != ctx->mem.page_size) {
+#endif
+        if (rc != DSM_OK) {
+            free(data);
+            send_nack(ctx, m, DSM_ST_BUSY);
+            goto out;
+        }
+        if (status == DSM_ST_BUSY) {
+            free(data);
+            send_nack(ctx, m, DSM_ST_BUSY);
+            goto out;
+        }
+        if (status == DSM_ST_BAD_STATE) {
+            /* LIMITACIÓN: dir_entry_t no guarda la incarnation del owner.
+             * No podemos distinguir en 2c un reinicio con el mismo slot,
+             * por lo que usamos el respaldo vigente con este riesgo conocido.
+             * Más adelante puede añadirse owner_incarnation al directorio. */
+            free(data);
+            data = malloc(ctx->mem.page_size);
+            if (!data) goto out;
+            if (dsm_mem_backing_load(&ctx->mem, page, data) != DSM_OK) {
+                free(data);
+                data = NULL;
+                send_nack(ctx, m, DSM_ST_BUSY);
+                goto out;
+            }
+            data_len = ctx->mem.page_size;
+            recovered_owner = true;
+        } else if (status != DSM_ST_OK ||
+                   data_len != ctx->mem.page_size) {
             free(data);
             send_nack(ctx, m, DSM_ST_BUSY);
             goto out;
@@ -818,6 +954,9 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
         entry = ctx->msi.dir[page];
         entry.state = DSM_DIR_SHARED;
         entry.owner = DSM_SLOT_NONE;
+        if (phantom_owner || recovered_owner) {
+            memset(entry.copyset, 0, sizeof(entry.copyset));
+        }
         copyset_set(&entry, requester);
         copyset_set(&entry, ctx->memb.self_slot);
         ctx->msi.dir[page] = entry;
@@ -840,11 +979,13 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
         goto out;
     }
 
-    rc = invalidate_remote_copies(ctx, page, &entry, requester);
-    if (rc != DSM_OK) {
-        free(data);
-        send_nack(ctx, m, DSM_ST_BUSY);
-        goto out;
+    if (!phantom_owner && !recovered_owner) {
+        rc = invalidate_remote_copies(ctx, page, &entry, requester);
+        if (rc != DSM_OK) {
+            free(data);
+            send_nack(ctx, m, DSM_ST_BUSY);
+            goto out;
+        }
     }
 
     /* El home conserva la versión entregada: si el anillo le quita la página,
@@ -936,20 +1077,54 @@ void msi_on_downgrade(dsm_ctx_t *ctx, const dsm_msg_t *m)
     if (!ctx || !m || m->hdr.page_id >= ctx->mem.npages) return;
 
     uint32_t page = m->hdr.page_id;
-    uint8_t *data = malloc(ctx->mem.page_size);
-    if (!data) return;
+    uint16_t status = DSM_ST_OK;
+
     dsm_mem_stripe_lock(&ctx->mem, page);
-    /* Cerrar primero toda escritura impide que un hilo local modifique el
-     * alias durante la copia que viajará al custodio. */
-    if (dsm_mem_set_prot(&ctx->mem, page, PROT_READ) != DSM_OK) {
+    uint8_t state = ctx->mem.local[page].state;
+    if (state == DSM_PAGE_IS_PEND ||
+        state == DSM_PAGE_IM_PEND ||
+        state == DSM_PAGE_SM_PEND) {
+        status = DSM_ST_BUSY;
         dsm_mem_stripe_unlock(&ctx->mem, page);
-        free(data);
-        return;
+    } else if (state != DSM_PAGE_M) {
+        status = DSM_ST_BAD_STATE;
+        dsm_mem_stripe_unlock(&ctx->mem, page);
+    } else {
+        /* Camino M: mprotect antes de copiar, tal como estaba aprobado. */
+        uint8_t *data = malloc(ctx->mem.page_size);
+        if (!data) {
+            dsm_mem_stripe_unlock(&ctx->mem, page);
+            status = DSM_ST_NO_SPACE;
+        } else {
+            if (dsm_mem_set_prot(&ctx->mem, page, PROT_READ) != DSM_OK) {
+                dsm_mem_stripe_unlock(&ctx->mem, page);
+                free(data);
+                status = DSM_ST_BAD_STATE;
+            } else {
+                memcpy(data, dsm_mem_page_ptr(&ctx->mem, page),
+                       ctx->mem.page_size);
+                ctx->mem.local[page].state = DSM_PAGE_S;
+                dsm_mem_stripe_unlock(&ctx->mem, page);
+
+                msg_header_t ack;
+                memset(&ack, 0, sizeof(ack));
+                ack.magic = DSM_MAGIC;
+                ack.cluster_id = ctx->cfg.cluster_id;
+                ack.proto_version = DSM_PROTO_VERSION;
+                ack.type = MSG_DOWNGRADE_ACK;
+                ack.src_slot = ctx->memb.self_slot;
+                ack.dst_slot = m->hdr.src_slot;
+                ack.req_id = m->hdr.req_id;
+                ack.page_id = page;
+                ack.status = DSM_ST_OK;
+                ack.flags = DSM_FLAG_HAS_DATA;
+                ack.payload_len = ctx->mem.page_size;
+                (void)dsm_net_send(ctx, m->hdr.src_slot, &ack, data);
+                free(data);
+                return;
+            }
+        }
     }
-    memcpy(data, dsm_mem_page_ptr(&ctx->mem, page), ctx->mem.page_size);
-    /* DOWNGRADE transforma M -> S después de copiar la versión más reciente. */
-    ctx->mem.local[page].state = DSM_PAGE_S;
-    dsm_mem_stripe_unlock(&ctx->mem, page);
 
     msg_header_t ack;
     memset(&ack, 0, sizeof(ack));
@@ -961,10 +1136,8 @@ void msi_on_downgrade(dsm_ctx_t *ctx, const dsm_msg_t *m)
     ack.dst_slot = m->hdr.src_slot;
     ack.req_id = m->hdr.req_id;
     ack.page_id = page;
-    ack.flags = DSM_FLAG_HAS_DATA;
-    ack.payload_len = ctx->mem.page_size;
-    (void)dsm_net_send(ctx, m->hdr.src_slot, &ack, data);
-    free(data);
+    ack.status = status;
+    (void)dsm_net_send(ctx, m->hdr.src_slot, &ack, NULL);
 }
 
 void msi_on_downgrade_ack(dsm_ctx_t *ctx, const dsm_msg_t *m)
@@ -986,10 +1159,6 @@ void msi_on_writeback(dsm_ctx_t *ctx, const dsm_msg_t *m)
         status = DSM_ST_NOT_HOME;
     } else if (dsm_mem_backing_store(&ctx->mem, page, m->payload) != DSM_OK) {
         status = DSM_ST_NO_SPACE;
-    } else {
-        pthread_mutex_lock(&ctx->msi.dir_mu);
-        ctx->msi.dir[page].busy = 0;
-        pthread_mutex_unlock(&ctx->msi.dir_mu);
     }
 
     msg_header_t ack;

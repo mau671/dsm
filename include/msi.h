@@ -64,6 +64,9 @@ void msi_test_busy_hook_config(uint32_t page, bool fail);
 void msi_test_busy_hook_wait_entered(void);
 void msi_test_busy_hook_release(void);
 bool msi_test_busy_hook_second_seen(void);
+void msi_test_downgrade_config(uint16_t status);
+uint32_t msi_test_downgrade_calls(void);
+void msi_test_downgrade_reset(void);
 #endif
 void msi_on_page_data(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void msi_on_grant(dsm_ctx_t *ctx, const dsm_msg_t *m);
