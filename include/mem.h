@@ -54,7 +54,6 @@ int      dsm_mem_init(dsm_mem_t *m, const dsm_config_t *cfg);
 void     dsm_mem_destroy(dsm_mem_t *m);
 int      dsm_mem_set_prot(dsm_mem_t *m, uint32_t page, int prot);
 void     dsm_mem_install_page(dsm_mem_t *m, uint32_t page, const void *src);
-void     dsm_mem_install_local(dsm_mem_t *m, uint32_t page);
 uint8_t *dsm_mem_page_ptr(dsm_mem_t *m, uint32_t page);
 page_local_t *dsm_mem_local(dsm_mem_t *m, uint32_t page);
 uint32_t dsm_mem_frame_alloc(dsm_mem_t *m);

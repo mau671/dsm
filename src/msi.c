@@ -4,6 +4,7 @@
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 static bool copyset_has(const dir_entry_t *entry, uint32_t slot)
 {
@@ -111,6 +112,59 @@ static bool busy_test_wait(dsm_ctx_t *ctx, uint32_t page)
     return false;
 }
 #endif
+
+/* --- Secuencia de transacciones de las respuestas de página --- */
+
+/* Toda respuesta que transporta contenido de página avanza esta secuencia.
+ * El receptor solo instala una respuesta cuyo tseq supere el ultimo que aplico,
+ * de modo que una trama repetida o atrasada no reescriba la tabla de paginas. */
+static uint32_t dir_tseq_next(dsm_ctx_t *ctx, uint32_t page)
+{
+    if (!ctx || !ctx->msi.dir || page >= ctx->msi.cap) return 1u;
+
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    uint32_t tseq = ctx->msi.dir[page].tseq + 1u;
+    if (tseq == 0) tseq = 1u;
+    ctx->msi.dir[page].tseq = tseq;
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
+    return tseq;
+}
+
+/* Decicion centralizada: compara y, cuando procede, publica el tseq antes de
+ * que el llamador instale datos o permisos. */
+static bool tseq_accept(dsm_ctx_t *ctx, uint32_t page, uint32_t tseq)
+{
+    if (!ctx || !ctx->mem.local || page >= ctx->mem.npages || tseq == 0) {
+        return false;
+    }
+
+    bool accept;
+    dsm_mem_stripe_lock(&ctx->mem, page);
+    if (tseq <= ctx->mem.local[page].tseq_seen) {
+        atomic_fetch_add_explicit(&ctx->ctr.tseq_discarded, 1,
+                                  memory_order_relaxed);
+        accept = false;
+    } else {
+        ctx->mem.local[page].tseq_seen = tseq;
+        accept = true;
+    }
+    dsm_mem_stripe_unlock(&ctx->mem, page);
+    return accept;
+}
+
+/* Predicado sin efectos: lo usa la capa de red para no despertar una RPC con
+ * una respuesta que el worker va a descartar de todos modos. */
+bool msi_tseq_stale(dsm_ctx_t *ctx, uint32_t page, uint32_t tseq)
+{
+    if (!ctx || !ctx->mem.local || page >= ctx->mem.npages || tseq == 0) {
+        return true;
+    }
+
+    dsm_mem_stripe_lock(&ctx->mem, page);
+    bool stale = tseq <= ctx->mem.local[page].tseq_seen;
+    dsm_mem_stripe_unlock(&ctx->mem, page);
+    return stale;
+}
 
 /* --- Identidad del home de cada página ---
  *
@@ -228,14 +282,29 @@ static bool page_can_serve(dsm_ctx_t *ctx, uint32_t page, void *buf)
     return dsm_mem_backing_load(&ctx->mem, page, buf) == DSM_OK;
 }
 
-/* Persiste en el marco de respaldo el contenido del alias. Solo se invoca desde
- * las rutas en las que este nodo es el home de la página. */
-static void page_persist_home(dsm_ctx_t *ctx, uint32_t page)
+/* Persiste el contenido vigente de una página custodiada y, con RAID5 activo,
+ * emite el delta de paridad contra el respaldo previo: una página nunca
+ * persistida cuenta como ceros. Cuando el contenido no cambia respecto del
+ * respaldo no se genera delta, que seria un XOR de ceros. */
+static int home_persist_delta(dsm_ctx_t *ctx, uint32_t page, const void *data)
 {
-    dsm_mem_stripe_lock(&ctx->mem, page);
-    (void)dsm_mem_backing_store(&ctx->mem, page,
-                                dsm_mem_page_ptr(&ctx->mem, page));
-    dsm_mem_stripe_unlock(&ctx->mem, page);
+    uint8_t *old = NULL;
+    if (ctx->cfg.redundancy_raid5) {
+        old = malloc(ctx->mem.page_size);
+        if (old && dsm_mem_backing_load(&ctx->mem, page, old) != DSM_OK) {
+            memset(old, 0, ctx->mem.page_size);
+        }
+    }
+
+    int rc = dsm_mem_backing_store(&ctx->mem, page, data);
+    if (rc == DSM_OK && old &&
+        memcmp(old, data, ctx->mem.page_size) != 0) {
+        (void)raid_on_write(ctx, page, old, data);
+    } else if (rc == DSM_OK && !old && ctx->cfg.redundancy_raid5) {
+        DSM_LOG_WARN("Sin memoria para el delta de paridad de la pagina %u", page);
+    }
+    free(old);
+    return rc;
 }
 
 /* Suelta el contenido de una página que pasó a otro home: la copia local queda
@@ -290,7 +359,11 @@ static int page_pull(dsm_ctx_t *ctx, uint32_t page, void *dst)
 
 /* Entrega al home vigente el contenido de una página que este nodo custodiaba y
  * espera el acuse antes de soltar su copia. Devuelve DSM_OK cuando el nuevo home
- * confirmó que guardó el contenido. */
+ * confirmó que guardó el contenido. Va marcado como traspaso: el contenido ya
+ * está acumulado en la paridad y un writeback ordinario generaría un delta
+ * contra un respaldo vacío que la cancelaría. El tseq propio viaja en la
+ * cabecera para que el nuevo home continúe la secuencia en lugar de
+ * reiniciarla y que sus respuestas no se descarten por antiguas. */
 static int home_transfer(dsm_ctx_t *ctx, uint32_t page, uint32_t home,
                          const void *data)
 {
@@ -298,11 +371,13 @@ static int home_transfer(dsm_ctx_t *ctx, uint32_t page, uint32_t home,
         return DSM_ERR_INVALID;
     }
 
+    uint32_t tseq = dir_snapshot(ctx, page).tseq;
     uint16_t status = DSM_ST_OK;
     uint32_t rx_len = 0;
-    int rc = dsm_net_rpc(ctx, home, MSG_WRITEBACK, page, 0, DSM_ACCESS_WRITE,
-                         DSM_FLAG_HAS_DATA, data, ctx->mem.page_size,
-                         &status, NULL, &rx_len);
+    int rc = dsm_net_rpc(ctx, home, MSG_WRITEBACK, page, tseq,
+                         DSM_ACCESS_WRITE,
+                         DSM_FLAG_HAS_DATA | DSM_FLAG_TRANSFER, data,
+                         ctx->mem.page_size, &status, NULL, &rx_len);
     if (rc != DSM_OK) return rc;
     return (status == DSM_ST_OK) ? DSM_OK : DSM_ERR_NET;
 }
@@ -334,15 +409,34 @@ static void home_page_content(dsm_ctx_t *ctx, uint32_t page, void *buf,
 
 /* --- Aplicación de contenido y permisos --- */
 
+/* Instala el contenido y los permisos de una respuesta de página. Con
+ * require_pending, la página debe estar en el estado pendiente que la
+ * solicitud dejo: la comprobacion ocurre dentro del cerrojo, de modo que
+ * una invalidacion que llegue entre el chequeo previo y la aplicacion no
+ * puede reabrir una página ya invalidada. */
 static int page_apply(dsm_ctx_t *ctx, uint32_t page, dsm_page_state_t state,
-                      const void *payload, uint32_t payload_len)
+                      const void *payload, uint32_t payload_len, uint32_t tseq,
+                      bool require_pending)
 {
     if (page >= ctx->mem.npages) return DSM_ERR_INVALID;
     if (payload_len != 0 && payload_len != ctx->mem.page_size) {
         return DSM_ERR_PROTO;
     }
+    if (!tseq_accept(ctx, page, tseq)) return DSM_OK;
 
     dsm_mem_stripe_lock(&ctx->mem, page);
+    if (require_pending) {
+        uint8_t current = ctx->mem.local[page].state;
+        bool expected = (state == DSM_PAGE_M)
+                            ? (current == DSM_PAGE_IM_PEND ||
+                               current == DSM_PAGE_SM_PEND)
+                            : (current == DSM_PAGE_IS_PEND ||
+                               current == DSM_PAGE_SM_PEND);
+        if (!expected) {
+            dsm_mem_stripe_unlock(&ctx->mem, page);
+            return DSM_ERR_BUSY;
+        }
+    }
     if (payload_len != 0) {
         dsm_mem_install_page(&ctx->mem, page, payload);
     }
@@ -366,31 +460,198 @@ static void page_invalidate_local(dsm_ctx_t *ctx, uint32_t page)
     dsm_mem_stripe_unlock(&ctx->mem, page);
 }
 
+/* --- Espera de acuses de una transaccion --- */
+
+static uint32_t msi_ack_timeout_ms(dsm_ctx_t *ctx)
+{
+    if (ctx->cfg.lock_timeout_ms) return ctx->cfg.lock_timeout_ms;
+    if (ctx->cfg.request_timeout_ms) return ctx->cfg.request_timeout_ms;
+    return 10000u;
+}
+
+int msi_ack_wait_begin(dsm_ctx_t *ctx, uint32_t txn,
+                       const uint8_t *mask, uint32_t expected)
+{
+    if (!ctx || txn == 0 || expected == 0) return DSM_ERR_INVALID;
+
+    int rc = DSM_ERR_NO_SPACE;
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    for (uint32_t i = 0; i < MSI_ACK_WAIT_SLOTS; i++) {
+        msi_ack_wait_t *w = &ctx->msi.ack_waits[i];
+        if (w->active) continue;
+        while (sem_trywait(&w->sem) == 0) {
+        }
+        w->txn      = txn;
+        w->expected = expected;
+        w->received = 0;
+        memcpy(w->ok_mask, mask, sizeof(w->ok_mask));
+        w->status   = DSM_ST_OK;
+        w->done     = 0;
+        w->active   = true;
+        rc = DSM_OK;
+        break;
+    }
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
+    return rc;
+}
+
+void msi_ack_wait_cancel(dsm_ctx_t *ctx, uint32_t txn)
+{
+    if (!ctx) return;
+
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    for (uint32_t i = 0; i < MSI_ACK_WAIT_SLOTS; i++) {
+        msi_ack_wait_t *w = &ctx->msi.ack_waits[i];
+        if (w->active && w->txn == txn) {
+            w->active = false;
+            w->done = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
+}
+
+int msi_ack_wait_result(dsm_ctx_t *ctx, uint32_t txn, uint32_t timeout_ms)
+{
+    if (!ctx) return DSM_ERR_INVALID;
+
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    msi_ack_wait_t *wait = NULL;
+    for (uint32_t i = 0; i < MSI_ACK_WAIT_SLOTS; i++) {
+        msi_ack_wait_t *w = &ctx->msi.ack_waits[i];
+        if (w->active && w->txn == txn) {
+            wait = w;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
+    /* Una entrada completada antes de la espera sigue activa hasta que este
+     * hilo la consuma: el NOT_FOUND queda para transacciones inexistentes. */
+    if (!wait) return DSM_ERR_NOT_FOUND;
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec  += (time_t)(timeout_ms / 1000u);
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    int wait_rc;
+    do {
+        wait_rc = sem_timedwait(&wait->sem, &deadline);
+    } while (wait_rc != 0 && errno == EINTR);
+
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    /* El despertar debe seguir correspondiendo a la misma transaccion: la
+     * entrada solo la libera este hilo, pero no se consume estado ajeno. */
+    if (!wait->active || wait->txn != txn) {
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
+        return DSM_ERR_NOT_FOUND;
+    }
+    if (wait_rc != 0 && !wait->done) {
+        wait->active = false;
+        wait->done = 0;
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
+        return (errno == ETIMEDOUT) ? DSM_ERR_TIMEOUT : DSM_ERR_NET;
+    }
+    /* Un acuse que llego entre el vencimiento y la cancelacion cuenta como
+     * respuesta: el semaforo drenado se limpia al reutilizar la ranura. */
+    uint16_t status = wait->status;
+    wait->active = false;
+    wait->done = 0;
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
+    return (status == DSM_ST_OK) ? DSM_OK : DSM_ERR_NET;
+}
+
+static bool ack_mask_empty(const uint8_t *mask)
+{
+    for (uint32_t i = 0; i < MAX_NODES / 8u; i++) {
+        if (mask[i] != 0) return false;
+    }
+    return true;
+}
+
+/* Registra el acuse de un remitente en la espera que corresponda a su txn. */
+static void ack_wait_on_ack(dsm_ctx_t *ctx, const dsm_msg_t *m)
+{
+    if (!ctx || !m || m->hdr.src_slot >= MAX_NODES) return;
+    uint32_t byte = m->hdr.src_slot / 8u;
+    uint8_t bit = (uint8_t)(1u << (m->hdr.src_slot % 8u));
+
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    for (uint32_t i = 0; i < MSI_ACK_WAIT_SLOTS; i++) {
+        msi_ack_wait_t *w = &ctx->msi.ack_waits[i];
+        if (!w->active || w->txn != m->hdr.req_id) continue;
+        /* Un duplicado o un remitente ajeno al conjunto no cuenta. */
+        if ((w->ok_mask[byte] & bit) == 0) break;
+        w->ok_mask[byte] = (uint8_t)(w->ok_mask[byte] & ~bit);
+        w->received++;
+        if (m->hdr.status != DSM_ST_OK) w->status = m->hdr.status;
+        if ((w->received >= w->expected && ack_mask_empty(w->ok_mask)) ||
+            w->status != DSM_ST_OK) {
+            /* La entrada sigue activa para que su dueño la encuentre y
+             * consuma el resultado; solo el resultado la libera. */
+            w->done = 1;
+            sem_post(&w->sem);
+        }
+        break;
+    }
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
+}
+
+/* Invalida todas las copias remotas y solo devuelve el permiso de escritura
+ * cuando ha llegado un acuse de cada destinatario. */
 static int invalidate_remote_copies(dsm_ctx_t *ctx, uint32_t page,
                                     const dir_entry_t *entry,
                                     uint32_t keep_slot)
 {
+    uint8_t mask[MAX_NODES / 8];
+    memset(mask, 0, sizeof(mask));
+    uint32_t expected = 0;
+
     for (uint32_t slot = 0; slot < MAX_NODES; slot++) {
-        if (!copyset_has(entry, slot) || slot == keep_slot) {
-            continue;
-        }
+        if (!copyset_has(entry, slot) || slot == keep_slot) continue;
         if (slot == ctx->memb.self_slot) {
             page_invalidate_local(ctx, page);
             atomic_fetch_add_explicit(&ctx->ctr.invalidations, 1,
                                       memory_order_relaxed);
             continue;
         }
+        mask[slot / 8u] |= (uint8_t)(1u << (slot % 8u));
+        expected++;
+    }
+    if (expected == 0) return DSM_OK;
 
-        uint16_t status = DSM_ST_OK;
-        uint32_t rx_len = 0;
-        int rc = dsm_net_rpc(ctx, slot, MSG_INVALIDATE, page, entry->tseq,
-                             DSM_ACCESS_WRITE, 0, NULL, 0, &status, NULL,
-                             &rx_len);
-        if (rc != DSM_OK || status != DSM_ST_OK) {
-            return (rc == DSM_OK) ? DSM_ERR_NET : rc;
+    uint32_t txn = dsm_net_next_req(ctx);
+    int rc = msi_ack_wait_begin(ctx, txn, mask, expected);
+    if (rc != DSM_OK) return rc;
+
+    for (uint32_t slot = 0; slot < MAX_NODES; slot++) {
+        if ((mask[slot / 8u] & (1u << (slot % 8u))) == 0) continue;
+
+        msg_header_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.magic         = DSM_MAGIC;
+        hdr.cluster_id    = ctx->cfg.cluster_id;
+        hdr.proto_version = DSM_PROTO_VERSION;
+        hdr.type          = MSG_INVALIDATE;
+        hdr.src_slot      = ctx->memb.self_slot;
+        hdr.dst_slot      = slot;
+        hdr.req_id        = txn;
+        hdr.page_id       = page;
+        hdr.tseq          = entry->tseq;
+        hdr.access        = DSM_ACCESS_WRITE;
+        hdr.epoch         = ctx->memb.epoch;
+
+        if (dsm_net_send(ctx, slot, &hdr, NULL) != DSM_OK) {
+            msi_ack_wait_cancel(ctx, txn);
+            return DSM_ERR_NET;
         }
     }
-    return DSM_OK;
+
+    return msi_ack_wait_result(ctx, txn, msi_ack_timeout_ms(ctx));
 }
 
 /* --- Fallo local atendido por el propio home --- */
@@ -428,13 +689,21 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
     if (remote_owner) {
         uint16_t status = DSM_ST_OK;
         uint32_t data_len = ctx->mem.page_size;
-        int rc = dsm_net_rpc(ctx, entry.owner, MSG_DOWNGRADE, page,
-                             entry.tseq, write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
-                             DSM_FLAG_HAS_DATA, NULL, 0, &status, data,
-                             &data_len);
+        uint32_t ack_tseq = 0;
+        uint32_t down_tseq = dir_tseq_next(ctx, page);
+        uint32_t txn = dsm_net_next_req(ctx);
+        uint8_t mask[MAX_NODES / 8];
+        memset(mask, 0, sizeof(mask));
+        mask[entry.owner / 8u] |= (uint8_t)(1u << (entry.owner % 8u));
+        (void)msi_ack_wait_begin(ctx, txn, mask, 1);
+        int rc = dsm_net_rpc_ex(ctx, entry.owner, MSG_DOWNGRADE, page,
+                                down_tseq, write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
+                                DSM_FLAG_HAS_DATA, NULL, 0, &status, data,
+                                &data_len, txn, &ack_tseq);
+        msi_ack_wait_cancel(ctx, txn);
         if (rc != DSM_OK) {
             free(data);
-            result = (rc == DSM_OK) ? DSM_ERR_NET : rc;
+            result = rc;
             goto out;
         }
         if (status == DSM_ST_BUSY) {
@@ -502,9 +771,10 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
     }
 
     if (write) {
-        /* Conserva primero una copia propia del contenido. Las copias remotas
-         * viejas se invalidan antes de abrir la vista local en M. */
-        if (dsm_mem_backing_store(&ctx->mem, page, data) != DSM_OK) {
+        /* Conserva primero una copia propia del contenido y acumula su
+         * delta de paridad. Las copias remotas viejas se invalidan antes
+         * de abrir la vista local en M. */
+        if (home_persist_delta(ctx, page, data) != DSM_OK) {
             free(data);
             result = DSM_ERR_NO_SPACE;
             goto out;
@@ -518,7 +788,8 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
         }
 
         int rc = page_apply(ctx, page, DSM_PAGE_M,
-                            data, ctx->mem.page_size);
+                            data, ctx->mem.page_size,
+                            dir_tseq_next(ctx, page), true);
         free(data);
         if (rc != DSM_OK) {
             result = rc;
@@ -526,16 +797,20 @@ static int home_local_fault(dsm_ctx_t *ctx, uint32_t page, bool write)
         }
     } else {
         int rc = page_apply(ctx, page, DSM_PAGE_S,
-                            data, ctx->mem.page_size);
+                            data, ctx->mem.page_size,
+                            dir_tseq_next(ctx, page), true);
+        if (rc == DSM_OK) {
+            /* En lectura la copia ya quedó aplicada y puede persistirse con
+             * seguridad antes de publicar el directorio. El persist incluye
+             * el delta de paridad cuando el contenido cambió respecto del
+             * marco. */
+            rc = home_persist_delta(ctx, page, data);
+        }
         free(data);
         if (rc != DSM_OK) {
             result = rc;
             goto out;
         }
-
-        /* En lectura la copia ya quedó aplicada y puede persistirse con
-         * seguridad antes de publicar el directorio. */
-        page_persist_home(ctx, page);
     }
 
     pthread_mutex_lock(&ctx->msi.dir_mu);
@@ -580,6 +855,16 @@ int msi_init(dsm_ctx_t *ctx)
     memset(msi, 0, sizeof(*msi));
     pthread_mutex_init(&msi->dir_mu, NULL);
 
+    for (uint32_t i = 0; i < MSI_ACK_WAIT_SLOTS; i++) {
+        if (sem_init(&msi->ack_waits[i].sem, 0, 0) != 0) {
+            for (uint32_t j = 0; j < i; j++) {
+                sem_destroy(&msi->ack_waits[j].sem);
+            }
+            pthread_mutex_destroy(&msi->dir_mu);
+            return DSM_ERR_MEM;
+        }
+    }
+
     if (ctx->cfg.page_size == 0 || ctx->cfg.view_size < ctx->cfg.page_size) {
         return DSM_OK;
     }
@@ -615,6 +900,9 @@ void msi_destroy(dsm_ctx_t *ctx)
     free(ctx->msi.dir);
     ctx->msi.dir = NULL;
     ctx->msi.cap = 0;
+    for (uint32_t i = 0; i < MSI_ACK_WAIT_SLOTS; i++) {
+        sem_destroy(&ctx->msi.ack_waits[i].sem);
+    }
     pthread_mutex_destroy(&ctx->msi.dir_mu);
 }
 
@@ -643,6 +931,15 @@ int msi_local_fault(dsm_ctx_t *ctx, fault_slot_t *s)
 
     uint32_t previous = DSM_SLOT_NONE;
     uint32_t home = home_resolve(ctx, page, &previous);
+
+    /* Un home distinto del conocido reinicia la secuencia de transacciones:
+     * sin esto, la primera respuesta del nuevo home (tseq bajo) se
+     * descartaria por antigua y la página quedaria sin servicio. */
+    if (previous != DSM_SLOT_NONE && previous != home) {
+        dsm_mem_stripe_lock(&ctx->mem, page);
+        ctx->mem.local[page].tseq_seen = 0;
+        dsm_mem_stripe_unlock(&ctx->mem, page);
+    }
 
     /* Si el anillo le quitó la página a este nodo, el contenido se entrega al
      * nuevo home antes de soltar la copia local. Un traspaso fallido deja la
@@ -693,13 +990,18 @@ int msi_local_fault(dsm_ctx_t *ctx, fault_slot_t *s)
     }
     uint32_t rx_len = ctx->mem.page_size;
     uint16_t status = DSM_ST_OK;
-    int rc = dsm_net_rpc(ctx, home, MSG_PAGE_REQUEST, page,
-                         ctx->mem.local[page].tseq_seen,
-                         write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
-                         DSM_FLAG_WANT_DATA, NULL, 0, &status, rx, &rx_len);
+    uint32_t resp_tseq = 0;
+    dsm_mem_stripe_lock(&ctx->mem, page);
+    uint32_t seen_tseq = ctx->mem.local[page].tseq_seen;
+    dsm_mem_stripe_unlock(&ctx->mem, page);
+    int rc = dsm_net_rpc_ex(ctx, home, MSG_PAGE_REQUEST, page,
+                            seen_tseq,
+                            write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
+                            DSM_FLAG_WANT_DATA, NULL, 0, &status, rx, &rx_len,
+                            0, &resp_tseq);
     if (rc == DSM_OK && status == DSM_ST_OK) {
         rc = page_apply(ctx, page, write ? DSM_PAGE_M : DSM_PAGE_S,
-                        rx, rx_len);
+                        rx, rx_len, resp_tseq, true);
     } else if (rc == DSM_OK && status == DSM_ST_BUSY) {
         page_invalidate_local(ctx, page);
         rc = DSM_ERR_BUSY;
@@ -765,6 +1067,7 @@ static void home_handle_probe(dsm_ctx_t *ctx, const dsm_msg_t *m)
     response.dst_slot      = m->hdr.src_slot;
     response.req_id        = m->hdr.req_id;
     response.page_id       = page;
+    response.tseq          = dir_tseq_next(ctx, page);
     response.payload_len   = ctx->mem.page_size;
     (void)dsm_net_send(ctx, m->hdr.src_slot, &response, data);
     free(data);
@@ -862,6 +1165,12 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
         if (!data) goto out;
         data_len = ctx->mem.page_size;
         uint16_t status = DSM_ST_OK;
+        uint32_t ack_tseq = 0;
+        uint32_t down_tseq = dir_tseq_next(ctx, page);
+        uint32_t txn = dsm_net_next_req(ctx);
+        uint8_t mask[MAX_NODES / 8];
+        memset(mask, 0, sizeof(mask));
+        mask[entry.owner / 8u] |= (uint8_t)(1u << (entry.owner % 8u));
 #if defined(DSM_TEST_HOOKS)
         pthread_mutex_lock(&g_busy_test_mu);
         if (g_downgrade_test_override) {
@@ -870,15 +1179,21 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
             rc = DSM_OK;
             data_len = (status == DSM_ST_OK) ? ctx->mem.page_size : 0;
         } else {
-            rc = dsm_net_rpc(ctx, entry.owner, MSG_DOWNGRADE, page, entry.tseq,
-                             write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
-                             DSM_FLAG_HAS_DATA, NULL, 0, &status, data, &data_len);
+            (void)msi_ack_wait_begin(ctx, txn, mask, 1);
+            rc = dsm_net_rpc_ex(ctx, entry.owner, MSG_DOWNGRADE, page, down_tseq,
+                                write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
+                                DSM_FLAG_HAS_DATA, NULL, 0, &status, data,
+                                &data_len, txn, &ack_tseq);
+            msi_ack_wait_cancel(ctx, txn);
         }
         pthread_mutex_unlock(&g_busy_test_mu);
 #else
-        rc = dsm_net_rpc(ctx, entry.owner, MSG_DOWNGRADE, page, entry.tseq,
-                         write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
-                         DSM_FLAG_HAS_DATA, NULL, 0, &status, data, &data_len);
+        (void)msi_ack_wait_begin(ctx, txn, mask, 1);
+        rc = dsm_net_rpc_ex(ctx, entry.owner, MSG_DOWNGRADE, page, down_tseq,
+                            write ? DSM_ACCESS_WRITE : DSM_ACCESS_READ,
+                            DSM_FLAG_HAS_DATA, NULL, 0, &status, data,
+                            &data_len, txn, &ack_tseq);
+        msi_ack_wait_cancel(ctx, txn);
 #endif
         if (rc != DSM_OK) {
             free(data);
@@ -947,8 +1262,9 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
     }
 
     if (!write) {
-        (void)page_apply(ctx, page, DSM_PAGE_S, data, data_len);
-        page_persist_home(ctx, page);
+        uint32_t tseq = dir_tseq_next(ctx, page);
+        (void)page_apply(ctx, page, DSM_PAGE_S, data, data_len, tseq, false);
+        (void)home_persist_delta(ctx, page, data);
 
         pthread_mutex_lock(&ctx->msi.dir_mu);
         entry = ctx->msi.dir[page];
@@ -972,6 +1288,7 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
         response.dst_slot = requester;
         response.req_id = m->hdr.req_id;
         response.page_id = page;
+        response.tseq = tseq;
         response.data_version = entry.version;
         response.payload_len = data_len;
         (void)dsm_net_send(ctx, requester, &response, data);
@@ -989,9 +1306,12 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
     }
 
     /* El home conserva la versión entregada: si el anillo le quita la página,
-     * el nuevo home la recupera del respaldo o del nodo que la recibió. */
-    (void)dsm_mem_backing_store(&ctx->mem, page, data);
+     * el nuevo home la recupera del respaldo o del nodo que la recibió. El
+     * respaldo arrastra su delta de paridad cuando el contenido cambió. */
+    (void)home_persist_delta(ctx, page, data);
     page_invalidate_local(ctx, page);
+
+    uint32_t tseq = dir_tseq_next(ctx, page);
 
     pthread_mutex_lock(&ctx->msi.dir_mu);
     entry = ctx->msi.dir[page];
@@ -999,7 +1319,6 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
     entry.owner = requester;
     memset(entry.copyset, 0, sizeof(entry.copyset));
     copyset_set(&entry, requester);
-    entry.tseq++;
     ctx->msi.dir[page] = entry;
     pthread_mutex_unlock(&ctx->msi.dir_mu);
 
@@ -1013,6 +1332,7 @@ void msi_home_handle_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
     response.dst_slot = requester;
     response.req_id = m->hdr.req_id;
     response.page_id = page;
+    response.tseq = tseq;
     response.data_version = entry.version;
     response.flags = data_len ? DSM_FLAG_HAS_DATA : 0;
     response.payload_len = data_len;
@@ -1029,20 +1349,33 @@ out:
 
 /* --- Mensajes de coherencia --- */
 
+static bool page_accept_pending(dsm_ctx_t *ctx, uint32_t page)
+{
+    if (page >= ctx->mem.npages) return false;
+    dsm_mem_stripe_lock(&ctx->mem, page);
+    uint8_t state = ctx->mem.local[page].state;
+    bool pending = state == DSM_PAGE_IS_PEND || state == DSM_PAGE_IM_PEND ||
+                   state == DSM_PAGE_SM_PEND;
+    dsm_mem_stripe_unlock(&ctx->mem, page);
+    return pending;
+}
+
 void msi_on_page_data(dsm_ctx_t *ctx, const dsm_msg_t *m)
 {
     if (!ctx || !m) return;
+    if (!page_accept_pending(ctx, m->hdr.page_id)) return;
     /* PAGE_DATA completa IS_PEND -> S y protege la página como solo lectura. */
     (void)page_apply(ctx, m->hdr.page_id, DSM_PAGE_S,
-                     m->payload, m->hdr.payload_len);
+                     m->payload, m->hdr.payload_len, m->hdr.tseq, true);
 }
 
 void msi_on_grant(dsm_ctx_t *ctx, const dsm_msg_t *m)
 {
     if (!ctx || !m) return;
+    if (!page_accept_pending(ctx, m->hdr.page_id)) return;
     /* GRANT completa IM_PEND/SM_PEND -> M y permite escritura. */
     (void)page_apply(ctx, m->hdr.page_id, DSM_PAGE_M,
-                     m->payload, m->hdr.payload_len);
+                     m->payload, m->hdr.payload_len, m->hdr.tseq, true);
 }
 
 void msi_on_invalidate(dsm_ctx_t *ctx, const dsm_msg_t *m)
@@ -1068,8 +1401,7 @@ void msi_on_invalidate(dsm_ctx_t *ctx, const dsm_msg_t *m)
 
 void msi_on_invalidate_ack(dsm_ctx_t *ctx, const dsm_msg_t *m)
 {
-    (void)ctx;
-    (void)m;
+    ack_wait_on_ack(ctx, m);
 }
 
 void msi_on_downgrade(dsm_ctx_t *ctx, const dsm_msg_t *m)
@@ -1078,6 +1410,7 @@ void msi_on_downgrade(dsm_ctx_t *ctx, const dsm_msg_t *m)
 
     uint32_t page = m->hdr.page_id;
     uint16_t status = DSM_ST_OK;
+    uint8_t *data = NULL;
 
     dsm_mem_stripe_lock(&ctx->mem, page);
     uint8_t state = ctx->mem.local[page].state;
@@ -1091,38 +1424,20 @@ void msi_on_downgrade(dsm_ctx_t *ctx, const dsm_msg_t *m)
         dsm_mem_stripe_unlock(&ctx->mem, page);
     } else {
         /* Camino M: mprotect antes de copiar, tal como estaba aprobado. */
-        uint8_t *data = malloc(ctx->mem.page_size);
+        data = malloc(ctx->mem.page_size);
         if (!data) {
             dsm_mem_stripe_unlock(&ctx->mem, page);
             status = DSM_ST_NO_SPACE;
+        } else if (dsm_mem_set_prot(&ctx->mem, page, PROT_READ) != DSM_OK) {
+            dsm_mem_stripe_unlock(&ctx->mem, page);
+            free(data);
+            data = NULL;
+            status = DSM_ST_BAD_STATE;
         } else {
-            if (dsm_mem_set_prot(&ctx->mem, page, PROT_READ) != DSM_OK) {
-                dsm_mem_stripe_unlock(&ctx->mem, page);
-                free(data);
-                status = DSM_ST_BAD_STATE;
-            } else {
-                memcpy(data, dsm_mem_page_ptr(&ctx->mem, page),
-                       ctx->mem.page_size);
-                ctx->mem.local[page].state = DSM_PAGE_S;
-                dsm_mem_stripe_unlock(&ctx->mem, page);
-
-                msg_header_t ack;
-                memset(&ack, 0, sizeof(ack));
-                ack.magic = DSM_MAGIC;
-                ack.cluster_id = ctx->cfg.cluster_id;
-                ack.proto_version = DSM_PROTO_VERSION;
-                ack.type = MSG_DOWNGRADE_ACK;
-                ack.src_slot = ctx->memb.self_slot;
-                ack.dst_slot = m->hdr.src_slot;
-                ack.req_id = m->hdr.req_id;
-                ack.page_id = page;
-                ack.status = DSM_ST_OK;
-                ack.flags = DSM_FLAG_HAS_DATA;
-                ack.payload_len = ctx->mem.page_size;
-                (void)dsm_net_send(ctx, m->hdr.src_slot, &ack, data);
-                free(data);
-                return;
-            }
+            memcpy(data, dsm_mem_page_ptr(&ctx->mem, page),
+                   ctx->mem.page_size);
+            ctx->mem.local[page].state = DSM_PAGE_S;
+            dsm_mem_stripe_unlock(&ctx->mem, page);
         }
     }
 
@@ -1137,17 +1452,27 @@ void msi_on_downgrade(dsm_ctx_t *ctx, const dsm_msg_t *m)
     ack.req_id = m->hdr.req_id;
     ack.page_id = page;
     ack.status = status;
-    (void)dsm_net_send(ctx, m->hdr.src_slot, &ack, NULL);
+    ack.tseq = m->hdr.tseq;
+    if (data) {
+        ack.flags = DSM_FLAG_HAS_DATA;
+        ack.payload_len = ctx->mem.page_size;
+    }
+    (void)dsm_net_send(ctx, m->hdr.src_slot, &ack, data);
+    free(data);
 }
 
 void msi_on_downgrade_ack(dsm_ctx_t *ctx, const dsm_msg_t *m)
 {
-    (void)ctx;
-    (void)m;
+    if (!ctx || !m) return;
+    if ((m->hdr.flags & DSM_FLAG_HAS_DATA) && m->payload) {
+        (void)tseq_accept(ctx, m->hdr.page_id, m->hdr.tseq);
+    }
+    ack_wait_on_ack(ctx, m);
 }
 
 /* WRITEBACK llega al home con el contenido de una página en M. El home lo
- * copia a su marco de respaldo y confirma con WRITEBACK_ACK. */
+ * copia a su marco de respaldo, con su delta de paridad, y confirma con
+ * WRITEBACK_ACK. */
 void msi_on_writeback(dsm_ctx_t *ctx, const dsm_msg_t *m)
 {
     if (!ctx || !m || m->hdr.page_id >= ctx->mem.npages) return;
@@ -1155,10 +1480,41 @@ void msi_on_writeback(dsm_ctx_t *ctx, const dsm_msg_t *m)
 
     uint32_t page = m->hdr.page_id;
     uint16_t status = DSM_ST_OK;
-    if (ring_home_of(ctx, page) != ctx->memb.self_slot) {
-        status = DSM_ST_NOT_HOME;
-    } else if (dsm_mem_backing_store(&ctx->mem, page, m->payload) != DSM_OK) {
-        status = DSM_ST_NO_SPACE;
+
+    /* La secuencia de leer el respaldo, persistir y emitir el delta de
+     * paridad no puede intercalarse con otra de la misma página: se
+     * reserva con el busy del directorio como el resto de las rutas del
+     * home. */
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    if (ctx->msi.dir[page].busy) {
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
+        status = DSM_ST_BUSY;
+    } else {
+        ctx->msi.dir[page].busy = 1;
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
+
+        if (ring_home_of(ctx, page) != ctx->memb.self_slot) {
+            status = DSM_ST_NOT_HOME;
+        } else if (m->hdr.flags & DSM_FLAG_TRANSFER) {
+            /* Traspaso de custodia: el contenido no cambia, así que se
+             * persiste sin delta de paridad, y la secuencia del custodio
+             * anterior se siembra para que las respuestas de este home
+             * superen el tseq_seen que los demás ya registraron. */
+            pthread_mutex_lock(&ctx->msi.dir_mu);
+            if (m->hdr.tseq != 0 && m->hdr.tseq > ctx->msi.dir[page].tseq) {
+                ctx->msi.dir[page].tseq = m->hdr.tseq;
+            }
+            pthread_mutex_unlock(&ctx->msi.dir_mu);
+            if (dsm_mem_backing_store(&ctx->mem, page, m->payload) != DSM_OK) {
+                status = DSM_ST_NO_SPACE;
+            }
+        } else if (home_persist_delta(ctx, page, m->payload) != DSM_OK) {
+            status = DSM_ST_NO_SPACE;
+        }
+
+        pthread_mutex_lock(&ctx->msi.dir_mu);
+        ctx->msi.dir[page].busy = 0;
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
     }
 
     msg_header_t ack;
@@ -1175,6 +1531,175 @@ void msi_on_writeback(dsm_ctx_t *ctx, const dsm_msg_t *m)
     (void)dsm_net_send(ctx, m->hdr.src_slot, &ack, NULL);
 }
 
+/* Instala en el nuevo custodio la copia que le entrega el nodo que custodiaba
+ * la página antes de la baja. */
+void msi_on_page_move(dsm_ctx_t *ctx, const dsm_msg_t *m)
+{
+    if (!ctx || !m || m->hdr.page_id >= ctx->mem.npages) return;
+    if (m->hdr.payload_len != ctx->mem.page_size || !m->payload) return;
+
+    uint32_t page = m->hdr.page_id;
+    uint16_t status = DSM_ST_OK;
+
+    /* El custodio anterior viaja en la cabecera: su secuencia de
+     * transacciones se siembra aqui para que las respuestas de este home
+     * superen el tseq_seen que los demas nodos ya registraron. */
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    if (m->hdr.tseq != 0 && m->hdr.tseq > ctx->msi.dir[page].tseq) {
+        ctx->msi.dir[page].tseq = m->hdr.tseq;
+    }
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
+    uint32_t tseq = dir_tseq_next(ctx, page);
+
+    if (ring_home_of(ctx, page) != ctx->memb.self_slot) {
+        status = DSM_ST_NOT_HOME;
+    } else if (dsm_mem_backing_store(&ctx->mem, page, m->payload) != DSM_OK) {
+        status = DSM_ST_NO_SPACE;
+    } else {
+        dsm_mem_stripe_lock(&ctx->mem, page);
+        dsm_mem_install_page(&ctx->mem, page, m->payload);
+        (void)dsm_mem_set_prot(&ctx->mem, page, PROT_READ);
+        ctx->mem.local[page].state = DSM_PAGE_S;
+        ctx->mem.local[page].tseq_seen = tseq;
+        dsm_mem_stripe_unlock(&ctx->mem, page);
+    }
+
+    pthread_mutex_lock(&ctx->msi.dir_mu);
+    dir_entry_t *entry = &ctx->msi.dir[page];
+    ctx->msi.home_map[page] = ctx->memb.self_slot;
+    entry->version++;
+    if (status == DSM_ST_OK) {
+        entry->state = DSM_DIR_SHARED;
+        entry->owner = DSM_SLOT_NONE;
+        memset(entry->copyset, 0, sizeof(entry->copyset));
+        copyset_set(entry, ctx->memb.self_slot);
+        copyset_set(entry, m->hdr.src_slot);
+    }
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
+
+    msg_header_t ack;
+    memset(&ack, 0, sizeof(ack));
+    ack.magic         = DSM_MAGIC;
+    ack.cluster_id    = ctx->cfg.cluster_id;
+    ack.proto_version = DSM_PROTO_VERSION;
+    ack.type          = MSG_PAGE_MOVE_ACK;
+    ack.src_slot      = ctx->memb.self_slot;
+    ack.dst_slot      = m->hdr.src_slot;
+    ack.req_id        = m->hdr.req_id;
+    ack.page_id       = page;
+    ack.status        = status;
+    (void)dsm_net_send(ctx, m->hdr.src_slot, &ack, NULL);
+}
+
+/* Reasigna las páginas cuyo custodio era el nodo caído. Solo se sirve una copia
+ * cuando hay datos vigentes; sin copia la página queda inválida y nadie la
+ * anuncia como compartida. */
+void msi_on_node_down(dsm_ctx_t *ctx, uint32_t slot)
+{
+    if (!ctx || slot >= MAX_NODES || !ctx->msi.dir) return;
+
+    uint32_t npages = ctx->mem.npages < ctx->msi.cap ? ctx->mem.npages : ctx->msi.cap;
+
+    for (uint32_t page = 0; page < npages; page++) {
+        if (home_known(ctx, page) != slot) continue;
+
+        uint32_t new_home = ring_home_of(ctx, page);
+        if (new_home == DSM_SLOT_NONE || new_home >= MAX_NODES ||
+            new_home == slot) {
+            continue;
+        }
+
+        dir_entry_t entry = dir_snapshot(ctx, page);
+        uint8_t *data = malloc(ctx->mem.page_size);
+        bool have = false;
+        bool transfer_failed = false;
+
+        if (data) {
+            /* La vista local y el marco de respaldo son la primera fuente: una
+             * copia cacheada no siempre figura en el copyset del directorio. */
+            have = page_can_serve(ctx, page, data);
+            for (uint32_t s = 0; !have && s < MAX_NODES; s++) {
+                if (s == ctx->memb.self_slot || s == slot ||
+                    !copyset_has(&entry, s)) {
+                    continue;
+                }
+                uint16_t status = DSM_ST_OK;
+                uint32_t rx_len = ctx->mem.page_size;
+                int rc = dsm_net_rpc(ctx, s, MSG_PAGE_REQUEST, page,
+                                     entry.tseq, DSM_ACCESS_READ,
+                                     DSM_FLAG_PROBE | DSM_FLAG_WANT_DATA,
+                                     NULL, 0, &status, data, &rx_len);
+                if (rc == DSM_OK && status == DSM_ST_OK &&
+                    rx_len == ctx->mem.page_size) {
+                    have = true;
+                }
+            }
+
+            if (have) {
+                uint32_t tseq = dir_tseq_next(ctx, page);
+                if (new_home == ctx->memb.self_slot) {
+                    (void)dsm_mem_backing_store(&ctx->mem, page, data);
+                    dsm_mem_stripe_lock(&ctx->mem, page);
+                    dsm_mem_install_page(&ctx->mem, page, data);
+                    (void)dsm_mem_set_prot(&ctx->mem, page, PROT_READ);
+                    ctx->mem.local[page].state = DSM_PAGE_S;
+                    ctx->mem.local[page].tseq_seen = tseq;
+                    dsm_mem_stripe_unlock(&ctx->mem, page);
+                } else {
+                    uint16_t status = DSM_ST_OK;
+                    uint32_t rx_len = 0;
+                    int rc = dsm_net_rpc(ctx, new_home, MSG_PAGE_MOVE, page,
+                                         tseq, DSM_ACCESS_READ, DSM_FLAG_HAS_DATA,
+                                         data, ctx->mem.page_size, &status,
+                                         NULL, &rx_len);
+                    if (rc != DSM_OK || status != DSM_ST_OK) {
+                        /* El nuevo home no recibio el contenido, pero la
+                         * copia de este nodo sigue valida: no se destruye. */
+                        have = false;
+                        transfer_failed = true;
+                    }
+                }
+            }
+            free(data);
+        }
+
+        (void)dir_tseq_next(ctx, page);
+        pthread_mutex_lock(&ctx->msi.dir_mu);
+        dir_entry_t *d = &ctx->msi.dir[page];
+        d->version++;
+        ctx->msi.home_map[page] = new_home;
+        if (have) {
+            d->state = DSM_DIR_SHARED;
+            d->owner = DSM_SLOT_NONE;
+            copyset_set(d, new_home);
+            if (new_home == ctx->memb.self_slot) {
+                copyset_set(d, ctx->memb.self_slot);
+            }
+        } else {
+            d->state = DSM_DIR_UNCACHED;
+            d->owner = DSM_SLOT_NONE;
+            memset(d->copyset, 0, sizeof(d->copyset));
+        }
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
+
+        if (!have) {
+            if (transfer_failed) {
+                /* Un traspaso fallido no destruye la copia local: sigue
+                 * siendo la unica fuente y el nuevo home la recuperara con
+                 * una sonda cuando la necesite. */
+                DSM_LOG_WARN("Traspaso de la página %u al slot %u fallo tras "
+                             "la baja del slot %u; se conserva la copia local",
+                             page, new_home, slot);
+            } else {
+                page_invalidate_local(ctx, page);
+                (void)dsm_mem_backing_drop(&ctx->mem, page);
+                DSM_LOG_WARN("Página %u sin copia válida tras la baja del slot %u; "
+                             "queda inválida", page, slot);
+            }
+        }
+    }
+}
+
 /* Persiste en el respaldo del home el contenido de una página que este nodo
  * tiene en M. El home escribe su propio marco; cualquier otro nodo envía el
  * contenido al home por WRITEBACK y espera el acuse. */
@@ -1187,17 +1712,33 @@ int msi_writeback_page(dsm_ctx_t *ctx, uint32_t page)
 
     dsm_mem_stripe_lock(&ctx->mem, page);
     memcpy(data, dsm_mem_page_ptr(&ctx->mem, page), ctx->mem.page_size);
+    uint32_t seen_tseq = ctx->mem.local[page].tseq_seen;
     dsm_mem_stripe_unlock(&ctx->mem, page);
 
     int rc;
     uint32_t home = ring_home_of(ctx, page);
     if (home == ctx->memb.self_slot) {
-        rc = dsm_mem_backing_store(&ctx->mem, page, data);
+        /* La secuencia de respaldo y delta se reserva con el busy del
+         * directorio, como en el receptor del WRITEBACK. */
+        pthread_mutex_lock(&ctx->msi.dir_mu);
+        if (ctx->msi.dir[page].busy) {
+            pthread_mutex_unlock(&ctx->msi.dir_mu);
+            free(data);
+            return DSM_ERR_BUSY;
+        }
+        ctx->msi.dir[page].busy = 1;
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
+
+        rc = home_persist_delta(ctx, page, data);
+
+        pthread_mutex_lock(&ctx->msi.dir_mu);
+        ctx->msi.dir[page].busy = 0;
+        pthread_mutex_unlock(&ctx->msi.dir_mu);
     } else {
         uint16_t status = DSM_ST_OK;
         uint32_t rx_len = 0;
         rc = dsm_net_rpc(ctx, home, MSG_WRITEBACK, page,
-                         ctx->mem.local[page].tseq_seen, DSM_ACCESS_WRITE,
+                         seen_tseq, DSM_ACCESS_WRITE,
                          DSM_FLAG_HAS_DATA, data, ctx->mem.page_size,
                          &status, NULL, &rx_len);
         if (rc == DSM_OK && status != DSM_ST_OK) {

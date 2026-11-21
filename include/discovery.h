@@ -75,6 +75,11 @@ void membership_on_leave(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void membership_on_resp(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void membership_send_resp(dsm_ctx_t *ctx, uint32_t dst);
 
+/* Recuperación de coherencia tras una baja: reasigna las páginas, los
+ * cerrojos y la paridad del slot indicado. La ejecuta un hilo worker a
+ * partir del mensaje sintético que encola quien cierra la ranura. */
+void membership_node_down_recover(dsm_ctx_t *ctx, uint32_t slot);
+
 /* Atiende una QUERY_REQ de dsmctl y responde por el socket de la petición. */
 void membership_handle_query_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd);
 

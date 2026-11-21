@@ -17,6 +17,8 @@
 #include "sync.h"
 #include "worker.h"
 #include "ring.h"
+#include "raid.h"
+#include "dist.h"
 #include "log.h"
 #include "util.h"
 
@@ -58,8 +60,14 @@ typedef struct {
     _Atomic uint64_t invalidations;
     _Atomic uint64_t fault_latency_us_total;
     _Atomic uint64_t faults_serviced;
+    _Atomic uint64_t tseq_discarded;
+    _Atomic uint64_t nacks_received;
     _Atomic uint32_t pending_count, wait_pool_used;
     _Atomic uint32_t slots_enqueued, slots_woken;
+    _Atomic uint64_t parity_deltas, parity_bytes;
+    _Atomic uint64_t stripe_rebuilds, parity_latency_us;
+    _Atomic uint64_t dist_tasks_run, dist_tasks_failed;
+    _Atomic uint64_t hb_missed;
 } dsm_counters_t;
 
 typedef struct dsm_ctx {
@@ -74,9 +82,10 @@ typedef struct dsm_ctx {
     dsm_counters_t    ctr;
     dsm_alloc_t       alloc;
     dsm_ring_t        ring;
+    dsm_raid_t        raid;
+    dsm_dist_t        dist;
     atomic_bool       running;
     pthread_t         hb_thread;
-    pthread_t         listener_thread;
 } dsm_ctx_t;
 
 /* Acceso al contexto global del nodo */

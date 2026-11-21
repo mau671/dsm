@@ -158,12 +158,6 @@ void dsm_mem_install_page(dsm_mem_t *m, uint32_t page, const void *src)
     }
 }
 
-void dsm_mem_install_local(dsm_mem_t *m, uint32_t page)
-{
-    (void)m;
-    (void)page;
-}
-
 uint8_t *dsm_mem_page_ptr(dsm_mem_t *m, uint32_t page)
 {
     if (page >= m->npages) return NULL;

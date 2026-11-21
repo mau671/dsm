@@ -18,6 +18,12 @@ static void fault_slot_wake(fault_slot_t *slot)
     syscall(SYS_futex, (int *)&slot->done, FUTEX_WAKE, 1, NULL, NULL, 0);
 }
 
+/* Límite de reintentos consecutivos por ranura de fallo: una página cuyo
+ * dueño en M murió devuelve BUSY indefinidamente y no debe monopolizar al
+ * despachador. Al agotarlos se despierta al hilo de aplicación, que vuelve
+ * a fallar y reencolar, y el despachador queda libre para otras páginas. */
+#define DSM_FAULT_BUSY_ATTEMPTS 64u
+
 static void *dispatcher_thread_main(void *arg)
 {
     dsm_ctx_t *ctx = (dsm_ctx_t *)arg;
@@ -39,9 +45,21 @@ static void *dispatcher_thread_main(void *arg)
          */
         uint64_t t0 = mono_us();
         int rc;
+        uint32_t busy_attempts = 0;
         do {
             rc = msi_local_fault(ctx, slot);
             if (rc == DSM_ERR_BUSY) {
+                busy_attempts++;
+                if (busy_attempts >= DSM_FAULT_BUSY_ATTEMPTS) {
+                    /* Página atascada (p. ej. dueño muerto en M): se libera
+                     * la ranura sin resolver; el acceso reencolará y otros
+                     * fallos no esperan detrás de esta página. */
+                    DSM_LOG_WARN("Fallo de la página %u sin progreso tras %u "
+                                 "reintentos; se libera la ranura",
+                                 slot->page, busy_attempts);
+                    rc = DSM_ERR_BUSY;
+                    break;
+                }
                 /* Limitación temporal: hasta que exista retry_at diferido,
                  * este despachador reintenta con jitter sin conservar locks.
                  * Cada hilo usa su propia semilla; no usa rand() global. */
@@ -55,6 +73,8 @@ static void *dispatcher_thread_main(void *arg)
                 while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
                     /* EINTR conserva el tiempo restante en ts. */
                 }
+            } else {
+                busy_attempts = 0;
             }
         } while (rc == DSM_ERR_BUSY && atomic_load(&ctx->running));
         uint64_t elapsed = mono_us() - t0;
@@ -122,6 +142,41 @@ static void *worker_thread_main(void *arg)
         case MSG_WRITEBACK:
             msi_on_writeback(ctx, &item->msg);
             break;
+        case MSG_PAGE_MOVE:
+            msi_on_page_move(ctx, &item->msg);
+            break;
+        case MSG_PARITY_DELTA:
+            raid_on_parity_delta(ctx, &item->msg);
+            break;
+        case MSG_PARITY_ACK:
+            raid_on_parity_ack(ctx, &item->msg);
+            break;
+        case MSG_STRIPE_READ:
+            raid_on_stripe_read(ctx, &item->msg);
+            break;
+        case MSG_STRIPE_DATA:
+            raid_on_stripe_data(ctx, &item->msg);
+            break;
+        case MSG_STRIPE_PUT:
+            raid_on_stripe_put(ctx, &item->msg);
+            break;
+        case MSG_STRIPE_PUT_ACK:
+            raid_on_stripe_put_ack(ctx, &item->msg);
+            break;
+        case MSG_STATE_REPORT:
+            raid_on_state_report(ctx, &item->msg);
+            break;
+        case MSG_DIR_DONE:
+            raid_on_dir_done(ctx, &item->msg);
+            break;
+        case MSG_NACK:
+            atomic_fetch_add_explicit(&ctx->ctr.nacks_received, 1,
+                                      memory_order_relaxed);
+            DSM_LOG_WARN("NACK del slot %u para la peticion %u (pagina %u, "
+                         "estado %u) sin peticion pendiente local",
+                         item->msg.hdr.src_slot, item->msg.hdr.req_id,
+                         item->msg.hdr.page_id, item->msg.hdr.status);
+            break;
         case MSG_LOCK_REQ:
             sync_on_lock_req(ctx, &item->msg);
             break;
@@ -137,6 +192,17 @@ static void *worker_thread_main(void *arg)
         case MSG_BARRIER_GO:
             sync_on_barrier_go(ctx, &item->msg);
             break;
+        case MSG_DIST_RUN:
+            dist_on_run(ctx, &item->msg);
+            break;
+        case MSG_DIST_DONE:
+            dist_on_done(ctx, &item->msg);
+            break;
+        case MSG_NODE_DOWN:
+            /* Mensaje sintético encolado por quien cerró la ranura: la
+             * recuperación de coherencia corre aquí y no en el listener. */
+            membership_node_down_recover(ctx, item->msg.hdr.page_id);
+            break;
         default:
             break;
         }
@@ -146,6 +212,10 @@ static void *worker_thread_main(void *arg)
         }
         free(item);
     }
+
+    /* Solo los hilos que ejecutaron un kernel distribuido tienen pila
+     * alternativa que liberar; en el resto es una operacion nula. */
+    (void)dsm_sig_thread_detach();
     return NULL;
 }
 

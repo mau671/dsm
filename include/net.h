@@ -39,6 +39,7 @@ typedef struct dsm_pending {
     uint32_t            rx_len;
     uint32_t            rx_capacity;
     uint32_t            rx_version;
+    uint32_t            rx_tseq;
     int                 result;
     struct dsm_pending *next;
 } pending_req_t;
@@ -63,16 +64,21 @@ int  net_start_listener(dsm_ctx_t *ctx);
 int  net_stop_listener(dsm_ctx_t *ctx);
 
 int  dsm_net_send(dsm_ctx_t *ctx, uint32_t dst, const msg_header_t *hdr, const void *payload);
+uint32_t dsm_net_next_req(dsm_ctx_t *ctx);
 int  dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
                  uint32_t tseq, uint8_t access, uint8_t flags,
                  const void *tx_payload, uint32_t tx_len,
                  uint16_t *out_status, void *rx_payload, uint32_t *rx_len);
+int  dsm_net_rpc_ex(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
+                    uint32_t tseq, uint8_t access, uint8_t flags,
+                    const void *tx_payload, uint32_t tx_len,
+                    uint16_t *out_status, void *rx_payload, uint32_t *rx_len,
+                    uint32_t req_id, uint32_t *out_tseq);
 
 int  dsm_net_read_one(int fd, uint32_t cluster_id, dsm_msg_t *out, uint8_t **owned);
 int  peer_ensure_connected(dsm_ctx_t *ctx, uint32_t slot);
 void peer_mark_down(dsm_ctx_t *ctx, uint32_t slot);
 
-int  net_probe(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t *out);
 int  net_send_heartbeat(dsm_ctx_t *ctx, uint32_t dst, uint32_t free_pages);
 int  net_send_nack(dsm_ctx_t *ctx, uint32_t dst, uint32_t req_id, uint16_t status);
 

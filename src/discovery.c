@@ -145,7 +145,8 @@ static int probe_peer(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t 
     int fd = dsm_connect_timeout(addr, ctx->cfg.connect_timeout_ms);
     if (fd < 0) return DSM_ERR_NET;
 
-    /* Enviar mensaje HELLO: 20 bytes (uuid[16] + raw_hash[4]) */    uint8_t hello_payload[20];
+    /* Enviar mensaje HELLO: 20 bytes (uuid[16] + raw_hash[4]) */
+    uint8_t hello_payload[20];
     memcpy(hello_payload, ctx->memb.self_uuid, 16);
     uint32_t hash_net = htonl(ctx->cfg.raw_hash);
     memcpy(hello_payload + 16, &hash_net, 4);
@@ -168,7 +169,8 @@ static int probe_peer(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t 
         return DSM_ERR_NET;
     }
 
-    /* Recibir respuesta WELCOME */    uint8_t rx_hdr_buf[DSM_HDR_LEN];
+    /* Recibir respuesta WELCOME */
+    uint8_t rx_hdr_buf[DSM_HDR_LEN];
     if (dsm_read_full_deadline(fd, rx_hdr_buf, DSM_HDR_LEN, ctx->cfg.discovery_timeout_ms) != DSM_OK) {
         close(fd);
         return DSM_ERR_NET;
@@ -354,61 +356,86 @@ static int discovery_visit_peer(dsm_ctx_t *ctx, const welcome_t *w,
 static int discovery_walk(dsm_ctx_t *ctx, discovery_walk_t *walk)
 {
     dsm_config_t *cfg = &ctx->cfg;
+    uint64_t deadline = mono_ms() + cfg->discovery_timeout_ms;
 
     for (uint32_t h = 0; h < cfg->peer_host_count; h++) {
-        struct hostent *he = gethostbyname(cfg->peer_hosts[h]);
-        if (!he || !he->h_addr_list[0]) {
+        if (mono_ms() >= deadline) break;
+
+        struct addrinfo hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags    = AI_ADDRCONFIG;
+
+        struct addrinfo *res = NULL;
+        int gai = getaddrinfo(cfg->peer_hosts[h], NULL, &hints, &res);
+        if (gai != 0 || !res) {
+            if (gai != EAI_NONAME) {
+                DSM_LOG_WARN("No se pudo resolver %s: %s", cfg->peer_hosts[h],
+                             gai_strerror(gai));
+            }
             continue;
         }
 
-        struct in_addr in;
-        memcpy(&in, he->h_addr_list[0], sizeof(in));
+        for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+            if (mono_ms() >= deadline) break;
+            if (ai->ai_family != AF_INET || !ai->ai_addr) continue;
 
-        for (uint16_t port = cfg->port_min; port <= cfg->port_max; port++) {
-            if (port == ctx->net.listen_port &&
-                (in.s_addr == htonl(INADDR_LOOPBACK) || in.s_addr == htonl(INADDR_ANY) ||
-                 (in.s_addr & htonl(0xFF000000)) == htonl(0x7F000000))) {
-                continue; /* No escanearse a sí mismo en loopback */
-            }
+            struct sockaddr_in sa;
+            memcpy(&sa, ai->ai_addr, sizeof(sa));
+            struct in_addr in = sa.sin_addr;
 
-            struct sockaddr_in addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            addr.sin_addr   = in;
-            addr.sin_port   = htons(port);
+            for (uint16_t port = cfg->port_min; port <= cfg->port_max; port++) {
+                if (mono_ms() >= deadline) break;
+                if (port == ctx->net.listen_port &&
+                    (in.s_addr == htonl(INADDR_LOOPBACK) || in.s_addr == htonl(INADDR_ANY) ||
+                     (in.s_addr & htonl(0xFF000000)) == htonl(0x7F000000))) {
+                    continue; /* No escanearse a sí mismo en loopback */
+                }
 
-            welcome_t w;
-            int pr = probe_peer(ctx, &addr, &w);
-            if (pr == DSM_ERR_CONFIG) {
-                DSM_LOG_ERR("probe_peer devolvio DSM_ERR_CONFIG en %s:%u",
-                            cfg->peer_hosts[h], port);
-                return DSM_ERR_CONFIG;
-            }
-            if (pr != DSM_OK) {
-                continue;
-            }
+                struct sockaddr_in addr;
+                memset(&addr, 0, sizeof(addr));
+                addr.sin_family = AF_INET;
+                addr.sin_addr   = in;
+                addr.sin_port   = htons(port);
 
-            /*
-             * La membresia identifica a cada nodo por su UUID, de modo que dos
-             * procesos con el mismo UUID (mismo archivo de identidad, puerto
-             * distinto) no se pueden distinguir entre si. Ese caso se reporta
-             * en lugar de ignorar al par: ignorarlo deja a los dos procesos
-             * creyendose el primer nodo del cluster.
-             */
-            if (memcmp(w.origin_uuid, ctx->memb.self_uuid, 16) == 0) {
-                char own_uuid[37];
-                uuid_to_str(w.origin_uuid, own_uuid);
-                DSM_LOG_ERR("Otro proceso escucha en %s:%u con el mismo UUID (%s); "
-                            "cada nodo necesita un DSM_NODE_TAG distinto",
-                            cfg->peer_hosts[h], port, own_uuid);
-                return DSM_ERR_CONFIG;
-            }
+                welcome_t w;
+                int pr = probe_peer(ctx, &addr, &w);
+                if (pr == DSM_ERR_CONFIG) {
+                    DSM_LOG_ERR("probe_peer devolvio DSM_ERR_CONFIG en %s:%u",
+                                cfg->peer_hosts[h], port);
+                    freeaddrinfo(res);
+                    return DSM_ERR_CONFIG;
+                }
+                if (pr != DSM_OK) {
+                    continue;
+                }
 
-            int rc = discovery_visit_peer(ctx, &w, &addr, walk);
-            if (rc != DSM_OK) {
-                return rc;
+                /*
+                 * La membresia identifica a cada nodo por su UUID, de modo que dos
+                 * procesos con el mismo UUID (mismo archivo de identidad, puerto
+                 * distinto) no se pueden distinguir entre si. Ese caso se reporta
+                 * en lugar de ignorar al par: ignorarlo deja a los dos procesos
+                 * creyendose el primer nodo del cluster.
+                 */
+                if (memcmp(w.origin_uuid, ctx->memb.self_uuid, 16) == 0) {
+                    char own_uuid[37];
+                    uuid_to_str(w.origin_uuid, own_uuid);
+                    DSM_LOG_ERR("Otro proceso escucha en %s:%u con el mismo UUID (%s); "
+                                "cada nodo necesita un DSM_NODE_TAG distinto",
+                                cfg->peer_hosts[h], port, own_uuid);
+                    freeaddrinfo(res);
+                    return DSM_ERR_CONFIG;
+                }
+
+                int rc = discovery_visit_peer(ctx, &w, &addr, walk);
+                if (rc != DSM_OK) {
+                    freeaddrinfo(res);
+                    return rc;
+                }
             }
         }
+        freeaddrinfo(res);
     }
 
     return DSM_OK;
@@ -1400,19 +1427,68 @@ void membership_on_join_ack(dsm_ctx_t *ctx, const dsm_msg_t *m)
     (void)m;
 }
 
+/* Recuperación de coherencia tras una baja: reasigna páginas custodiadas por
+ * el slot caído, pasa sus cerrojos al nuevo custodio y programa la
+ * reconstrucción de paridad. La ejecuta un hilo worker: sus RPC por página
+ * no pueden correr en el listener, que es el único que completa las
+ * respuestas, ni en el hilo de latidos, cuyo retraso declararía muertos a
+ * los demás nodos. */
+void membership_node_down_recover(dsm_ctx_t *ctx, uint32_t slot)
+{
+    if (!ctx || slot >= MAX_NODES || slot == ctx->memb.self_slot) return;
+
+    msi_on_node_down(ctx, slot);
+    sync_on_node_down(ctx, slot);
+    /* La membresia ya esta cerrada: raid_on_node_down consulta el anillo
+     * antes de tomar el mutex de franja, sin invertir el orden de locks. */
+    if (ctx->cfg.redundancy_raid5) {
+        raid_on_node_down(ctx, slot);
+    }
+}
+
+/* Encola la recuperación de una ranura recién cerrada. Quien detecta la
+ * muerte solo actualiza la membresía y deja el trabajo pesado a un worker,
+ * de modo que el listener y el hilo de latidos nunca se bloquean en RPC. */
+static void node_down_recover_enqueue(dsm_ctx_t *ctx, uint32_t slot)
+{
+    if (!ctx || slot >= MAX_NODES) return;
+
+    dsm_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.hdr.magic       = DSM_MAGIC;
+    msg.hdr.cluster_id  = ctx->cfg.cluster_id;
+    msg.hdr.proto_version = DSM_PROTO_VERSION;
+    msg.hdr.type        = MSG_NODE_DOWN;
+    msg.hdr.src_slot    = ctx->memb.self_slot;
+    msg.hdr.page_id     = slot;
+
+    if (worker_enqueue(ctx, &msg, NULL) != DSM_OK) {
+        DSM_LOG_WARN("Recuperación del slot %u aplazada: sin capacidad de "
+                     "cola; los fallos de página la completarán", slot);
+    }
+}
+
 void membership_on_node_down(dsm_ctx_t *ctx, const dsm_msg_t *m)
 {
     uint32_t s = m->hdr.page_id; /* slot afectado en page_id */
     if (s >= MAX_NODES || s == ctx->memb.self_slot) return;
 
+    bool changed = false;
     pthread_rwlock_wrlock(&ctx->memb.rw);
     if (membership_slot_present(ctx, s)) {
         ctx->memb.nodes[s].state = DSM_NODE_DEAD;
         ctx->memb.present[s / 8] &= (uint8_t)~(1u << (s % 8));
         ctx->memb.reusable_after_ms[s] = mono_ms() + ctx->cfg.reconnect_max_ms;
+        changed = true;
         DSM_LOG_WARN("Notificacion NODE_DOWN procesada para slot %u", s);
     }
     pthread_rwlock_unlock(&ctx->memb.rw);
+
+    /* Solo quien cierra la ranura recupera: los receptores del broadcast
+     * ya la encuentran cerrada y su paso es un no-op. */
+    if (changed) {
+        node_down_recover_enqueue(ctx, s);
+    }
 }
 
 void membership_on_leave(dsm_ctx_t *ctx, const dsm_msg_t *m)
@@ -1420,14 +1496,20 @@ void membership_on_leave(dsm_ctx_t *ctx, const dsm_msg_t *m)
     uint32_t s = m->hdr.src_slot;
     if (s >= MAX_NODES || s == ctx->memb.self_slot) return;
 
+    bool changed = false;
     pthread_rwlock_wrlock(&ctx->memb.rw);
     if (membership_slot_present(ctx, s)) {
         ctx->memb.nodes[s].state = DSM_NODE_DEAD;
         ctx->memb.present[s / 8] &= (uint8_t)~(1u << (s % 8));
         ctx->memb.reusable_after_ms[s] = mono_ms() + ctx->cfg.reconnect_max_ms;
+        changed = true;
         DSM_LOG_INFO("Salida ordenada (LEAVE) del nodo en slot %u", s);
     }
     pthread_rwlock_unlock(&ctx->memb.rw);
+
+    if (changed) {
+        node_down_recover_enqueue(ctx, s);
+    }
 }
 
 void membership_on_resp(dsm_ctx_t *ctx, const dsm_msg_t *m)
@@ -1704,6 +1786,13 @@ void membership_evaluate(dsm_ctx_t *ctx, uint64_t now_ms)
 
         uint64_t elapsed = now_ms - ni->last_hb_ms;
         uint32_t missed = (uint32_t)(elapsed / ctx->cfg.hb_interval_ms);
+        /* Cada intervalo perdido se cuenta una sola vez: el acumulador
+         * crece con el incremento respecto de la evaluación anterior. */
+        if (missed > ni->missed_hb) {
+            atomic_fetch_add_explicit(&ctx->ctr.hb_missed,
+                                      (uint64_t)(missed - ni->missed_hb),
+                                      memory_order_relaxed);
+        }
         ni->missed_hb = (uint8_t)(missed > 255 ? 255 : missed);
 
         if (ni->missed_hb >= ctx->cfg.hb_dead) {
@@ -1718,6 +1807,14 @@ void membership_evaluate(dsm_ctx_t *ctx, uint64_t now_ms)
         }
     }
     pthread_rwlock_unlock(&m->rw);
+
+    /* Quien detecta la muerte también recupera la coherencia de su lado:
+     * confiar solo en el broadcast dejaría al detector con páginas huérfanas
+     * si el aviso se pierde. La recuperación corre en un worker, nunca en
+     * este hilo de latidos. */
+    for (uint32_t d = 0; d < dead_count; d++) {
+        node_down_recover_enqueue(ctx, dead_slots[d]);
+    }
 
     /* Difundir NODE_DOWN para los nodos declarados muertos */
     for (uint32_t d = 0; d < dead_count; d++) {

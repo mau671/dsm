@@ -81,12 +81,20 @@ static void pending_remove(dsm_ctx_t *ctx, pending_req_t *pending)
             ctx->net.pending[bucket] = found->next;
         }
     }
+    atomic_fetch_sub_explicit(&ctx->ctr.pending_count, 1, memory_order_relaxed);
     pthread_mutex_unlock(&ctx->net.pending_mu);
 }
 
 static int pending_complete(dsm_ctx_t *ctx, const msg_header_t *hdr,
                             const uint8_t *payload)
 {
+    /* Una respuesta de pagina repetida o antigua no despierta al emisor: se
+     * deja caer al worker, que la descarta sin tocar la tabla de paginas. */
+    if ((hdr->type == MSG_PAGE_DATA || hdr->type == MSG_GRANT) &&
+        msi_tseq_stale(ctx, hdr->page_id, hdr->tseq)) {
+        return DSM_ERR_NOT_FOUND;
+    }
+
     pthread_mutex_lock(&ctx->net.pending_mu);
     pending_req_t *pending = pending_find_locked(ctx, hdr->req_id, NULL);
     if (!pending) {
@@ -94,8 +102,17 @@ static int pending_complete(dsm_ctx_t *ctx, const msg_header_t *hdr,
         return DSM_ERR_NOT_FOUND;
     }
 
+    /* El acuse de degradacion llega como respuesta sincronica: ademas de
+     * despertar la RPC se entrega al estado de acuses para que cierre su
+     * transaccion. */
+    if (hdr->type == MSG_DOWNGRADE_ACK) {
+        dsm_msg_t ack = { .hdr = *hdr, .payload = payload };
+        msi_on_downgrade_ack(ctx, &ack);
+    }
+
     pending->status     = hdr->status;
     pending->rx_version = hdr->data_version;
+    pending->rx_tseq    = hdr->tseq;
     pending->rx_len     = hdr->payload_len;
     pending->result     = DSM_OK;
     if (hdr->payload_len > pending->rx_capacity) {
@@ -110,7 +127,12 @@ static int pending_complete(dsm_ctx_t *ctx, const msg_header_t *hdr,
     if (sem_post(&pending->sem) != 0) {
         pending->result = DSM_ERR_NET;
     }
+    bool lock_grant = (hdr->type == MSG_LOCK_GRANT);
     pthread_mutex_unlock(&ctx->net.pending_mu);
+
+    if (lock_grant) {
+        sync_send_lock_ack(ctx, hdr->src_slot, hdr->page_id, hdr->req_id);
+    }
     return DSM_OK;
 }
 
@@ -222,7 +244,7 @@ static void *listener_thread_main(void *arg)
                 pthread_rwlock_unlock(&ctx->memb.rw);
                 w.count = count;
 
-                uint8_t welcome_buf[4096];
+                uint8_t welcome_buf[DSM_WELCOME_WIRE_MAX];
                 size_t wlen = dsm_pack_welcome(&w, welcome_buf, sizeof(welcome_buf));
 
                 msg_header_t resp_hdr;
@@ -231,7 +253,13 @@ static void *listener_thread_main(void *arg)
                 resp_hdr.cluster_id    = ctx->cfg.cluster_id;
                 resp_hdr.proto_version = DSM_PROTO_VERSION;
                 resp_hdr.type          = MSG_WELCOME;
-                resp_hdr.status        = (peer_hash == ctx->cfg.raw_hash) ? DSM_ST_OK : DSM_ST_CONFIG_MISMATCH;
+                resp_hdr.status        = (peer_hash == ctx->cfg.raw_hash) ? DSM_ST_OK
+                                                                          : DSM_ST_CONFIG_MISMATCH;
+                if (wlen == 0) {
+                    /* El empaquetado no cabe ni en el peor caso: un aviso
+                     * con estado explicito en lugar de un OK sin carga. */
+                    resp_hdr.status = DSM_ST_NO_SPACE;
+                }
                 resp_hdr.payload_len   = (uint32_t)wlen;
 
                 uint8_t raw_resp[DSM_HDR_LEN];
@@ -279,12 +307,47 @@ static void *listener_thread_main(void *arg)
             wire_payload_ok(hdr.type, hdr.flags, hdr.payload_len, ctx->cfg.page_size)) {
             atomic_fetch_add_explicit(&ctx->ctr.msgs_recv, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&ctx->ctr.bytes_recv, DSM_HDR_LEN + hdr.payload_len, memory_order_relaxed);
-            if (dsm_msg_is_response(hdr.type) &&
-                pending_complete(ctx, &hdr, payload) == DSM_OK) {
+            /* Los acuses de concesion y de barrera se resuelven aqui: si se
+             * encolaran, un unico worker podria quedar bloqueado esperando su
+             * propio acuse. */
+            if ((hdr.type == MSG_LOCK_REL || hdr.type == MSG_BARRIER_GO) &&
+                (hdr.flags & DSM_FLAG_PROBE)) {
+                sync_ack_received(ctx, hdr.req_id);
                 free(payload);
                 payload = NULL;
                 fd_close_quiet(&cfd);
                 continue;
+            }
+            if (dsm_msg_is_response(hdr.type) || hdr.type == MSG_PAGE_MOVE_ACK) {
+                int complete_rc = pending_complete(ctx, &hdr, payload);
+                /* Una respuesta de pagina sin pending pertenece a una RPC ya
+                 * agotada: descartarla evita sobrescribir una copia vigente. */
+                if (complete_rc == DSM_OK ||
+                    hdr.type == MSG_PAGE_DATA || hdr.type == MSG_GRANT) {
+                    free(payload);
+                    payload = NULL;
+                    fd_close_quiet(&cfd);
+                    continue;
+                }
+                /* Los acuses de invalidacion cierran esperas de transaccion
+                 * que solo este hilo puede despertar: se resuelven aqui y
+                 * no ocupan un worker, que podria estar esperando su
+                 * propio acuse. Un WRITEBACK_ACK sin pending no tiene
+                 * efecto local y tambien se descarta aqui. */
+                if (hdr.type == MSG_INVALIDATE_ACK) {
+                    dsm_msg_t ack = { .hdr = hdr, .payload = payload };
+                    msi_on_invalidate_ack(ctx, &ack);
+                    free(payload);
+                    payload = NULL;
+                    fd_close_quiet(&cfd);
+                    continue;
+                }
+                if (hdr.type == MSG_WRITEBACK_ACK) {
+                    free(payload);
+                    payload = NULL;
+                    fd_close_quiet(&cfd);
+                    continue;
+                }
             }
             dsm_msg_t msg = { .hdr = hdr, .payload = payload };
             if (hdr.type == MSG_JOIN) {
@@ -504,6 +567,11 @@ int net_send_nack(dsm_ctx_t *ctx, uint32_t dst, uint32_t req_id, uint16_t status
     return dsm_net_send(ctx, dst, &hdr, NULL);
 }
 
+uint32_t dsm_net_next_req(dsm_ctx_t *ctx)
+{
+    return (uint32_t)atomic_fetch_add(&ctx->net.req_counter, 1) + 1u;
+}
+
 /* Ejecuta un intento completo de RPC: registra la solicitud pendiente con un
  * req_id nuevo, envia la trama y espera la respuesta hasta
  * REQUEST_TIMEOUT_MS. Devuelve DSM_ERR_TIMEOUT o DSM_ERR_NET ante fallos de
@@ -512,11 +580,12 @@ static int net_rpc_attempt(dsm_ctx_t *ctx, uint32_t dst, uint16_t type,
                            uint32_t page_id, uint32_t tseq, uint8_t access,
                            uint8_t flags, const void *tx_payload, uint32_t tx_len,
                            uint16_t *out_status, void *rx_payload,
-                           uint32_t rx_capacity, uint32_t *rx_len)
+                           uint32_t rx_capacity, uint32_t *rx_len,
+                           uint32_t req_id, uint32_t *out_tseq)
 {
     pending_req_t pending;
     memset(&pending, 0, sizeof(pending));
-    pending.req_id      = (uint32_t)atomic_fetch_add(&ctx->net.req_counter, 1) + 1u;
+    pending.req_id      = req_id ? req_id : dsm_net_next_req(ctx);
     pending.page_id     = page_id;
     pending.rx_payload  = rx_payload;
     pending.rx_capacity = rx_capacity;
@@ -529,6 +598,7 @@ static int net_rpc_attempt(dsm_ctx_t *ctx, uint32_t dst, uint16_t type,
     pthread_mutex_lock(&ctx->net.pending_mu);
     pending.next = ctx->net.pending[bucket];
     ctx->net.pending[bucket] = &pending;
+    atomic_fetch_add_explicit(&ctx->ctr.pending_count, 1, memory_order_relaxed);
     pthread_mutex_unlock(&ctx->net.pending_mu);
 
     msg_header_t hdr;
@@ -589,6 +659,7 @@ static int net_rpc_attempt(dsm_ctx_t *ctx, uint32_t dst, uint16_t type,
         pending.rx_len = 0;
     }
     *rx_len = pending.rx_len;
+    if (out_tseq) *out_tseq = pending.rx_tseq;
     if (sem_destroy(&pending.sem) != 0) {
         DSM_LOG_WARN("sem_destroy de la solicitud %u fallo", pending.req_id);
         if (result == DSM_OK) {
@@ -598,10 +669,11 @@ static int net_rpc_attempt(dsm_ctx_t *ctx, uint32_t dst, uint16_t type,
     return result;
 }
 
-int dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
-                 uint32_t tseq, uint8_t access, uint8_t flags,
-                 const void *tx_payload, uint32_t tx_len,
-                 uint16_t *out_status, void *rx_payload, uint32_t *rx_len)
+int dsm_net_rpc_ex(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
+                   uint32_t tseq, uint8_t access, uint8_t flags,
+                   const void *tx_payload, uint32_t tx_len,
+                   uint16_t *out_status, void *rx_payload, uint32_t *rx_len,
+                   uint32_t req_id, uint32_t *out_tseq)
 {
     if (!ctx || dst >= MAX_NODES || tx_len > DSM_MAX_PAYLOAD ||
         (tx_len > 0 && !tx_payload) || !rx_len) {
@@ -610,6 +682,7 @@ int dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
     if (rx_payload == NULL && *rx_len != 0) {
         return DSM_ERR_INVALID;
     }
+    if (out_tseq) *out_tseq = 0;
 
     /* Solo los fallos de transporte justifican reenviar: una respuesta con
      * estado distinto de OK es una respuesta del protocolo y llegaria igual
@@ -638,13 +711,23 @@ int dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
         *rx_len = capacity;
         rc = net_rpc_attempt(ctx, dst, type, page_id, tseq, access, flags,
                              tx_payload, tx_len, out_status, rx_payload,
-                             capacity, rx_len);
+                             capacity, rx_len, req_id, out_tseq);
         if (rc != DSM_ERR_TIMEOUT && rc != DSM_ERR_NET) {
             break;
         }
     }
 
     return rc;
+}
+
+int dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
+                uint32_t tseq, uint8_t access, uint8_t flags,
+                const void *tx_payload, uint32_t tx_len,
+                uint16_t *out_status, void *rx_payload, uint32_t *rx_len)
+{
+    return dsm_net_rpc_ex(ctx, dst, type, page_id, tseq, access, flags,
+                          tx_payload, tx_len, out_status, rx_payload, rx_len,
+                          0, NULL);
 }
 
 /* Plazo de lectura de una trama cuando el llamador no aporta configuración. */
@@ -684,13 +767,5 @@ int dsm_net_read_one(int fd, uint32_t cluster_id, dsm_msg_t *out, uint8_t **owne
     out->hdr = hdr;
     out->payload = payload;
     *owned = payload;
-    return DSM_OK;
-}
-
-int net_probe(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t *out)
-{
-    (void)ctx;
-    (void)addr;
-    (void)out;
     return DSM_OK;
 }

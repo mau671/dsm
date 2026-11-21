@@ -35,6 +35,12 @@ dsm_ctx_t *dsm_ctx_create_test(void)
         membership_init(ctx);
         net_init(ctx);
         sync_init(ctx);
+        if (dist_init(ctx) != DSM_OK) {
+            net_destroy(ctx);
+            membership_destroy(ctx);
+            free(ctx);
+            return NULL;
+        }
         pthread_mutex_init(&ctx->alloc.mu, NULL);
     }
     return ctx;
@@ -114,10 +120,8 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
     }
     sync_init(ctx);
 
-    /* 6. Inicializar memoria virtual y manejador de fallos */
-    rc = dsm_mem_init(&ctx->mem, &ctx->cfg);
+    rc = dist_init(ctx);
     if (rc != DSM_OK) {
-        DSM_LOG_ERR("Fallo al inicializar subsistema de memoria virtual: %d", rc);
         msi_destroy(ctx);
         net_destroy(ctx);
         membership_destroy(ctx);
@@ -125,10 +129,25 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
         return rc;
     }
 
+    /* 6. Inicializar memoria virtual y manejador de fallos */
+    rc = dsm_mem_init(&ctx->mem, &ctx->cfg);
+    if (rc != DSM_OK) {
+        DSM_LOG_ERR("Fallo al inicializar subsistema de memoria virtual: %d", rc);
+        dist_destroy(ctx);
+        msi_destroy(ctx);
+        net_destroy(ctx);
+        membership_destroy(ctx);
+        free(ctx);
+        return rc;
+    }
+    raid_init(ctx);
+
     rc = dsm_sig_install();
     if (rc != DSM_OK) {
         DSM_LOG_ERR("Fallo al registrar manejador de señales SIGSEGV");
+        raid_shutdown(ctx);
         dsm_mem_destroy(&ctx->mem);
+        dist_destroy(ctx);
         msi_destroy(ctx);
         net_destroy(ctx);
         membership_destroy(ctx);
@@ -140,7 +159,9 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
     rc = worker_start(ctx);
     if (rc != DSM_OK) {
         dsm_sig_restore();
+        raid_shutdown(ctx);
         dsm_mem_destroy(&ctx->mem);
+        dist_destroy(ctx);
         msi_destroy(ctx);
         net_destroy(ctx);
         membership_destroy(ctx);
@@ -152,7 +173,9 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
         atomic_store(&ctx->running, false);
         worker_stop(ctx);
         dsm_sig_restore();
+        raid_shutdown(ctx);
         dsm_mem_destroy(&ctx->mem);
+        dist_destroy(ctx);
         msi_destroy(ctx);
         net_destroy(ctx);
         membership_destroy(ctx);
@@ -171,7 +194,9 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
         dispatcher_stop(ctx);
         worker_stop(ctx);
         dsm_sig_restore();
+        raid_shutdown(ctx);
         dsm_mem_destroy(&ctx->mem);
+        dist_destroy(ctx);
         msi_destroy(ctx);
         net_stop_listener(ctx);
         net_destroy(ctx);
@@ -195,21 +220,26 @@ dsm_status_t dsm_finalize(void)
 
     DSM_LOG_INFO("Finalizando subsistema DSM en nodo %u...", ctx->memb.self_slot);
 
-    /* 1. Detener ciclo de ejecucion primero para que hb_thread pare */
+    /* 1. Unir el hilo de reconstruccion antes de cortar la red: puede estar
+     * esperando STRIPE_DATA y necesita workers y listener todavia vivos. */
+    raid_shutdown(ctx);
+
+    /* 2. Detener ciclo de ejecucion primero para que hb_thread pare */
     atomic_store(&ctx->running, false);
 
-    /* 2. Anunciar salida al cluster y detener hilo de heartbeat */
+    /* 3. Anunciar salida al cluster y detener hilo de heartbeat */
     discovery_leave(ctx);
 
-    /* 3. Detener despachadores y workers */
+    /* 4. Detener despachadores y workers */
     dispatcher_stop(ctx);
     worker_stop(ctx);
+    dist_destroy(ctx);
 
-    /* 4. Detener red */
+    /* 5. Detener red */
     net_stop_listener(ctx);
     net_destroy(ctx);
 
-    /* 5. Restaurar señales y liberar memoria */
+    /* 6. Restaurar señales y liberar memoria */
     dsm_sig_restore();
     dsm_mem_destroy(&ctx->mem);
 
@@ -531,6 +561,7 @@ dsm_status_t dsm_stats(dsm_stats_t *out)
     out->invalidations          = atomic_load_explicit(&ctx->ctr.invalidations, memory_order_relaxed);
     out->fault_latency_us_total = atomic_load_explicit(&ctx->ctr.fault_latency_us_total, memory_order_relaxed);
     out->faults_serviced        = atomic_load_explicit(&ctx->ctr.faults_serviced, memory_order_relaxed);
+    out->tseq_discarded         = atomic_load_explicit(&ctx->ctr.tseq_discarded, memory_order_relaxed);
     out->fault_latency_us_avg   = (out->faults_serviced == 0)
                                       ? 0
                                       : out->fault_latency_us_total / out->faults_serviced;
@@ -538,6 +569,13 @@ dsm_status_t dsm_stats(dsm_stats_t *out)
     out->wait_pool_used         = atomic_load_explicit(&ctx->ctr.wait_pool_used, memory_order_relaxed);
     out->slots_enqueued         = atomic_load_explicit(&ctx->ctr.slots_enqueued, memory_order_relaxed);
     out->slots_woken            = atomic_load_explicit(&ctx->ctr.slots_woken, memory_order_relaxed);
+    out->parity_deltas          = atomic_load_explicit(&ctx->ctr.parity_deltas, memory_order_relaxed);
+    out->parity_bytes           = atomic_load_explicit(&ctx->ctr.parity_bytes, memory_order_relaxed);
+    out->stripe_rebuilds        = atomic_load_explicit(&ctx->ctr.stripe_rebuilds, memory_order_relaxed);
+    out->parity_latency_us      = atomic_load_explicit(&ctx->ctr.parity_latency_us, memory_order_relaxed);
+    out->dist_tasks_run         = atomic_load_explicit(&ctx->ctr.dist_tasks_run, memory_order_relaxed);
+    out->dist_tasks_failed      = atomic_load_explicit(&ctx->ctr.dist_tasks_failed, memory_order_relaxed);
+    out->hb_missed              = atomic_load_explicit(&ctx->ctr.hb_missed, memory_order_relaxed);
 
     msi_counters(ctx, &out->pages_m, &out->pages_s, &out->pages_i);
     return DSM_OK;
