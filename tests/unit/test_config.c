@@ -160,9 +160,9 @@ static int test_load_repo_config(void)
     static uint8_t buf[1 << 20];
     size_t n = fread(buf, 1, sizeof(buf), f);
     fclose(f);
-    CHECK(n == 1852);
+    CHECK(n == 2333);
     CHECK(cfg.raw_hash == dsm_crc32(0, buf, n));
-    CHECK(cfg.raw_hash == 0x6B51CA15u);
+    CHECK(cfg.raw_hash == 0x9E8EA3ADu);
 
     /* Dos lecturas identicas del mismo archivo producen el mismo hash exacto.
      * Esto es la base del handshake HELLO: si dos nodos leen el mismo byte
@@ -704,8 +704,11 @@ static int test_cross_validation_rules(void)
     EXPECT_OK("MAX_RUNTIME_NODES = 1\n");
     EXPECT_OK("MAX_RUNTIME_NODES = 256\n");
 
-    /* RAID5 no soportado */
-    EXPECT_BAD("cv_raid5.conf", "REDUNDANCY = RAID5\n");
+    /* RAID5 con K dentro de [2, 8] */
+    EXPECT_OK("REDUNDANCY = RAID5\n");
+    EXPECT_OK("REDUNDANCY = RAID5\nRAID_K = 8\n");
+    EXPECT_BAD("cv_raid5_k1.conf", "REDUNDANCY = RAID5\nRAID_K = 1\n");
+    EXPECT_BAD("cv_raid5_k9.conf", "REDUNDANCY = RAID5\nRAID_K = 9\n");
     EXPECT_OK("REDUNDANCY = NONE\n");
     EXPECT_OK("REDUNDANCY = none\n");       /* case-insensitive */
 
@@ -781,7 +784,7 @@ static int test_reload_and_null_safety(void)
     cfg.raw_hash = 0xDEADBEEF;
     REQUIRE(config_load(&cfg, "dsm.conf") == DSM_OK);
     CHECK(cfg.peer_host_count == 5);
-    CHECK(cfg.raw_hash == 0x6B51CA15u);
+    CHECK(cfg.raw_hash == 0x9E8EA3ADu);
     CHECK(cfg.page_size == 4096);
 
     /* config_free es idempotente y tolera NULL */
@@ -810,6 +813,13 @@ static int test_reload_and_null_safety(void)
     CHECK(config_validate(&bad) == DSM_ERR_CONFIG);
     bad = cfg;
     bad.redundancy_raid5 = true;
+    CHECK(config_validate(&bad) == DSM_OK);
+    bad = cfg;
+    bad.raid_k = 1;
+    CHECK(config_validate(&bad) == DSM_ERR_CONFIG);
+    bad = cfg;
+    bad.redundancy_raid5 = true;
+    bad.raid_k = 9;
     CHECK(config_validate(&bad) == DSM_ERR_CONFIG);
 
     return 0;
@@ -1214,7 +1224,11 @@ static int test_rig_validacion_directa(void)
     RIG_MUT(reconnect_min_ms, base.reconnect_max_ms + 1u);
     RIG_MUT_OK(reconnect_min_ms, base.reconnect_max_ms);
     RIG_MUT(max_runtime_nodes, (uint32_t)MAX_NODES + 1u);
-    RIG_MUT(redundancy_raid5, true);
+    RIG_MUT_OK(redundancy_raid5, true);
+    RIG_MUT(raid_k, 1u);
+    RIG_MUT(raid_k, 9u);
+    RIG_MUT_OK(raid_k, 2u);
+    RIG_MUT_OK(raid_k, 8u);
 
     /* Los defaults del archivo canonico son validos y no se mutan al validar. */
     dsm_config_t copia = base;

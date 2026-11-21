@@ -38,6 +38,10 @@
  * queda en la cola del custodio y dsm_lock devuelve DSM_ERR_TIMEOUT dentro del
  * plazo LOCK_TIMEOUT_MS configurado.
  *
+ * La prueba de grant duplicado inyecta en B una concesion repetida con el
+ * req_id ya concedido: B solo debe acusar, sin devolver el cerrojo. A comprueba
+ * que sigue en manos de B porque su siguiente dsm_lock agota el plazo.
+ *
  * Los identificadores de cerrojo se eligen despues de que la membresia tiene
  * dos nodos, buscando el primero cuyo home sea la ranura 0 o la ranura 1. El
  * padre envia el identificador elegido al hijo por el pipe de comandos, de modo
@@ -67,11 +71,12 @@
 
 /* Comandos del padre al hijo */
 enum {
-    CMD_START   = 'S',
-    CMD_LOCK    = 'L',
-    CMD_UNLOCK  = 'U',
-    CMD_BARRIER = 'B',
-    CMD_QUIT    = 'Q'
+    CMD_START     = 'S',
+    CMD_LOCK      = 'L',
+    CMD_UNLOCK    = 'U',
+    CMD_BARRIER   = 'B',
+    CMD_DUP_GRANT = 'D',
+    CMD_QUIT      = 'Q'
 };
 
 /* Codigos de resultado que el hijo publica por el pipe de estado */
@@ -310,6 +315,42 @@ static int wait_node_count(uint32_t expected, int timeout_ms, uint32_t *out)
     return 0;
 }
 
+/* Inyecta en el propio nodo un LOCK_GRANT duplicado con el req_id de la
+ * propiedad ya adquirida, como si el custodio lo reenviara al perderse el
+ * acuse. Devuelve 0 si este nodo no tiene registrada esa propiedad. */
+static int inject_duplicate_grant(uint32_t lock_id, uint32_t custodian)
+{
+    dsm_ctx_t *ctx = dsm_ctx_get();
+    if (!ctx) return 0;
+
+    pthread_mutex_lock(&ctx->sync.mu);
+    uint32_t req = 0;
+    for (int i = 0; i < DSM_MAX_HELD; i++) {
+        dsm_sync_held_t *h = &ctx->sync.held[i];
+        if (h->active && h->lock_id == lock_id) {
+            req = h->req_id;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&ctx->sync.mu);
+    if (req == 0) return 0;
+
+    dsm_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.hdr.magic         = DSM_MAGIC;
+    msg.hdr.cluster_id    = ctx->cfg.cluster_id;
+    msg.hdr.proto_version = DSM_PROTO_VERSION;
+    msg.hdr.type          = MSG_LOCK_GRANT;
+    msg.hdr.src_slot      = custodian;
+    msg.hdr.dst_slot      = ctx->memb.self_slot;
+    msg.hdr.req_id        = req;
+    msg.hdr.page_id       = lock_id;
+    msg.hdr.epoch         = ctx->memb.epoch;
+
+    sync_on_lock_grant(ctx, &msg);
+    return 1;
+}
+
 /* Cuerpo del nodo B. Nunca retorna. */
 static void run_child(const char *conf_b, int status_fd, int cmd_fd)
 {
@@ -365,6 +406,16 @@ static void run_child(const char *conf_b, int status_fd, int cmd_fd)
         }
         case CMD_UNLOCK: {
             int rc = (int)dsm_unlock(cmd.arg1);
+            if (!child_report(status_fd, CH_OK, rc, 0)) {
+                _exit(CH_COMMAND_FAIL);
+            }
+            break;
+        }
+        case CMD_DUP_GRANT: {
+            int ok = inject_duplicate_grant(cmd.arg1, cmd.arg2);
+            /* Da tiempo al custodio a procesar cualquier LOCK_REL emitido. */
+            usleep(200000);
+            int rc = ok ? DSM_OK : DSM_ERR_INVALID;
             if (!child_report(status_fd, CH_OK, rc, 0)) {
                 _exit(CH_COMMAND_FAIL);
             }
@@ -692,6 +743,64 @@ static int scenario_lock_remote(sync_link_t *l, uint32_t lock_a, uint32_t lock_b
     return 1;
 }
 
+/* --- Grant duplicado: la concesion repetida no libera el cerrojo --- */
+
+/*
+ * B adquiere un cerrojo custodiado por A. Se inyecta en B un LOCK_GRANT
+ * duplicado con el mismo req_id, como si el acuse de la concesion se hubiera
+ * perdido y A la reenviara. B debe limitarse a acusar: si devolviera el
+ * cerrojo, A lo daria por libre aunque B siga creyendo que lo posee.
+ */
+static int scenario_duplicate_grant(sync_link_t *l, uint32_t lock_id)
+{
+    test_sts_t st;
+
+    /* A toma el cerrojo y B queda esperando en la cola del custodio. */
+    if (dsm_lock(lock_id) != DSM_OK) {
+        printf("   A no pudo tomar el cerrojo %u\n", lock_id);
+        return 0;
+    }
+    if (!link_send(l, CMD_LOCK, lock_id, 0)) {
+        printf("   no se pudo ordenar el cerrojo a B\n");
+        return 0;
+    }
+    if (!link_quiet(l, "espera del cerrojo en B", BLOCKED_WINDOW_MS)) return 0;
+    if (dsm_unlock(lock_id) != DSM_OK) {
+        printf("   A no pudo liberar el cerrojo %u\n", lock_id);
+        return 0;
+    }
+    if (!link_recv(l, "concesion del cerrojo a B", &st)) return 0;
+    if (st.result != DSM_OK) {
+        printf("   B no obtuvo el cerrojo %u: %d\n", lock_id, st.result);
+        return 0;
+    }
+
+    /* Reenvio del grant con el req_id ya concedido. */
+    if (!link_step(l, CMD_DUP_GRANT, lock_id, 0, "grant duplicado en B", &st) ||
+        st.result != DSM_OK) {
+        printf("   B no pudo inyectar el grant duplicado\n");
+        return 0;
+    }
+
+    /* El custodio debe seguir considerando a B dueno: una peticion nueva desde
+     * A agota su plazo en la cola. Si el grant duplicado hubiera liberado el
+     * cerrojo, esta llamada habria tenido exito. */
+    int rc = (int)dsm_lock(lock_id);
+    if (rc != DSM_ERR_TIMEOUT) {
+        printf("   el grant duplicado libero el cerrojo %u en el custodio: %d\n",
+               lock_id, rc);
+        if (rc == DSM_OK) (void)dsm_unlock(lock_id);
+        return 0;
+    }
+
+    if (!link_step(l, CMD_UNLOCK, lock_id, 0, "liberacion en B", &st) ||
+        st.result != DSM_OK) {
+        printf("   B no pudo liberar el cerrojo %u\n", lock_id);
+        return 0;
+    }
+    return 1;
+}
+
 /* --- Escenario (c): barrera de dos participantes --- */
 
 /*
@@ -747,7 +856,7 @@ static int run_scenario(uint16_t port_min, uint16_t port_max)
     int conf_a_fd = -1, conf_b_fd = -1, log_b_fd = -1;
     int result = SCENARIO_FAIL;
     int ok = 1;
-    uint32_t lock_a = 0, lock_b = 0;
+    uint32_t lock_a = 0, lock_b = 0, lock_dup = 0;
 
     link.child = -1;
     link.cmd_fd = -1;
@@ -761,13 +870,15 @@ static int run_scenario(uint16_t port_min, uint16_t port_max)
     /* La membresia ya tiene dos nodos en los dos procesos: el anillo calcula el
      * mismo custodio para cada identificador. */
     if (!find_lock_with_home(1, 0, &lock_a) ||
-        !find_lock_with_home(lock_a + 1, 1, &lock_b)) {
+        !find_lock_with_home(lock_a + 1, 1, &lock_b) ||
+        !find_lock_with_home(lock_a + 1000, 0, &lock_dup)) {
         printf("   no se encontraron cerrojos con custodio en A y en B\n");
         ok = 0;
         goto cleanup;
     }
 
     if (!scenario_lock_remote(&link, lock_a, lock_b)) ok = 0;
+    if (ok && !scenario_duplicate_grant(&link, lock_dup)) ok = 0;
     if (ok && !scenario_barrier(&link, lock_a + 7)) ok = 0;
 
     if (ok) {

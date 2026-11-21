@@ -1434,11 +1434,38 @@ static int test_rig_payload_ok_por_tipo(void)
     CHECK(wire_payload_ok(MSG_BARRIER_GO, 0, 0, ps) == false);
     CHECK(wire_payload_ok(MSG_BARRIER_GO, 0, 5, ps) == false);
 
-    /* Tipos solo acotados por DSM_MAX_PAYLOAD (carga variable). */
+    /* PAGE_MOVE / STRIPE_DATA: exactamente page_size. */
+    CHECK(wire_payload_ok(MSG_PAGE_MOVE, 0, ps, ps) == true);
+    CHECK(wire_payload_ok(MSG_PAGE_MOVE, 0, max, ps) == false);
+    CHECK(wire_payload_ok(MSG_STRIPE_DATA, 0, ps, ps) == true);
+    CHECK(wire_payload_ok(MSG_STRIPE_DATA, 0, max, ps) == false);
+
+    /* PAGE_MOVE_ACK: solo 0. */
+    CHECK(wire_payload_ok(MSG_PAGE_MOVE_ACK, 0, 0, ps) == true);
+    CHECK(wire_payload_ok(MSG_PAGE_MOVE_ACK, 0, DSM_WIRE_WORD_LEN, ps) == false);
+
+    /* PARITY_DELTA: cabecera de 4 bytes mas page_size. */
+    CHECK(wire_payload_ok(MSG_PARITY_DELTA, 0, DSM_PARITY_DELTA_WIRE_LEN(ps), ps) == true);
+    CHECK(wire_payload_ok(MSG_PARITY_DELTA, 0, ps, ps) == false);
+
+    /* ACK/estado de una palabra: exactamente 4 bytes. */
+    CHECK(wire_payload_ok(MSG_PARITY_ACK, 0, DSM_WIRE_WORD_LEN, ps) == true);
+    CHECK(wire_payload_ok(MSG_STRIPE_PUT_ACK, 0, DSM_WIRE_WORD_LEN, ps) == true);
+    CHECK(wire_payload_ok(MSG_STATE_REPORT, 0, DSM_WIRE_WORD_LEN, ps) == true);
+    CHECK(wire_payload_ok(MSG_DIR_DONE, 0, DSM_WIRE_WORD_LEN, ps) == true);
+    CHECK(wire_payload_ok(MSG_PARITY_ACK, 0, 0, ps) == false);
+
+    /* STRIPE_PUT: layout fijo de 76 bytes. */
+    CHECK(wire_payload_ok(MSG_STRIPE_PUT, 0, DSM_STRIPE_WIRE_LEN, ps) == true);
+    CHECK(wire_payload_ok(MSG_STRIPE_PUT, 0, 0, ps) == false);
+
+    /* STRIPE_READ: layout fijo de 8 bytes. */
+    CHECK(wire_payload_ok(MSG_STRIPE_READ, 0, DSM_STRIPE_READ_WIRE_LEN, ps) == true);
+    CHECK(wire_payload_ok(MSG_STRIPE_READ, 0, 0, ps) == false);
+
+    /* QUERY: sin restriccion propia, solo acotados por DSM_MAX_PAYLOAD. */
     static const uint16_t variables[] = {
-        MSG_PAGE_MOVE, MSG_PAGE_MOVE_ACK, MSG_PARITY_DELTA, MSG_PARITY_ACK,
-        MSG_STRIPE_PUT, MSG_STRIPE_PUT_ACK, MSG_STRIPE_READ, MSG_STRIPE_DATA,
-        MSG_STATE_REPORT, MSG_DIR_DONE, MSG_QUERY_REQ, MSG_QUERY_RESP
+        MSG_QUERY_REQ, MSG_QUERY_RESP
     };
     for (size_t i = 0; i < sizeof(variables) / sizeof(variables[0]); i++) {
         CHECK(wire_payload_ok(variables[i], 0, 0, ps) == true);
