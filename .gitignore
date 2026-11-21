@@ -13,3 +13,7 @@ docs/Entregable02/*.tex
 Instrucciones.md
 .agents/
 skills-lock.json
+.opencode/
+TODO.md
+SO-P1-E3-*.pdf
+docs/Entregable03/*.pdf

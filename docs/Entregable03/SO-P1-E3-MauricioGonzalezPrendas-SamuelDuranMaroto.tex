@@ -1,0 +1,755 @@
+\documentclass[11pt,spanish]{article}
+
+% =========================================================
+% PLANTILLA BASE PARA TAREAS ACADÉMICAS / INFORMES TÉCNICOS
+% =========================================================
+
+% --- Idioma y codificación para Tectonic / XeLaTeX ---
+\usepackage[spanish,es-tabla,es-noquoting]{babel}
+\usepackage{fontspec}
+
+% --- Márgenes / papel ---
+\usepackage{geometry}
+\geometry{a4paper, margin=2.5cm}
+
+% --- Matemáticas y símbolos ---
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+% --- Tablas, enlaces y elementos visuales ---
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{xltabular}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,shapes.geometric,arrows.meta,calc,fit,backgrounds,babel}
+\usepackage{enumitem}
+\usepackage{ragged2e}
+\usepackage{caption}
+\captionsetup{skip=6pt}
+\captionsetup[table]{position=top}
+\captionsetup[figure]{position=bottom}
+\usepackage{xurl}
+\usepackage[colorlinks=true, linkcolor=blue!70!black, urlcolor=blue!70!black, citecolor=blue!70!black, hypertexnames=false]{hyperref}
+
+% --- Configuración de párrafo en bloque ---
+\makeatletter
+\renewcommand\paragraph{\@startsection{paragraph}{4}{\z@}%
+  {2.2ex \@plus1ex \@minus.2ex}%
+  {0.8ex}%
+  {\normalfont\normalsize\bfseries}}
+\makeatother
+
+% --- Listados de código con formato elegante ---
+\usepackage{listings}
+
+\definecolor{codebg}{rgb}{0.97,0.97,0.98}
+\definecolor{codeframe}{rgb}{0.85,0.85,0.88}
+\definecolor{commentgreen}{rgb}{0.13,0.54,0.13}
+\definecolor{keywordblue}{rgb}{0.0,0.2,0.7}
+\definecolor{stringpurple}{rgb}{0.6,0.1,0.4}
+
+% --- Colores para esquemas y diagramas TikZ ---
+\definecolor{softblue}{rgb}{0.88, 0.93, 1.0}
+\definecolor{softgreen}{rgb}{0.88, 0.96, 0.88}
+\definecolor{softorange}{rgb}{1.0, 0.92, 0.82}
+\definecolor{softpurple}{rgb}{0.93, 0.88, 0.98}
+\definecolor{softteal}{rgb}{0.85, 0.95, 0.95}
+\definecolor{softyellow}{rgb}{1.0, 0.95, 0.80}
+\definecolor{borderblue}{rgb}{0.2, 0.4, 0.7}
+\definecolor{bordergreen}{rgb}{0.2, 0.6, 0.2}
+\definecolor{borderorange}{rgb}{0.8, 0.4, 0.1}
+
+\lstdefinestyle{customcode}{
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\scriptsize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=none,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=4,
+    frame=single,
+    rulecolor=\color{codeframe},
+    commentstyle=\color{commentgreen}\itshape,
+    keywordstyle=\color{keywordblue}\bfseries,
+    stringstyle=\color{stringpurple},
+    xleftmargin=0.5em,
+    xrightmargin=0.5em
+}
+
+\lstdefinestyle{customcodenum}{
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\scriptsize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=left,
+    numbersep=6pt,
+    numberstyle=\tiny\color{gray},
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=4,
+    frame=single,
+    rulecolor=\color{codeframe},
+    commentstyle=\color{commentgreen}\itshape,
+    keywordstyle=\color{keywordblue}\bfseries,
+    stringstyle=\color{stringpurple},
+    xleftmargin=1.5em,
+    xrightmargin=0.5em
+}
+
+\lstset{style=customcode}
+
+% --- Encabezado y pie de página ---
+\usepackage[myheadings]{fancyhdr}
+\usepackage{lastpage}
+\setlength{\headheight}{30pt}
+\setlength{\footskip}{30pt}
+
+% --- Interlineado ---
+\linespread{1.18}
+\sloppy
+\setlength{\emergencystretch}{2em}
+
+% =========================================================
+% DATOS DEL DOCUMENTO
+% =========================================================
+\newcommand{\Institucion}{Instituto Tecnológico de Costa Rica}
+\newcommand{\Campus}{Escuela de Ingeniería en Computación}
+\newcommand{\DocumentoTitulo}{Proyecto01}
+\newcommand{\DocumentoSubtitulo}{Sistema de Memoria Distribuida}
+\newcommand{\DocumentoAvance}{Entregable 3: Prototipo 2 y arquitectura actualizada}
+\newcommand{\Curso}{IC-6600 Principios de Sistemas Operativos}
+\newcommand{\Profesor}{Esteban Arias Méndez}
+\newcommand{\FechaDocumento}{20 de noviembre de 2026}
+\newcommand{\PeriodoAcademico}{II Semestre}
+\newcommand{\AnioDocumento}{2026}
+
+% Autores con nombre a la izquierda y carné a la derecha
+\newcommand{\AutoresPortada}{%
+\begin{minipage}{0.85\textwidth}
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lr@{}}
+Mauricio González Prendas & 2024143009 \\
+Samuel Durán Maroto & 2023072368 \\
+\end{tabular*}
+\end{minipage}%
+}
+
+% Datos que aparecen en el encabezado
+\newcommand{\DocHeaderLeft}{\Curso}
+\newcommand{\DocHeaderRight}{\DocumentoTitulo\ -- Entregable 3}
+\newcommand{\DocFooterRight}{Página~\thepage\ de~\pageref{LastPage}}
+
+% Metadatos PDF
+\title{\DocumentoTitulo: \DocumentoSubtitulo}
+\author{Mauricio González Prendas, Samuel Durán Maroto}
+\date{\FechaDocumento}
+
+% =========================================================
+% CONFIGURACIÓN DE TABLAS Y UTILIDADES
+% =========================================================
+\newcolumntype{Y}{>{\RaggedRight\arraybackslash}X}
+\newcolumntype{P}[1]{>{\RaggedRight\arraybackslash}p{#1}}
+\renewcommand{\arraystretch}{1.22}
+\setlength{\LTpre}{0.5em}
+\setlength{\LTpost}{0.5em}
+
+% =========================================================
+% ENCABEZADO Y PIE
+% =========================================================
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+\fancyfoot[C]{\thepage}
+
+\fancypagestyle{plain}{%
+    \fancyhf{}%
+    \renewcommand{\headrulewidth}{0pt}%
+    \renewcommand{\footrulewidth}{0pt}%
+    \fancyfoot[C]{\thepage}%
+}
+\fancypagestyle{widefancy}{%
+    \fancyhf{}%
+    \renewcommand{\headrulewidth}{0pt}%
+    \renewcommand{\footrulewidth}{0pt}%
+    \fancyfoot[C]{\thepage}%
+}
+
+% =========================================================
+% PORTADA
+% =========================================================
+\newcommand{\MakeCover}{%
+\begin{titlepage}
+\thispagestyle{empty}
+\centering
+
+\includegraphics[width=0.22\linewidth]{../Entregable01/imgs/logo.png}
+\vspace{0.6cm}
+
+{\bfseries \huge \Institucion \par}
+\vspace{0.25cm}
+{\LARGE \Campus \par}
+
+\vfill
+
+{\huge \bfseries Sistema de memoria distribuida \par}
+
+\vfill
+
+{\bfseries \LARGE Profesor: \par}
+\vspace{0.2cm}
+{\Large \Profesor \par}
+
+\vfill
+
+{\bfseries \LARGE Estudiantes: \par}
+\vspace{0.3cm}
+{\Large \AutoresPortada \par}
+
+\vfill
+
+{\bfseries\LARGE Fecha: \par}
+\vspace{0.2cm}
+{\Large \FechaDocumento \par}
+
+\vfill
+
+{\LARGE \PeriodoAcademico \par}
+{\LARGE \AnioDocumento \par}
+
+\end{titlepage}%
+}
+
+% =========================================================
+% DOCUMENTO
+% =========================================================
+\begin{document}
+\hypersetup{pageanchor=false}
+
+% =========================
+% Portada
+% =========================
+\MakeCover
+
+\newpage
+\hypersetup{pageanchor=true}
+\pagenumbering{roman}
+{\small\tableofcontents}
+\newpage
+\pagenumbering{arabic}
+
+% =========================================================
+\section{Alcance del Prototipo 2}\label{sec:alcance}
+% =========================================================
+
+El Prototipo 2 conserva la organización del Prototipo 1, con la misma vista proyectada sobre \texttt{memfd}, el mismo directorio MSI en el nodo custodio y el mismo anillo de dispersión consistente, y agrega los mecanismos que faltaban para que la coherencia sobreviva a respuestas repetidas, a transacciones que invalidan varias copias, a la caída de un custodio y a la pérdida de un nodo con datos. También incorpora dos servicios que no existían en la entrega anterior: la ejecución distribuida de particiones de trabajo y la generación de consultas globales y reportes HTML.
+
+La afirmación anterior conviene precisarla porque el árbol de trabajo contiene piezas con distinto grado de madurez. La comparación de secuencias, el conteo de acuses, la recuperación de custodia, la paridad RAID5, la serialización por página y los reportes están implementados y compilan en los cuatro perfiles. La ejecución distribuida tiene API, mensajes y ejecución local comprobada, pero todavía no tiene una aplicación que la use entre dos procesos ni una demostración de extremo a extremo con dos nodos. Las limitaciones se detallan en la sección~\ref{sec:pendientes} y no se ocultan en el resto del documento.
+
+\subsection{Implementado}
+
+\begin{itemize}[leftmargin=1.5em, itemsep=0.3em]
+    \item \textbf{Secuencias de transacción.} \texttt{dir\_tseq\_next}, \texttt{tseq\_accept} y \texttt{msi\_tseq\_stale} comparan el \texttt{tseq} de cada respuesta con el último aplicado por página; una respuesta repetida o anterior se descarta y se contabiliza en \texttt{tseq\_discarded}. La compuerta cubre \texttt{PAGE\_DATA}, \texttt{GRANT} y el contenido de \texttt{DOWNGRADE\_ACK}, y la capa de red la consulta antes de despertar una RPC.
+    \item \textbf{Acuses múltiples.} \texttt{msi\_ack\_wait\_t} mantiene un mapa de bits por transacción, con el conjunto esperado y el conjunto pendiente, de modo que \texttt{invalidate\_remote\_copies} solo concede escritura cuando llegó el acuse de cada destinatario. Los duplicados y los remitentes ajenos al conjunto no alteran la cuenta.
+    \item \textbf{Recuperación de custodia.} \texttt{msi\_on\_node\_down} recalcula el custodio con el anillo ya reconstruido, busca una copia en la vista local, en el marco de respaldo o en el copyset, la transfiere con \texttt{PAGE\_MOVE} y actualiza el directorio con una versión nueva. Si no encuentra una copia válida, deja la página inválida y no publica una versión antigua como si fuera vigente.
+    \item \textbf{RAID5.} Franjas de $K$ páginas de datos y una de paridad, $P = D_1 \oplus \dots \oplus D_K$, con \texttt{parity\_slot} distinto de los $K$ custodios de datos, delta de paridad en \texttt{PARITY\_DELTA}, acuse en \texttt{PARITY\_ACK}, recolección con \texttt{STRIPE\_READ} y \texttt{STRIPE\_DATA}, instalación de una franja nueva con \texttt{STRIPE\_PUT} y reconstrucción por XOR en un hilo propio.
+    \item \textbf{Serialización por página.} La bandera \texttt{busy} del directorio reserva la página mientras una transacción la modifica; una segunda solicitud recibe \texttt{NACK} con estado \texttt{BUSY} en lugar de observar un estado intermedio. La degradación a \texttt{PROT\_READ} ocurre antes de copiar el contenido que se entrega.
+    \item \textbf{Recuperación de dueño fantasma.} Si el directorio declara \texttt{MODIFIED} con un dueño que ya no conserva la página pero sigue vivo, el custodio recupera el contenido del marco de respaldo; si el dueño responde \texttt{BAD\_STATE}, también recurre al respaldo y lo retira del copyset.
+    \item \textbf{Respuestas huérfanas.} El listener descarta \texttt{PAGE\_DATA} y \texttt{GRANT} que no encuentran una solicitud pendiente, y \texttt{page\_accept\_pending} impide aplicar una respuesta a una página que ya salió de un estado pendiente.
+    \item \textbf{Cerrojos y barreras.} \texttt{sync\_on\_node\_down} recalcula el custodio al cambiar la membresía. \texttt{LOCK\_GRANT} y \texttt{BARRIER\_GO} se confirman con un acuse y se retransmiten hasta \texttt{REQUEST\_RETRIES} veces dentro de \texttt{LOCK\_TIMEOUT\_MS}. La barrera compara el umbral anunciado por cada participante y la concesión duplicada se reconoce por \texttt{req\_id}.
+    \item \textbf{Ejecución distribuida.} \texttt{dsm\_dist\_register}, \texttt{dsm\_dist\_launch}, \texttt{dsm\_dist\_collect} y \texttt{dsm\_dist\_verify}, con los mensajes \texttt{DIST\_RUN} y \texttt{DIST\_DONE}. El coordinador reparte las particiones por turno entre los trabajadores, ejecuta localmente las que le corresponden, recoge los resultados y verifica el CRC32 agregado.
+    \item \textbf{Consultas globales y HTML.} \texttt{dsm\_pages\_global} recorre las tablas de páginas de todos los nodos y arma la tabla con propietario, orden, copyset y franja. \texttt{dsm\_html\_report} escribe un archivo por nodo y un archivo global en \texttt{OUTPUT\_DIR}.
+    \item \textbf{Configuración y verificación.} \texttt{RAID\_K}, \texttt{CHUNK\_PAGES}, \texttt{WAIT\_POOL\_ENTRIES}, \texttt{OUTPUT\_DIR} y \texttt{DIST\_TIMEOUT\_MS} tienen lector real. Las comprobaciones automáticas de la biblioteca pasan completas en el perfil ASan+UBSan.
+\end{itemize}
+
+\subsection{Pendiente y límites de la entrega}
+
+Esa lista tiene grados de evidencia distintos. La ejecución distribuida y los reportes HTML están implementados, pero probados con un solo nodo, y la evidencia de ejecución en varios nodos que el enunciado del proyecto pide todavía no existe. Los cerrojos y las barreras están implementados de forma parcial: la migración reinicia la cola de espera y el umbral remoto no devuelve error al par que anuncia un valor distinto. Lo ausente no aparece en la lista: el asignador global, con \texttt{dsm\_alloc} todavía local al nodo; los metadatos por proceso, sin PID ni orden de páginas por proceso; y la verificación sobre máquinas físicas, porque toda la evidencia de ejecución es localhost.
+
+\subsection{Verificación}
+
+La compilación y la verificación funcional se describen en la sección~\ref{sec:pruebas}. La corrida completa terminó sin fallos con la biblioteca instrumentada de ASan+UBSan. La ejecución de extremo a extremo con dos procesos se corre aparte y se comenta en esa misma sección.
+
+% =========================================================
+\section{Cambios respecto al Prototipo 1}\label{sec:cambios}
+% =========================================================
+
+El Prototipo 1 demostró el flujo MSI de una página entre dos nodos, pero lo hizo con un directorio que no serializaba transacciones, una secuencia que se enviaba sin compararse y esperas que dependían de una sola respuesta por RPC. El Prototipo 2 no cambia el modelo de coherencia; cambia las condiciones bajo las cuales ese modelo se considera válido. Esta sección explica por qué cada cambio era necesario y qué cuesta.
+
+\subsection{De la transacción implícita a la página ocupada}
+
+En el Prototipo 1, dos workers podían atender dos \texttt{PAGE\_REQUEST} sobre la misma página y ambos leer el mismo estado del directorio antes de que cualquiera lo modificara. El primero podía conceder \texttt{M} al solicitante A y el segundo invalidar la copia de A para conceder \texttt{M} a B, con lo que A quedaba con un permiso que el directorio ya no reconocía. La aplicación de demostración no lanzaba dos hilos sobre la misma página, así que el defecto no aparecía.
+
+El Prototipo 2 agrega \texttt{busy} a \texttt{dir\_entry\_t}. \texttt{home\_local\_fault} y \texttt{msi\_home\_handle\_request} reservan la página bajo \texttt{dir\_mu} antes de leer el estado y liberan la bandera en la salida, incluso en los caminos de error. Una segunda solicitud no espera: recibe \texttt{DSM\_ST\_BUSY} y el solicitante reintenta. Es una serialización por rechazo, no una cola, y esa decisión mantiene el código pequeño a costa de no garantizar un orden de llegada.
+
+\subsection{De una secuencia decorativa a una compuerta}
+
+El campo \texttt{tseq} viajaba en la cabecera desde el Prototipo 1, pero \texttt{page\_local\_t.tseq\_seen} solo se escribía. Una respuesta duplicada, una respuesta de una RPC que había vencido o una respuesta reordenada podía instalarse después de una versión más nueva y dejar la página con contenido anterior. El Prototipo 2 centraliza la decisión en \texttt{tseq\_accept}: si el número recibido no supera el último aplicado, la respuesta se descarta y el contador \texttt{tseq\_discarded} se incrementa. La comparación ocurre antes de instalar contenido o permisos, de modo que un descarte no deja efectos parciales.
+
+La misma compuerta se consulta en \texttt{pending\_complete} a través de \texttt{msi\_tseq\_stale}. Si la respuesta es vieja, el listener no despierta la RPC; el hilo que esperaba sigue su curso y la trama se descarta en el camino de la página. Esa doble comprobación evita que una respuesta tardía active un hilo que ya había agotado su plazo y que podría confundir el resultado de otra solicitud.
+
+\subsection{De un acuse por RPC a un mapa de acuses}
+
+Una RPC correlacionada por \texttt{req\_id} cubre exactamente una respuesta. Cuando el custodio necesita invalidar dos o más copias antes de conceder escritura, no alcanza con esperar la respuesta de la última invalidación: hace falta saber que todas llegaron y que ninguna falló. El Prototipo 2 introduce \texttt{msi\_ack\_wait\_t}, con \texttt{expected}, \texttt{received}, un mapa \texttt{ok\_mask} y un semáforo. \texttt{invalidate\_remote\_copies} registra la transacción, envía un \texttt{INVALIDATE} a cada miembro del copyset distinto del solicitante y espera a que el mapa quede vacío. Un acuse duplicado encuentra su bit ya limpio y no cuenta; un acuse de un nodo que no pertenece al conjunto tampoco.
+
+\subsection{De la caída sin reasignación a la recuperación de custodia}
+
+En el Prototipo 1, \texttt{NODE\_DOWN} retiraba la ranura de la máscara de presencia y el anillo se reconstruía, pero nadie reasignaba el contenido de las páginas cuyo custodio había desaparecido. El nuevo custodio no tenía la página y el acceso fallaba o se servía desde una copia incompleta. El Prototipo 2 recorre las páginas cuyo último custodio conocido es el nodo caído, busca una copia válida y la transfiere al nuevo custodio con \texttt{PAGE\_MOVE}. La operación se apoya en \texttt{home\_map}, que conserva el último custodio calculado por página; sin ese registro no se podría distinguir un nodo que perdió la página de uno que nunca la custodió.
+
+\subsection{De la concesión única al acuse con retransmisión}
+
+\texttt{LOCK\_GRANT} y \texttt{BARRIER\_GO} se enviaban una sola vez. Si la trama se perdía, el solicitante agotaba \texttt{LOCK\_TIMEOUT\_MS} aunque el custodio ya le hubiera concedido el recurso, y el custodio podía quedar con una concesión que nadie usaba. El Prototipo 2 agrega un acuse: la concesión se reenvía hasta \texttt{REQUEST\_RETRIES} veces y el acuse viaja como \texttt{LOCK\_REL} con la bandera \texttt{PROBE} para los cerrojos y como \texttt{BARRIER\_GO} con la misma bandera para las barreras. El listener atiende esos acuses antes de encolarlos, porque si dependieran de un worker, un worker ocupado podría quedar esperando su propio acuse.
+
+La concesión duplicada tuvo un efecto secundario que el Prototipo 1 no distinguía. Si el acuse se perdía, el custodio reenviaba el \texttt{GRANT}; el solicitante ya lo había registrado y respondía liberando el cerrojo, con lo que el custodio lo daba por libre mientras el nodo seguía dentro de la sección crítica. \texttt{sync\_held\_find\_req} busca la propiedad por \texttt{req\_id} y no por hilo, de modo que un \texttt{GRANT} duplicado solo se acusa y no se libera.
+
+\subsection{Servicios nuevos y parámetros con uso real}
+
+La ejecución distribuida y los reportes HTML no existían como código en el Prototipo 1. El Prototipo 2 agrega ambos servicios, con sus mensajes y sus funciones públicas. También da uso a cinco claves que el archivo de configuración declaraba sin lector: \texttt{RAID\_K} en la formación de franjas, \texttt{CHUNK\_PAGES} en el orden y la franja del reporte, \texttt{WAIT\_POOL\_ENTRIES} en la capacidad de particiones de un trabajo, \texttt{OUTPUT\_DIR} en el destino de los HTML y \texttt{DIST\_TIMEOUT\_MS} en la espera de \texttt{dsm\_dist\_verify}.
+
+En el directorio, el Prototipo 2 agrega la bandera \texttt{busy} por página, de modo que una segunda solicitud recibe \texttt{BUSY} en lugar de leer un estado a medio modificar. La secuencia \texttt{tseq} deja de ser un campo decorativo: cada respuesta que transporta contenido avanza el contador y el receptor descarta la que no supera el último valor aplicado. Las invalidaciones dejan de depender de una RPC por copia y pasan a un mapa de acuses por transacción que espera a todos los destinatarios. Cuando cae el custodio de una página, el nuevo home se calcula con el anillo, se busca una copia en el copyset o en el respaldo y el contenido se transfiere con \texttt{PAGE\_MOVE}. La redundancia deja de estar diferida: RAID5 se acepta con $K$ páginas de datos y una de paridad. Los cerrojos y las barreras incorporan acuse y retransmisión acotada, y la barrera compara el umbral anunciado por cada participante. Las respuestas de página que llegan sin una solicitud pendiente se descartan en la capa de red. La persistencia deja de ser una promesa del diseño: \texttt{dsm\_sync} emite \texttt{WRITEBACK} y el custodio lo aplica. Por último, aparecen la ejecución distribuida y los reportes HTML como servicios con API pública.
+
+% =========================================================
+\section{Recuperación de custodia y redundancia RAID5}\label{sec:custodia_raid}
+% =========================================================
+
+\subsection{Reasignación del custodio}
+
+La recuperación empieza cuando \texttt{membership\_on\_node\_down} o \texttt{membership\_on\_leave} retiran la ranura y, con la membresía ya actualizada, llaman a \texttt{msi\_on\_node\_down}, \texttt{sync\_on\_node\_down} y, si la redundancia está activa, \texttt{raid\_on\_node\_down}. El orden importa: el anillo debe reflejar la baja antes de calcular el nuevo custodio, y la reconstrucción de RAID5 debe consultar la membresía antes de tomar el mutex de la franja.
+
+\texttt{msi\_on\_node\_down} recorre las páginas de la vista y selecciona solo aquellas cuyo último custodio conocido, \texttt{home\_known}, es la ranura caída. Para cada una calcula \texttt{new\_home} con \texttt{ring\_home\_of} y busca contenido en este orden: la vista local en estado \texttt{S} o \texttt{M}, el marco de respaldo del propio nodo, y los miembros del copyset que no sean el nodo caído ni el propio nodo. La consulta a un par usa \texttt{PAGE\_REQUEST} con las banderas \texttt{PROBE} y \texttt{WANT\_DATA}; la respuesta la atiende \texttt{home\_handle\_probe}, que entrega lo que todavía conserva y suelta la página si ya no es el custodio.
+
+Si el nuevo custodio es el propio nodo, el contenido se guarda en el marco de respaldo, se instala en la vista con \texttt{PROT\_READ} y la página queda en \texttt{S}. Si el nuevo custodio es otro nodo, se envía \texttt{PAGE\_MOVE} con la página completa y se espera \texttt{PAGE\_MOVE\_ACK}. En ambos casos se incrementa la versión del directorio, se guarda \texttt{new\_home} en \texttt{home\_map} y se marca la entrada como \texttt{SHARED} con el nuevo custodio en el copyset. Si no se encontró ninguna copia, la entrada queda en \texttt{UNCACHED}, sin dueño y con el copyset vacío, la copia local se invalida y el marco de respaldo se libera con \texttt{dsm\_mem\_backing\_drop}. Esa decisión evita publicar una versión antigua como si fuera la vigente.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.88, every node/.style={transform shape},
+    >={Latex},
+    actor/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.0cm, minimum height=0.9cm},
+    dead/.style={draw=red!60!black, fill=red!8, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.0cm, minimum height=0.9cm},
+    store/.style={draw=borderorange, fill=softorange, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.0cm, minimum height=0.9cm},
+    flow/.style={->, thick, draw=black!65, font=\scriptsize, align=center}
+]
+
+\node[dead] (old) at (0, 0) {Custodio anterior\\slot $s$ caído};
+\node[actor] (ring) at (5.0, 0) {\texttt{ring\_home\_of}\\nuevo custodio};
+\node[store] (src) at (10.0, 0) {Vista local o\\marco de respaldo};
+\node[actor] (peer) at (10.0, -3.2) {Par del copyset\\con copia viva};
+\node[actor] (new) at (5.0, -3.2) {Nuevo custodio\\\texttt{new\_home}};
+\node[store] (dir) at (0, -3.2) {Directorio\\\texttt{SHARED} y versión};
+
+\draw[flow] (old) -- node[above] {\texttt{NODE\_DOWN}} (ring);
+\draw[flow] (ring) -- node[above] {busca copia} (src);
+\draw[flow] (src) -- node[right] {si no hay} (peer);
+\draw[flow] (peer) -- node[above] {\texttt{PAGE\_DATA}} (new);
+\draw[flow] (src) -- node[left, pos=0.55] {\texttt{PAGE\_MOVE}} (new);
+\draw[flow] (new) -- node[above] {actualiza} (dir);
+
+\end{tikzpicture}
+\caption{Recuperación de una página cuando el custodio anterior deja de estar vivo. La copia se busca primero en el nodo que ejecuta la recuperación y después en el copyset.}
+\label{fig:recuperacion_custodia}
+\end{figure}
+
+La recuperación tiene un alcance acotado que conviene decir: solo actúa sobre páginas cuyo \texttt{home\_map} local apunta al slot caído. Un nodo que nunca calculó el custodio de una página no tiene una entrada que corregir y no participa de esa reasignación. Tampoco se conserva la incarnation del dueño en \texttt{dir\_entry\_t}; si un nodo reinicia con la misma ranura, el custodio no puede distinguir la instancia vieja de la nueva y recurre al respaldo cuando el dueño responde \texttt{BAD\_STATE}. Es una decisión conservadora, pero deja una ventana de inconsistencia que la sección~\ref{sec:pendientes} detalla.
+
+\subsection{Franjas, paridad y tolerancia}
+
+Con \texttt{REDUNDANCY=RAID5}, la vista se divide en franjas de $K$ páginas de datos consecutivas y una página de paridad. La página $j$ de la franja $i$ es $D_{i,j}$ y la paridad se calcula como
+\begin{equation}
+P_i = D_{i,1} \oplus D_{i,2} \oplus \dots \oplus D_{i,K}.
+\end{equation}
+El custodio de la paridad, \texttt{parity\_slot}, se elige como la primera ranura viva que no sea custodio de ninguna de las $K$ páginas de datos. Esa condición es la que garantiza que la pérdida de un nodo no destruya a la vez un dato y la paridad de la misma franja. La configuración exige $K \in [2,8]$ y, cuando la redundancia está activa, \texttt{MAX\_RUNTIME\_NODES} $\ge K+1$. La segunda comprobación es una cota de configuración, no una garantía de nodos vivos: si en ejecución hay menos de $K+1$ nodos, \texttt{raid\_stripe\_refresh} deja \texttt{parity\_slot} en \texttt{DSM\_SLOT\_NONE} y las escrituras registran la advertencia correspondiente.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.92, every node/.style={transform shape},
+    data/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\small, minimum width=2.0cm, minimum height=1.0cm},
+    par/.style={draw=borderorange, fill=softorange, thick, rounded corners, align=center, font=\small, minimum width=2.0cm, minimum height=1.0cm},
+    lab/.style={font=\scriptsize, text=black!70},
+    op/.style={->, >=Latex, thick, draw=black!65}
+]
+
+\node[data] (d1) at (0, 0) {$D_1$};
+\node[data, right=0.25cm of d1] (d2) {$D_2$};
+\node[data, right=0.25cm of d2] (d3) {$D_3$};
+\node[lab, right=0.18cm of d3] (dots) {$\cdots$};
+\node[data, right=0.18cm of dots] (dk) {$D_K$};
+\node[par, right=0.35cm of dk] (p) {$P$};
+
+\node[lab, above=0.12cm of d3] {páginas de datos};
+\node[lab, above=0.12cm of p] {paridad};
+
+\draw[op] (d1.south) to[bend right=18] (p.south);
+\draw[op] (d2.south) to[bend right=10] (p.south);
+\draw[op] (d3.south) -- (p.south);
+\draw[op] (dk.south) to[bend left=10] (p.south);
+\node[lab, below=1.0cm of p] {$P = D_1 \oplus D_2 \oplus \dots \oplus D_K$};
+
+\end{tikzpicture}
+\caption{Organización de una franja RAID5. La paridad ocupa una página completa y se guarda en un custodio distinto de los $K$ custodios de datos.}
+\label{fig:franja_raid}
+\end{figure}
+
+La tolerancia es de una pieza por franja, no de un nodo cualquiera del clúster. Si dos páginas de datos de la misma franja caen en el mismo nodo, la pérdida de ese nodo elimina dos incógnitas y la reconstrucción no alcanza. \texttt{raid\_stripe\_refresh} evita que la paridad comparta nodo con un dato, pero no reparte los datos para que cada uno viva en una ranura distinta; esa colocación depende del anillo y no se corrige. Con $K=2$ y tres nodos, la configuración típica tolera la pérdida de un nodo por franja; con $K=8$ y nueve nodos, también tolera una pieza por franja, pero la probabilidad de que dos datos compartan nodo crece si el anillo concentra páginas.
+
+\subsection{Escritura y delta de paridad}
+
+La paridad no se actualiza en cada almacenamiento de la aplicación, sino cuando la página se persiste. \texttt{dsm\_sync} recorre las páginas en \texttt{M} y llama a \texttt{msi\_writeback\_page}; si el custodio es local, copia al marco de respaldo y calcula el delta; si es remoto, envía \texttt{WRITEBACK} y el custodio aplica el contenido y el delta. La razón es económica: un almacenamiento puede ocurrir miles de veces antes de una sincronización, y enviar un delta por cada uno multiplicaría el tráfico sin mejorar la durabilidad.
+
+El delta se calcula con la versión anterior y la nueva:
+\begin{equation}
+\Delta = D_{\text{antes}} \oplus D_{\text{después}}, \qquad P' = P \oplus \Delta.
+\end{equation}
+El emisor envía \texttt{PARITY\_DELTA} con el identificador de franja y $\Delta$ como carga útil de tamaño de página. El custodio de la paridad responde \texttt{PARITY\_ACK} con la versión aplicada. Cada franja mantiene \texttt{version} en \texttt{stripe\_rt\_t}; el emisor la incrementa antes de enviar y el receptor solo acepta el delta si coincide con la versión esperada. Si llega una versión distinta, responde \texttt{DSM\_ST\_BAD\_STATE} con la versión vigente y el emisor reintenta con la siguiente, hasta tres intentos. Esa coreografía resuelve el caso de dos escritores que compiten por la misma franja sin un cerrojo global de paridad.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\linewidth}{l r r r Y}
+\toprule
+\textbf{Operación} & \textbf{Mensajes} & \textbf{Bytes} & \textbf{Sobre la página} & \textbf{Comentario} \\
+\midrule
+Persistencia local sin RAID & 0 & 0 & 0 & Solo copia al marco de respaldo. \\
+Persistencia local con RAID & 2 & 4\,216 & 1.03 & \texttt{PARITY\_DELTA} y \texttt{PARITY\_ACK}. \\
+Persistencia remota sin RAID & 2 & 4\,208 & 1.03 & \texttt{WRITEBACK} y \texttt{WRITEBACK\_ACK}. \\
+Persistencia remota con RAID & 4 & 8\,424 & 2.06 & Se suman el delta y su acuse. \\
+\bottomrule
+\end{tabularx}
+\caption{Overhead analítico por página persistida con página de 4096 bytes y cabecera de 56 bytes. No incluye reintentos ni la latencia de la RTT.}
+\label{tab:overhead}
+\end{table}
+
+La tabla~\ref{tab:overhead} se obtiene del formato, no de una medición de latencia. El mensaje \texttt{PARITY\_DELTA} mide $56 + 4 + 4096 = 4156$ bytes, su acuse $56 + 4 = 60$, el \texttt{WRITEBACK} $56 + 4096 = 4152$ y su acuse 56. La capacidad útil es $K/(K+1)$: 66.7\% con $K=2$, 80\% con $K=4$ y 88.9\% con $K=8$. El espacio de paridad es $1/K$ del total.
+
+\subsection{Reconstrucción}
+
+\texttt{raid\_on\_node\_down} encola la ranura caída en una cola acotada de \texttt{MAX\_NODES} entradas y arranca un hilo de reconstrucción si no hay otro activo. El hilo recorre las franjas afectadas, marca la franja en \texttt{DEGRADED} y elige un líder: la ranura viva más baja entre los datos y la paridad. Solo el líder reconstruye, de modo que varios nodos que detectan la misma baja no dupliquen el trabajo.
+
+Para una franja con un dato perdido, el líder reúne la paridad y los $K-1$ datos supervivientes con \texttt{STRIPE\_READ} y \texttt{STRIPE\_DATA}, verifica que cada respuesta traiga la versión de la franja y calcula
+\begin{equation}
+D_{\text{perdido}} = P \oplus \bigoplus_{j \ne \text{perdido}} D_j.
+\end{equation}
+Para una franja con la paridad perdida, reúne los $K$ datos y calcula $P$ con la misma operación. El resultado se entrega al nuevo custodio con \texttt{PAGE\_MOVE} si es otro nodo, o se instala en la vista local si el líder es el nuevo custodio. Cuando la paridad cambia de custodio, \texttt{STRIPE\_PUT} instala la descripción de la franja y \texttt{PARITY\_DELTA} entrega el marco completo con la versión siguiente.
+
+\begin{lstlisting}[language=C, caption={Reconstrucción XOR de una pieza a partir de las supervivientes.}, label={lst:xor}]
+void raid_xor_rebuild(const uint8_t **parts, uint32_t n, uint32_t ps,
+                      uint8_t *out)
+{
+    memset(out, 0, ps);
+    for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t b = 0; b < ps; b++) {
+            out[b] = (uint8_t)(out[b] ^ parts[i][b]);
+        }
+    }
+}
+\end{lstlisting}
+
+El costo de una reconstrucción también se puede calcular. Para $K$ piezas, la recolección usa $K$ \texttt{STRIPE\_READ} de 64 bytes y $K$ \texttt{STRIPE\_DATA} de 4152 bytes, es decir $2K$ mensajes y $4216K$ bytes, más el \texttt{PAGE\_MOVE} y su acuse cuando el nuevo custodio es remoto. Con $K=2$ son 4 mensajes de recolección y unos 12.6 KB por franja; con $K=4$ son 8 mensajes y unos 21.1 KB. La reconstrucción se ejecuta en un hilo separado para que el listener siga atendiendo las respuestas que esa misma reconstrucción espera, un detalle que no es opcional: si el hilo que recibe la baja se bloqueara esperando \texttt{STRIPE\_DATA}, las respuestas no tendrían quién las leyera.
+
+\subsection{Límites de la redundancia}
+
+La paridad vive en memoria, en \texttt{ctx->raid.parity}, y la tabla de franjas se reconstruye al arrancar. No hay un archivo de paridad persistente ni una versión de franja en disco: la versión es un contador de la tabla en memoria y se pierde si el proceso reinicia. Esto es suficiente para tolerar la caída de un nodo mientras el clúster sigue vivo, pero no para recuperar el estado después de reiniciar a todos los nodos. La reconstrucción tampoco se ha ejercitado con la caída real de un proceso que permita observar la página recuperada; solo se ha verificado la identidad XOR de forma aislada.
+
+El custodio de paridad es, además, un punto único para las escrituras de su franja. Si cae, \texttt{raid\_on\_write} devuelve \texttt{DSM\_ERR\_NODE\_DOWN} y la escritura pierde la actualización de paridad hasta que la reconstrucción designe otro custodio. La operación de datos no se pierde, pero la franja queda degradada y el siguiente fallo puede ser irreversible. Es una consecuencia del diseño de una sola paridad por franja y no se corrige con los mecanismos actuales.
+
+% =========================================================
+\section{Concurrencia, secuencias y acuses}\label{sec:concurrencia}
+% =========================================================
+
+\subsection{La bandera \texttt{busy} y el dueño fantasma}
+
+La reserva de una página se hace en dos pasos. Primero se toma \texttt{dir\_mu}, se consulta \texttt{busy} y, si está libre, se pone en uno; después se suelta el mutex y se trabaja con una copia de la entrada. La bandera se libera en la etiqueta \texttt{out} de ambas funciones, de modo que un error de memoria, una RPC fallida o un \texttt{NACK} no la dejan tomada. La segunda solicitud no espera: recibe \texttt{DSM\_ST\_BUSY}. En el camino local, \texttt{home\_local\_fault} devuelve \texttt{DSM\_ERR\_BUSY} y el despachador reintenta con un jitter de 500 a 2000 microsegundos; en el camino remoto, el solicitante invalida su estado pendiente y devuelve el error a la aplicación, que puede reintentar.
+
+\begin{lstlisting}[language=C, caption={Reserva de la página en el custodio.}, label={lst:busy}]
+pthread_mutex_lock(&ctx->msi.dir_mu);
+if (ctx->msi.dir[page].busy) {
+    pthread_mutex_unlock(&ctx->msi.dir_mu);
+    send_nack(ctx, m, DSM_ST_BUSY);
+    return;
+}
+ctx->msi.dir[page].busy = 1;
+reserved = true;
+pthread_mutex_unlock(&ctx->msi.dir_mu);
+\end{lstlisting}
+
+La bandera convive con una recuperación específica. Si la entrada está en \texttt{MODIFIED} y el dueño declarado es el propio solicitante, el custodio no le pide un \texttt{DOWNGRADE} a quien dice ser dueño: busca el contenido en el marco de respaldo y lo entrega como \texttt{SHARED}. Ese es el caso del dueño fantasma, un nodo que figura como propietario pero ya no tiene la copia, por ejemplo porque reinició y perdió la vista. Si el dueño es remoto y responde \texttt{BAD\_STATE}, el custodio también recurre al respaldo, retira al dueño del copyset y continúa. En cambio, si el dueño está muerto, la entrada en \texttt{M} no se sirve desde el respaldo: podría ser anterior a la última escritura y el custodio prefiere devolver \texttt{BUSY} antes que entregar datos viejos.
+
+\subsection{El orden de \texttt{mprotect}}
+
+El orden de las operaciones al degradar una copia propia es deliberado. Si el custodio copiara el contenido y después aplicara \texttt{PROT\_READ}, un hilo de la aplicación podría escribir entre la copia y el cambio de permiso, y el contenido entregado al solicitante no incluiría esa escritura. La implementación cierra la escritura primero, copia después y solo entonces marca la página como \texttt{S}. La misma secuencia se repite en \texttt{home\_local\_fault}, en \texttt{msi\_home\_handle\_request} y en \texttt{msi\_on\_downgrade}.
+
+\begin{lstlisting}[language=C, caption={Degradación antes de copiar el contenido que se entrega.}, label={lst:mprotect}]
+dsm_mem_stripe_lock(&ctx->mem, page);
+if (dsm_mem_set_prot(&ctx->mem, page, PROT_READ) != DSM_OK) {
+    dsm_mem_stripe_unlock(&ctx->mem, page);
+    /* error */
+}
+memcpy(data, dsm_mem_page_ptr(&ctx->mem, page), ctx->mem.page_size);
+ctx->mem.local[page].state = DSM_PAGE_S;
+dsm_mem_stripe_unlock(&ctx->mem, page);
+\end{lstlisting}
+
+\subsection{La compuerta de \texttt{tseq}}
+
+\texttt{dir\_tseq\_next} incrementa el contador de la página bajo \texttt{dir\_mu} y salta el cero, que se reserva para ``sin secuencia''. \texttt{tseq\_accept} compara el valor recibido con \texttt{tseq\_seen} de la copia local bajo el stripe de la página. Si el recibido es menor o igual, incrementa \texttt{tseq\_discarded} y devuelve falso; si es mayor, publica el nuevo valor antes de que el llamador instale los datos. La publicación temprana es intencional: si la instalación falla después, la secuencia ya avanzó y una respuesta vieja no podrá colarse en un reintento.
+
+\begin{lstlisting}[language=C, caption={Comparación y publicación de la secuencia de página.}, label={lst:tseq}]
+static bool tseq_accept(dsm_ctx_t *ctx, uint32_t page, uint32_t tseq)
+{
+    if (!ctx || !ctx->mem.local || page >= ctx->mem.npages || tseq == 0) {
+        return false;
+    }
+
+    bool accept;
+    dsm_mem_stripe_lock(&ctx->mem, page);
+    if (tseq <= ctx->mem.local[page].tseq_seen) {
+        atomic_fetch_add_explicit(&ctx->ctr.tseq_discarded, 1,
+                                  memory_order_relaxed);
+        accept = false;
+    } else {
+        ctx->mem.local[page].tseq_seen = tseq;
+        accept = true;
+    }
+    dsm_mem_stripe_unlock(&ctx->mem, page);
+    return accept;
+}
+\end{lstlisting}
+
+El predicado \texttt{msi\_tseq\_stale} existe para la capa de red y no tiene efectos. \texttt{pending\_complete} lo consulta antes de buscar la solicitud pendiente; si la respuesta es vieja, devuelve \texttt{DSM\_ERR\_NOT\_FOUND} y el listener la descarta. Sin esa comprobación, una respuesta retrasada podría despertar una RPC que ya había agotado su plazo y hacerle creer que el contenido es el vigente.
+
+\subsection{Acuses múltiples}
+
+La estructura de espera guarda lo que falta, no lo que llegó. \texttt{ok\_mask} se inicializa con los destinatarios esperados y cada acuse limpia su bit; \texttt{received} cuenta los acuses nuevos y \texttt{expected} es el total. Cuando el mapa queda vacío y la cuenta alcanza el total, la espera se completa; si un acuse trae un estado distinto de \texttt{OK}, la espera termina de inmediato con error. Un acuse duplicado encuentra el bit ya limpio y no incrementa la cuenta; un acuse de un nodo que no estaba en la máscara tampoco.
+
+\begin{lstlisting}[language=C, caption={Espera de acuses por transacción.}, label={lst:ack}]
+typedef struct {
+    uint32_t txn;
+    uint32_t expected;
+    uint32_t received;
+    uint8_t  ok_mask[MAX_NODES / 8];
+    uint16_t status;
+    bool     active;
+    sem_t    sem;
+} msi_ack_wait_t;
+\end{lstlisting}
+
+\texttt{invalidate\_remote\_copies} arma la máscara con todos los miembros del copyset distintos del solicitante. Si el propio custodio figura en el copyset, invalida su copia local sin enviar nada; para los demás, registra la espera, envía un \texttt{INVALIDATE} por cada uno y espera. La capacidad es de 64 transacciones concurrentes; una invalidación que necesite más de 64 esperas simultáneas falla con \texttt{DSM\_ERR\_NO\_SPACE}. Es una cota deliberada para no reservar una tabla proporcional al número de páginas.
+
+\texttt{DOWNGRADE\_ACK} sigue el mismo camino, aunque la RPC ya correlacione la respuesta. \texttt{msi\_on\_downgrade\_ack} registra el acuse en la espera y, si la carga trae datos, aplica la compuerta de \texttt{tseq} sobre el contenido. La RPC despierta al hilo que espera y ese hilo copia el contenido a su búfer; el acuse, en paralelo, cierra la transacción del mapa. Esa duplicación es intencional porque permite que una transacción con varias copias use el mismo mecanismo que una con una sola.
+
+\subsection{Respuestas huérfanas}
+
+El listener clasifica las respuestas con \texttt{dsm\_msg\_is\_response}. Si \texttt{pending\_complete} no encuentra la solicitud, devuelve \texttt{DSM\_ERR\_NOT\_FOUND}; para \texttt{PAGE\_DATA} y \texttt{GRANT}, el listener libera la carga y cierra la conexión sin encolarla. Antes de este cambio, una respuesta de una RPC vencida podía llegar a un worker y aplicarse sobre una página que ya estaba en \texttt{S} o \texttt{M}, sobrescribiendo una versión más nueva. La guardia \texttt{page\_accept\_pending} agrega una segunda defensa: \texttt{msi\_on\_page\_data} y \texttt{msi\_on\_grant} solo aplican si la página está en \texttt{IS\_PEND}, \texttt{IM\_PEND} o \texttt{SM\_PEND}. Una respuesta que llega tarde ya no encuentra un estado pendiente y se descarta.
+
+\subsection{Cerrojos y barreras}
+
+La propiedad de un cerrojo se registra por hilo con \texttt{pthread\_equal}. Dos hilos del mismo proceso compiten igual que dos procesos, y un hilo que no tomó el cerrojo recibe \texttt{DSM\_ERR\_INVALID} al intentar liberarlo. No hay herencia entre hilos ni detección de muerte del poseedor: si el hilo termina sin liberar, el cerrojo sigue retenido hasta que el custodio cambie o el siguiente solicitante agote \texttt{LOCK\_TIMEOUT\_MS}.
+
+La entrega de una concesión usa \texttt{sync\_deliver\_grant}: registra una espera de acuse, envía el \texttt{LOCK\_GRANT} y espera; si no llega, reenvía hasta \texttt{REQUEST\_RETRIES} veces, con un tope de \texttt{DSM\_MAX\_REQUEST\_RETRIES}. El acuse es un \texttt{LOCK\_REL} con \texttt{DSM\_FLAG\_PROBE}, que el listener atiende en línea. Si el custodio no logra entregar la concesión, deshace la asignación y pasa al siguiente de la cola para no dejar el cerrojo retenido por una petición que nunca llegó. \texttt{sync\_deliver\_barrier\_go} repite la misma idea con \texttt{BARRIER\_GO} y un acuse con la misma bandera.
+
+La barrera valida el umbral en \texttt{sync\_barrier\_arrive}: el primer arribo lo fija y los siguientes deben anunciar el mismo valor; si no, la función devuelve \texttt{DSM\_ERR\_INVALID}. La validación es completa cuando el custodio es local, porque el llamador recibe el error. Cuando el arribo llega por red, \texttt{sync\_on\_barrier\_arrive} ignora el resultado y el participante remoto no se entera de la discrepancia; esa asimetría se registra como limitación.
+
+\texttt{sync\_on\_node\_down} recorre la tabla de cerrojos, recalcula el custodio con el anillo y reinicia la cola. No conserva al dueño anterior: deja \texttt{owner\_slot} en el nuevo custodio y \texttt{owner\_req} en cero. La intención es que el nuevo custodio no conceda el cerrojo a ciegas, pero el efecto práctico es que el cerrojo puede quedar retenido hasta que alguien lo libere o el plazo de los solicitantes expire. Es una migración conservadora, no una transferencia completa del estado.
+
+La protección se reparte en varias capas. La página del directorio se serializa con \texttt{busy} bajo \texttt{dir\_mu}, de modo que una segunda transacción recibe \texttt{BUSY} y no observa un estado intermedio; no hay cola de espera. El estado local de cada página se protege con el semáforo de la franja correspondiente, que cubre \texttt{state}, \texttt{tseq\_seen} y los permisos, y el cambio de \texttt{mprotect} ocurre dentro de esa misma sección. Los acuses de invalidación se cuentan en una estructura por transacción con capacidad para 64 esperas concurrentes. Las solicitudes de red se correlacionan por \texttt{req\_id} en una tabla de 1024 cubetas, y una respuesta sin solicitud pendiente se descarta. La propiedad de un cerrojo se registra por hilo: solo el propietario lo libera, sin herencia ni detección de muerte. La concesión remota usa acuse y retransmisión, pero no migra el estado del dueño anterior. La barrera usa un mapa de arribos por generación, de modo que un aviso atrasado no libera una ronda futura; el umbral remoto no se valida.
+
+% =========================================================
+\section{Ejecución distribuida de trabajo}\label{sec:dist}
+% =========================================================
+
+La ejecución distribuida se agregó como un extra del enunciado. La API pública expone el registro de kernels, el lanzamiento de trabajos, la recolección y la verificación, y la implementación está separada en un módulo propio; el estado por nodo está en \texttt{dsm\_dist\_t}, con 32 ranuras de kernels, 16 trabajos y una tabla de resultados por trabajo. Un trabajo se identifica con \texttt{job\_id}, un kernel con \texttt{kernel\_id} y cada partición con un \texttt{dsm\_dist\_part\_t} que contiene \texttt{id}, \texttt{src\_va}, \texttt{dst\_va} y \texttt{nbytes}. Las direcciones pertenecen a la vista DSM, de modo que el kernel lee y escribe la misma memoria compartida que el resto del sistema.
+
+\texttt{dsm\_dist\_register} asocia un identificador con una función y un argumento opaco. El registro es local al proceso; no se propaga al clúster. Esa decisión evita inventar un mecanismo de carga de código y obliga a que cada nodo trabajador registre el mismo \texttt{kernel\_id} antes de recibir trabajo. \texttt{dsm\_dist\_launch} valida que las particiones tengan identificadores únicos y en rango, que los trabajadores pertenezcan a la membresía, que no sean clientes y que aporten memoria, que el kernel esté registrado y que el trabajo no exista. Luego reparte las particiones por turno: la partición $i$ va al trabajador $i \bmod n$.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.90, every node/.style={transform shape},
+    >={Latex},
+    nodebox/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.2cm, minimum height=0.9cm},
+    work/.style={draw=borderorange, fill=softorange, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.2cm, minimum height=0.9cm},
+    flow/.style={->, thick, draw=black!65, font=\scriptsize, align=center}
+]
+
+\node[nodebox] (coord) at (0, 0) {Coordinador\\\texttt{dsm\_dist\_launch}};
+\node[work] (p0) at (5.0, 1.8) {Partición 0\\trabajador $w_0$};
+\node[work] (p1) at (5.0, 0.0) {Partición 1\\trabajador $w_1$};
+\node[work] (p2) at (5.0, -1.8) {Partición 2\\trabajador $w_0$};
+\node[nodebox] (coll) at (10.0, 0) {Coordinador\\\texttt{dsm\_dist\_collect}};
+
+\draw[flow] (coord) -- node[above, pos=0.55] {\texttt{DIST\_RUN}} (p0);
+\draw[flow] (coord) -- node[above] {\texttt{DIST\_RUN}} (p1);
+\draw[flow] (coord) -- node[below, pos=0.55] {\texttt{DIST\_RUN}} (p2);
+\draw[flow] (p0) -- node[above, pos=0.45] {\texttt{DIST\_DONE}} (coll);
+\draw[flow] (p1) -- node[above] {\texttt{DIST\_DONE}} (coll);
+\draw[flow] (p2) -- node[below, pos=0.45] {\texttt{DIST\_DONE}} (coll);
+
+\end{tikzpicture}
+\caption{Reparto por turno de las particiones y recolección de resultados. El coordinador también puede ejecutar las particiones que le correspondan sin abrir una conexión contra su propio listener.}
+\label{fig:dist}
+\end{figure}
+
+El trabajador que recibe \texttt{DIST\_RUN} busca el kernel, construye el descriptor de la partición y ejecuta la función en el hilo worker que atendió el mensaje. Antes de invocar el kernel, el worker registra su pila alternativa con \texttt{dsm\_sig\_thread\_attach}, de modo que un fallo de página dentro del rango compartido se resuelva por el mismo camino de \texttt{SIGSEGV} que usa cualquier hilo de aplicación. Al terminar, calcula el CRC32 del rango de salida, cuenta los fallos de lectura y escritura que ocurrieron durante la ejecución y responde \texttt{DIST\_DONE} con el estado, la cantidad de elementos, el CRC, la duración y esos contadores. El coordinador guarda el resultado en la tabla del trabajo, rechaza un \texttt{part\_id} repetido o fuera de rango y marca el trabajo como terminado cuando recibió todas las particiones. \texttt{dsm\_dist\_collect} entrega los resultados no recogidos y \texttt{dsm\_dist\_verify} espera a que el trabajo termine y compara el XOR de los CRC32 de las particiones con el valor esperado.
+
+\begin{lstlisting}[language=C, caption={Reparto de particiones y ejecución local del coordinador.}, label={lst:dist}]
+for (uint32_t i = 0; i < nparts; i++) {
+    uint32_t dst = workers[i % nworkers];
+    /* ... se empaqueta el descriptor en dist_run_wire_t ... */
+    if (dst == self) {
+        dsm_msg_t local = { .hdr = hdr, .payload = payload };
+        dist_on_run(ctx, &local);
+    } else if (dsm_net_send(ctx, dst, &hdr, payload) != DSM_OK) {
+        result = DSM_ERR_NET;
+        break;
+    }
+}
+\end{lstlisting}
+
+La relación con la configuración es directa. \texttt{WAIT\_POOL\_ENTRIES} limita la cantidad de particiones de un trabajo, con un tope duro de 4096; un trabajo con más particiones que la capacidad configurada devuelve \texttt{DSM\_ERR\_NO\_SPACE}. \texttt{DIST\_TIMEOUT\_MS} es el plazo por defecto de \texttt{dsm\_dist\_verify} cuando el trabajo aún no terminó. \texttt{CHUNK\_PAGES} no interviene en el reparto: las particiones se describen explícitamente y el tamaño de cada rango lo decide la aplicación. La clave se usa en el reporte para mostrar el orden de página y la franja, no para dividir trabajo.
+
+La implementación tiene límites que conviene conocer. El kernel se ejecuta en el hilo worker, así que un kernel largo bloquea el despacho de mensajes de página de ese nodo. No hay cancelación ni plazo por partición: \texttt{deadline\_ms} viaja en \texttt{DIST\_RUN} pero \texttt{dist\_on\_run} no lo aplica. El lanzamiento devuelve éxito después de enviar las órdenes, no después de que terminen; la espera real ocurre en \texttt{collect} o \texttt{verify}. La ejecución distribuida se ha ejercitado con un solo trabajador local, de modo que valida la API, el reparto, la ejecución y la verificación, pero no la comunicación entre dos procesos ni el uso de la memoria de otro nodo. Esa es la diferencia entre ``implementado'' y ``demostrado en varios nodos''.
+
+% =========================================================
+\section{Consultas globales y reportes HTML}\label{sec:reportes}
+% =========================================================
+
+\texttt{dsm\_pages\_global} recibe un rango de páginas y un búfer de texto, y arma una tabla con las columnas página, propietario, orden, copyset y franja. El propietario se calcula con \texttt{ring\_home\_of} sobre la membresía vigente; el orden es \texttt{page} $\bmod$ \texttt{CHUNK\_PAGES}; la franja es \texttt{page / RAID\_K} cuando la redundancia está activa y \texttt{page / CHUNK\_PAGES} cuando no lo está. Para construir el copyset, la función consulta la tabla local de cada nodo presente con \texttt{QUERY\_REQ} de tipo \texttt{DSM\_QUERY\_PAGES} y ámbito local, y marca un bit por cada nodo que reporta la página en \texttt{S} o \texttt{M}. La consulta se hace por bloques de 4096 páginas para no reservar una entrada por página de la vista.
+
+\texttt{dsm\_html\_report} usa la misma información y escribe en \texttt{OUTPUT\_DIR} un archivo \texttt{global.html} y un archivo \texttt{nodo-<slot>.html} por cada nodo que aporta memoria. El archivo global muestra la cantidad de nodos, la cantidad de clientes, la época, el tamaño de página, las páginas de la vista y las particiones distribuidas ejecutadas y fallidas; después lista los nodos y los clientes con su rol, estado, memoria y dirección, y una tabla de páginas materializadas. Cada archivo por nodo repite los datos del nodo y, si es el nodo local, agrega sus estadísticas. Los clientes aparecen en la lista global con el rol \texttt{cliente}, no generan archivo propio porque no aportan memoria ni custodian páginas, y no se cuentan como nodos.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\linewidth}{l l Y}
+\toprule
+\textbf{Clave} & \textbf{Valor} & \textbf{Uso real} \\
+\midrule
+\texttt{RAID\_K} & 2 & Número de datos por franja; validado en $[2,8]$ y usado por \texttt{raid\_init} y \texttt{raid\_stripe\_refresh}. \\
+\texttt{CHUNK\_PAGES} & 4 & Orden de página y agrupación de franja en \texttt{report.c}. \\
+\texttt{WAIT\_POOL\_ENTRIES} & 64 & Capacidad de particiones de un trabajo distribuido, con tope de 4096. \\
+\texttt{OUTPUT\_DIR} & \texttt{reports} & Destino por defecto de \texttt{dsm\_html\_report}. \\
+\texttt{DIST\_TIMEOUT\_MS} & 5000 & Plazo por defecto de \texttt{dsm\_dist\_verify}. \\
+\bottomrule
+\end{tabularx}
+\caption{Parámetros nuevos y el lugar donde se consumen.}
+\label{tab:config_p2}
+\end{table}
+
+El contraste entre cliente y nodo se mantiene en todas las consultas. Un proceso arranca con \texttt{DSM\_NODE\_MODE=client}, publica \texttt{mem\_pages} en cero y \texttt{is\_client} en uno, y el anillo lo excluye porque \texttt{ring\_build} solo incorpora nodos con memoria. \texttt{dsm\_node\_count} y \texttt{dsm\_global\_size} lo omiten, de modo que lanzar una aplicación cliente no cambia el tamaño del clúster ni el conteo de nodos. \texttt{report\_collect\_nodes} aplica el mismo filtro, así que un cliente no aparece como propietario ni genera un archivo de reporte; \texttt{report\_collect\_clients} lo separa para listarlo con su rol en el archivo global.
+
+La implementación de los reportes tiene tres límites. El primero es que \texttt{dsmctl} no expone un comando \texttt{html}: la función existe en la biblioteca y se puede llamar desde una aplicación, pero no desde la herramienta de diagnóstico. El segundo es que la generación se ha ejercitado con un nodo y un cliente simulado; la consulta remota de páginas está implementada, pero no se ha ejercitado con dos nodos que permitan comprobar la paginación y el copyset entre procesos. El tercero es una discrepancia menor de contrato: la referencia de la API indica que \texttt{out\_dir} no puede ser una cadena vacía, mientras que \texttt{dsm\_html\_report} interpreta la cadena vacía como \texttt{OUTPUT\_DIR}.
+
+% =========================================================
+\section{Protocolo: mensajes nuevos y validación}\label{sec:protocolo}
+% =========================================================
+
+La cabecera sigue midiendo 56 bytes en el cable y 64 en memoria, con los mismos dieciséis campos y el CRC32 IEEE 802.3. El Prototipo 2 no cambió el formato de la cabecera; agregó cargas útiles y tipos. \texttt{wire\_payload\_ok} es la tabla que decide si una trama puede llegar a un manejador, y \texttt{dsm\_wire\_validate} sigue comprobando magic, versión, \texttt{cluster\_id}, longitud máxima y CRC antes de esa tabla. Un tipo nuevo sin una regla exacta en \texttt{wire\_payload\_ok} no se considera implementado.
+
+{\small
+\begin{xltabular}{\linewidth}{l l l l Y}
+\caption{Mensajes nuevos o con uso nuevo en el Prototipo 2. La columna de carga indica la longitud que exige \texttt{wire\_payload\_ok}.}\\
+\toprule
+\textbf{Tipo} & \textbf{Código} & \textbf{Dirección} & \textbf{Carga} & \textbf{Uso y validación} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Tipo} & \textbf{Código} & \textbf{Dirección} & \textbf{Carga} & \textbf{Uso y validación} \\
+\midrule
+\endhead
+\texttt{PAGE\_MOVE} & $0\text{x}0A$ & Custodio a nuevo home & \texttt{page\_size} & Transferencia de custodia y reconstrucción; longitud exacta. \\
+\texttt{PAGE\_MOVE\_ACK} & $0\text{x}0B$ & Nuevo home a emisor & 0 & Confirma la instalación; longitud cero. \\
+\texttt{WRITEBACK} & $0\text{x}17$ & Dueño en M a home & \texttt{page\_size} & Persistencia de \texttt{dsm\_sync}; longitud exacta. \\
+\texttt{WRITEBACK\_ACK} & $0\text{x}18$ & Home a dueño & 0 & Confirma la persistencia; longitud cero. \\
+\texttt{PARITY\_DELTA} & $0\text{x}20$ & Escritor a paridad & $4 + $ \texttt{page\_size} & Delta XOR y franja; longitud exacta y tope de carga. \\
+\texttt{PARITY\_ACK} & $0\text{x}21$ & Paridad a escritor & 4 & Versión aplicada; palabra de 4 bytes. \\
+\texttt{STRIPE\_PUT} & $0\text{x}22$ & Líder a nuevo custodio & 76 & Descripción de la franja; longitud exacta. \\
+\texttt{STRIPE\_PUT\_ACK} & $0\text{x}23$ & Custodio a líder & 4 & Confirma la descripción; palabra de 4 bytes. \\
+\texttt{STRIPE\_READ} & $0\text{x}24$ & Líder a custodio & 8 & Pide dato o paridad; longitud exacta. \\
+\texttt{STRIPE\_DATA} & $0\text{x}25$ & Custodio a líder & \texttt{page\_size} & Datos o paridad; longitud exacta. \\
+\texttt{STATE\_REPORT} & $0\text{x}26$ & Líder a miembros & 4 & Marca la franja degradada; palabra de 4 bytes. \\
+\texttt{DIR\_DONE} & $0\text{x}27$ & Nuevo home a líder & 4 & Marca la franja activa; palabra de 4 bytes. \\
+\texttt{LOCK\_REQ} & $0\text{x}30$ & Solicitante a custodio & 0 & Sin carga; el identificador viaja en \texttt{page\_id}. \\
+\texttt{LOCK\_GRANT} & $0\text{x}31$ & Custodio a solicitante & 0 & Concesión con acuse y retransmisión. \\
+\texttt{LOCK\_REL} & $0\text{x}32$ & Titular a custodio & 0 & Liberación o acuse con \texttt{PROBE}. \\
+\texttt{BARRIER\_ARRIVE} & $0\text{x}33$ & Participante a custodio & 8 & Umbral y generación; longitud exacta. \\
+\texttt{BARRIER\_GO} & $0\text{x}34$ & Custodio a participantes & 4 & Generación; acuse con \texttt{PROBE}. \\
+\texttt{DIST\_RUN} & $0\text{x}50$ & Coordinador a trabajador & 48 & Rango, trabajo, kernel y plazo; longitud exacta. \\
+\texttt{DIST\_DONE} & $0\text{x}51$ & Trabajador a coordinador & 40 & Estado, CRC, tiempo y fallos; longitud exacta. \\
+\bottomrule
+\end{xltabular}
+}
+
+El catálogo completo enumera 38 códigos, desde \texttt{HELLO} en $0\text{x}01$ hasta \texttt{NACK} en $0\text{x}7F$. Los mensajes de membresía, descubrimiento y consulta conservan sus reglas. \texttt{WELCOME} y \texttt{MEMBERSHIP\_RESP} se validan como rangos con aritmética modular; \texttt{HELLO} exige 20 bytes; \texttt{JOIN} exige los 36 de \texttt{membership\_wire\_t}; \texttt{HEARTBEAT} exige 12. Las cargas de página, paridad y movimiento exigen exactamente \texttt{page\_size} o la suma de la cabecera de paridad más \texttt{page\_size}, de modo que un mensaje truncado no llega a \texttt{msi.c} ni a \texttt{raid.c}.
+
+La clasificación de respuestas también cambió de efecto. \texttt{dsm\_msg\_is\_response} sigue incluyendo \texttt{NACK} y \texttt{DIST\_DONE}. Un \texttt{NACK} sin solicitud pendiente no desaparece: el listener no lo descarta porque solo descarta \texttt{PAGE\_DATA} y \texttt{GRANT} huérfanos, así que llega al worker y este incrementa \texttt{nacks\_received} y registra el diagnóstico. Un \texttt{DIST\_DONE} sin solicitud pendiente sigue el mismo camino y llega a \texttt{dist\_on\_done}, que lo rechaza si el trabajo o la partición no existen. Esa caída al worker es la que permite que la ejecución distribuida use mensajes clasificados como respuesta sin una RPC que los espere.
+
+% =========================================================
+\section{Pruebas y compilación}\label{sec:pruebas}
+% =========================================================
+
+\subsection{Compilación}
+
+El proyecto se compila con los cuatro perfiles del \texttt{Makefile}. Cada perfil deja objetos, biblioteca y binarios en \texttt{build/obj}, \texttt{build/lib} y \texttt{build/bin}, y todos usan \texttt{-std=c11}, \texttt{-Wall -Wextra -Wpedantic -Werror} y \texttt{-ftls-model=initial-exec}. La corrida de esta entrega compiló \texttt{release}, \texttt{debug}, \texttt{asan} y \texttt{tsan} sin advertencias.
+
+\begin{lstlisting}[language=bash, numbers=none]
+make clean
+make release debug asan tsan
+\end{lstlisting}
+
+\subsection{Verificación funcional}
+
+La verificación recorre los comportamientos nuevos: la segunda solicitud que encuentra la página tomada, la recuperación del dueño fantasma desde el respaldo, el retiro del copyset de un dueño que responde \texttt{BAD\_STATE}, la concesión de \texttt{BUSY} sin modificar el directorio, la reconstrucción XOR con y sin paridad, el registro y reemplazo de kernels, el reparto y la recogida de particiones, la verificación por CRC, el rechazo de parámetros inválidos, el kernel desconocido, la tabla global de páginas y el reporte HTML con un nodo y un cliente.
+
+La ejecución de extremo a extremo se realizó con dos procesos reales sobre un tramo de puertos propio: uno escribe el patrón, el otro lo lee, lo sobrescribe y el primero lo vuelve a leer. La salida confirma las cuatro transiciones del modelo MSI y termina con el mensaje de éxito.
+
+\subsection{Qué no se ha ejercitado}
+
+No se ha ejercitado directamente el descarte por secuencia repetida después de inyectar una respuesta duplicada, ni la concesión tras dos acuses de invalidación. Tampoco se ha ejercitado la recuperación de una página al caer su custodio con \texttt{PAGE\_MOVE}, ni la reconstrucción de una franja tras una caída. El traspaso ordenado por unión y salida sí se ha ejercitado; la caída abrupta, no. La operación XOR pura se ha verificado, pero no su integración con el directorio. La ejecución distribuida se ha ejercitado con un trabajador local y los reportes con un nodo y un cliente; la comunicación entre dos procesos queda pendiente.
+
+% =========================================================
+\section{Limitaciones y trabajo pendiente}\label{sec:pendientes}
+% =========================================================
+
+El sistema no está terminado. La recuperación de custodia, la paridad RAID5, la serialización por página, la compuerta de \texttt{tseq}, los acuses múltiples, los cerrojos y las barreras están implementados de forma parcial: cada mecanismo funciona en el camino probado y deja bordes sin cubrir. La reconstrucción de franjas no se ha ejercitado con la caída real de un proceso; solo se ha verificado la operación XOR pura. La ejecución distribuida y los reportes HTML están implementados, con API, mensajes y una ejecución local, pero sin una aplicación que los use entre dos nodos. El asignador global, los metadatos por proceso y las pruebas físicas siguen ausentes, y la documentación de la API está desactualizada. Las subsecciones que siguen detallan, por área, las limitaciones que un lector debe conocer antes de construir sobre la API.
+
+\subsection{Recuperación y redundancia}
+
+La recuperación de custodia funciona para las páginas que el nodo conoce, pero no es una garantía global. \texttt{home\_map} se llena cuando el nodo resuelve el custodio de una página; un nodo que nunca tocó esa página no tiene una entrada que corregir y no participa. Si el custodio cae y ningún nodo conserva copia, \texttt{home\_page\_content} termina sirviendo ceros después de que \texttt{page\_pull} no encuentra nada. No se entrega una versión anterior, pero tampoco se devuelve un error explícito a la aplicación: la pérdida se detecta en el registro y en el estado \texttt{UNCACHED}, no en el valor leído. Para una aplicación que necesita distinguir ``cero'' de ``dato perdido'', esa diferencia importa.
+
+La paridad RAID5 se calcula sobre la versión persistida, no sobre cada almacenamiento. Una página escrita y no sincronizada no está reflejada en la paridad; si el dueño en \texttt{M} cae antes de un \texttt{dsm\_sync}, la reconstrucción puede recuperar una versión anterior. La ventana es la misma que existe sin RAID5, pero conviene decirla. La paridad tampoco sobrevive al reinicio de todos los procesos porque vive en \texttt{calloc}, y la versión de franja es un contador en memoria. La reconstrucción se apoya en el hilo propio para no bloquear al listener, pero no tiene un plazo global ni cancelación; una franja con un par que no responde se queda en \texttt{DEGRADED} y las páginas afectadas se invalidan cuando la recolección falla.
+
+\subsection{Concurrencia y sincronización}
+
+La serialización por página es correcta para el caso de una transacción a la vez, pero no es una cola. Una ráfaga de solicitudes sobre la misma página produce \texttt{BUSY} y reintentos, no un orden justo. Los campos \texttt{wait\_head}, \texttt{wait\_tail} y \texttt{txn} de \texttt{dir\_entry\_t} siguen reservados y sin uso, y la estructura \texttt{txn\_t} de \texttt{msi.h} no participa del camino actual. La comparación de \texttt{tseq} no reemplaza un protocolo de orden total entre custodios: si la página cambia de custodio, la secuencia del nuevo custodio puede empezar en un valor que el solicitante ya vio.
+
+La migración de cerrojos es la parte más conservadora. \texttt{sync\_on\_node\_down} recalcula el custodio y limpia la cola, pero deja el cerrojo marcado como propio del nuevo custodio. No hay forma de saber si el dueño anterior estaba dentro de la sección crítica o si murió antes de liberar, así que el sistema prefiere no conceder. El efecto es un cerrojo que puede quedar retenido hasta que el nuevo custodio cambie otra vez o hasta que el solicitante agote su plazo. La detección de muerte del poseedor y la herencia entre hilos siguen fuera del alcance.
+
+\subsection{Ejecución distribuida y reportes}
+
+La ejecución distribuida tiene API, mensajes, validación y una ejecución local, pero no una aplicación que la use. El registro del kernel es local a cada proceso, de modo que una aplicación que lance trabajo a otro nodo debe registrar el mismo \texttt{kernel\_id} en ambos; si no, el trabajador responde con \texttt{DSM\_ERR\_INVALID}. El kernel se ejecuta en el hilo worker y no hay un hilo dedicado por partición, así que un kernel intensivo compite con la atención de páginas. \texttt{deadline\_ms} viaja en \texttt{DIST\_RUN} pero no se aplica. La partición se describe con direcciones de la vista, y el coordinador no valida que el rango pertenezca a la vista ni que \texttt{src\_va} y \texttt{dst\_va} no se solapen.
+
+Los reportes HTML existen y producen el archivo global y el archivo por nodo, pero no hay un comando \texttt{dsmctl html}. La generación se invoca desde la API y usa \texttt{OUTPUT\_DIR}. La generación se ha ejercitado con un nodo; la consulta remota de páginas está implementada, pero no se ha ejercitado con dos procesos. La tabla global solo muestra páginas materializadas, y el archivo por nodo omite las páginas en \texttt{I}; esa decisión reduce el tamaño del HTML, pero no documenta las páginas ausentes.
+
+\subsection{Asignación y documentación}
+
+\texttt{dsm\_alloc} y \texttt{dsm\_free} siguen siendo locales. No hay un asignador coordinado que consulte el espacio libre de otros nodos ni que solicite memoria cuando la vista local no alcanza. Tampoco hay metadatos de propiedad por PID ni un orden de páginas por proceso; el reporte usa \texttt{CHUNK\_PAGES} para mostrar un orden aproximado. La referencia de la API aún conserva el título del Prototipo 1, no incluye las funciones de ejecución distribuida ni las de reporte, y omite campos nuevos de las estadísticas. Este informe describe el comportamiento actual, pero el documento de referencia de la API necesita una actualización aparte.
+
+\subsection{Cierre}
+
+El Prototipo 2 convierte varias promesas del diseño en mecanismos verificables: una respuesta repetida ya no reescribe la página, una escritura espera todos los acuses de invalidación, un custodio caído se reemplaza y una franja RAID5 se reconstruye por XOR. La compilación de los cuatro perfiles y la verificación funcional sostienen esa afirmación para el código que existe. La ejecución distribuida y los reportes tienen API, implementación y una ejecución local, pero todavía no tienen la demostración entre dos procesos que el enunciado pide para el extra. La recuperación de custodia y la paridad tampoco se han ejercitado con la muerte real de un nodo.
+
+El trabajo siguiente se ordena por riesgo. Primero, la demostración con dos nodos que mate al custodio de una página y confirme la recuperación, y la reconstrucción de una franja RAID5 tras la caída de un nodo. Segundo, la comprobación del descarte por secuencia repetida y de la concesión tras dos acuses de invalidación incompletos. Tercero, una aplicación de ejecución distribuida que use al menos dos nodos y registre el kernel en ambos. Cuarto, el comando \texttt{dsmctl html} y una corrida con varios nodos en las máquinas del laboratorio. Mientras esas piezas no existan, el sistema es un prototipo sólido en el camino de una página y en la API, pero no una demostración completa de tolerancia a fallos en un clúster físico.
+
+\end{document}
