@@ -32,6 +32,8 @@ typedef struct dsm_config {
     uint32_t max_runtime_nodes;
     uint32_t vnodes_per_mb;
     bool     redundancy_raid5;
+    uint32_t raid_k;
+    uint32_t chunk_pages;
 
     uint16_t port_min;
     uint16_t port_max;
@@ -56,8 +58,11 @@ typedef struct dsm_config {
     uint32_t home_slack_permille;   /* 1250 = 1.25 */
     uint32_t lock_timeout_ms;
     uint32_t worker_queue_cap;
+    uint32_t wait_pool_entries;
+    uint32_t dist_timeout_ms;
 
     char     log_level[16];
+    char     output_dir[256];
 
     /* Propiedad de este proceso, no del archivo compartido: se toma de la
      * variable de entorno DSM_NODE_MODE. Un cliente usa la memoria del cluster

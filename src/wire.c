@@ -204,6 +204,28 @@ bool wire_payload_ok(uint16_t type, uint8_t flags, uint32_t len, uint32_t page_s
         return len == 8u; /* n[4] + generation[4] */
     case MSG_BARRIER_GO:
         return len == 4u; /* generation[4] */
+    case MSG_DIST_RUN:
+        return len == DSM_DIST_RUN_WIRE_LEN;
+    case MSG_DIST_DONE:
+        return len == DSM_DIST_DONE_WIRE_LEN;
+    case MSG_PAGE_MOVE:
+    case MSG_STRIPE_DATA:
+        return page_size != 0 && len == page_size;
+    case MSG_PAGE_MOVE_ACK:
+        return len == 0;
+    case MSG_PARITY_DELTA:
+        return page_size != 0 &&
+               page_size <= DSM_MAX_PAYLOAD - DSM_PARITY_DELTA_HDR_LEN &&
+               len == DSM_PARITY_DELTA_WIRE_LEN(page_size);
+    case MSG_PARITY_ACK:
+    case MSG_STRIPE_PUT_ACK:
+    case MSG_STATE_REPORT:
+    case MSG_DIR_DONE:
+        return len == DSM_WIRE_WORD_LEN;
+    case MSG_STRIPE_PUT:
+        return len == DSM_STRIPE_WIRE_LEN;
+    case MSG_STRIPE_READ:
+        return len == DSM_STRIPE_READ_WIRE_LEN;
     default:
         return len <= DSM_MAX_PAYLOAD;
     }
@@ -286,6 +308,238 @@ void dsm_unpack_dir_entry(const uint8_t in[DSM_DIR_ENTRY_LEN], dir_entry_t *d)
     d->busy      = in[37];
     d->reserved  = get_u16(in + 38);
     memcpy(d->copyset, in + 40, 32);
+}
+
+/* --- Ejecución distribuida --- */
+
+size_t dsm_pack_dist_run(const dist_run_wire_t *d, uint8_t out[DSM_DIST_RUN_WIRE_LEN])
+{
+    put_u32(out + 0, d->job);
+    put_u32(out + 4, d->kernel);
+    put_u32(out + 8, d->part_id);
+    put_u32(out + 12, d->nparts);
+    put_u32(out + 16, d->deadline_ms);
+    put_u64(out + 20, d->src_va);
+    put_u64(out + 28, d->dst_va);
+    put_u64(out + 36, d->nbytes);
+    put_u32(out + 44, d->launch_seq);
+    return DSM_DIST_RUN_WIRE_LEN;
+}
+
+void dsm_unpack_dist_run(const uint8_t in[DSM_DIST_RUN_WIRE_LEN], dist_run_wire_t *d)
+{
+    d->job         = get_u32(in + 0);
+    d->kernel      = get_u32(in + 4);
+    d->part_id     = get_u32(in + 8);
+    d->nparts      = get_u32(in + 12);
+    d->deadline_ms = get_u32(in + 16);
+    d->src_va      = get_u64(in + 20);
+    d->dst_va      = get_u64(in + 28);
+    d->nbytes      = get_u64(in + 36);
+    d->launch_seq  = get_u32(in + 44);
+}
+
+size_t dsm_pack_dist_done(const dist_done_wire_t *d, uint8_t out[DSM_DIST_DONE_WIRE_LEN])
+{
+    put_u32(out + 0, d->job);
+    put_u32(out + 4, d->part_id);
+    put_u32(out + 8, d->status);
+    put_u32(out + 12, d->items);
+    put_u64(out + 16, d->crc);
+    put_u64(out + 24, d->us);
+    put_u32(out + 32, d->launch_seq);
+    put_u32(out + 36, d->faults_r);
+    put_u32(out + 40, d->faults_w);
+    return DSM_DIST_DONE_WIRE_LEN;
+}
+
+void dsm_unpack_dist_done(const uint8_t in[DSM_DIST_DONE_WIRE_LEN], dist_done_wire_t *d)
+{
+    d->job        = get_u32(in + 0);
+    d->part_id    = get_u32(in + 4);
+    d->status     = get_u32(in + 8);
+    d->items      = get_u32(in + 12);
+    d->crc        = get_u64(in + 16);
+    d->us         = get_u64(in + 24);
+    d->launch_seq = get_u32(in + 32);
+    d->faults_r   = get_u32(in + 36);
+    d->faults_w   = get_u32(in + 40);
+}
+
+/* --- Paridad y migración de páginas --- */
+
+size_t dsm_pack_stripe(const stripe_wire_t *s, uint8_t out[DSM_STRIPE_WIRE_LEN])
+{
+    size_t off = 12;
+
+    put_u32(out + 0, s->stripe_id);
+    out[4] = s->k;
+    memcpy(out + 5, s->reserved, 3);
+    put_u32(out + 8, s->parity_slot);
+    for (uint32_t i = 0; i < DSM_STRIPE_DATA_SLOTS; i++) {
+        put_u32(out + off, s->data_page[i]);
+        off += 4;
+    }
+    for (uint32_t i = 0; i < DSM_STRIPE_DATA_SLOTS; i++) {
+        put_u32(out + off, s->data_slot[i]);
+        off += 4;
+    }
+    return DSM_STRIPE_WIRE_LEN;
+}
+
+void dsm_unpack_stripe(const uint8_t in[DSM_STRIPE_WIRE_LEN], stripe_wire_t *s)
+{
+    size_t off = 12;
+
+    s->stripe_id = get_u32(in + 0);
+    s->k         = in[4];
+    memcpy(s->reserved, in + 5, 3);
+    s->parity_slot = get_u32(in + 8);
+    for (uint32_t i = 0; i < DSM_STRIPE_DATA_SLOTS; i++) {
+        s->data_page[i] = get_u32(in + off);
+        off += 4;
+    }
+    for (uint32_t i = 0; i < DSM_STRIPE_DATA_SLOTS; i++) {
+        s->data_slot[i] = get_u32(in + off);
+        off += 4;
+    }
+}
+
+size_t dsm_pack_parity_delta(const parity_delta_wire_t *d, const uint8_t *delta,
+                             uint32_t page_size, uint8_t *out)
+{
+    if (!d || !delta || !out || page_size == 0 ||
+        page_size > DSM_MAX_PAYLOAD - DSM_PARITY_DELTA_HDR_LEN) {
+        return 0;
+    }
+    put_u32(out + 0, d->stripe_id);
+    memcpy(out + DSM_PARITY_DELTA_HDR_LEN, delta, page_size);
+    return DSM_PARITY_DELTA_WIRE_LEN(page_size);
+}
+
+void dsm_unpack_parity_delta(const uint8_t *in, uint32_t page_size,
+                             parity_delta_wire_t *d, uint8_t *delta)
+{
+    if (!in || !d || !delta || page_size == 0 ||
+        page_size > DSM_MAX_PAYLOAD - DSM_PARITY_DELTA_HDR_LEN) {
+        return;
+    }
+    d->stripe_id = get_u32(in + 0);
+    memcpy(delta, in + DSM_PARITY_DELTA_HDR_LEN, page_size);
+}
+
+size_t dsm_pack_word(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN])
+{
+    put_u32(out + 0, w->value);
+    return DSM_WIRE_WORD_LEN;
+}
+
+void dsm_unpack_word(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w)
+{
+    w->value = get_u32(in + 0);
+}
+
+size_t dsm_pack_parity_ack(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN])
+{
+    return dsm_pack_word(w, out);
+}
+
+void dsm_unpack_parity_ack(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w)
+{
+    dsm_unpack_word(in, w);
+}
+
+size_t dsm_pack_stripe_put_ack(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN])
+{
+    return dsm_pack_word(w, out);
+}
+
+void dsm_unpack_stripe_put_ack(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w)
+{
+    dsm_unpack_word(in, w);
+}
+
+size_t dsm_pack_state_report(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN])
+{
+    return dsm_pack_word(w, out);
+}
+
+void dsm_unpack_state_report(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w)
+{
+    dsm_unpack_word(in, w);
+}
+
+size_t dsm_pack_dir_done(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN])
+{
+    return dsm_pack_word(w, out);
+}
+
+void dsm_unpack_dir_done(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w)
+{
+    dsm_unpack_word(in, w);
+}
+
+size_t dsm_pack_stripe_read(const stripe_read_wire_t *r, uint8_t out[DSM_STRIPE_READ_WIRE_LEN])
+{
+    put_u32(out + 0, r->stripe_id);
+    out[4] = r->kind;
+    memcpy(out + 5, r->reserved, 3);
+    return DSM_STRIPE_READ_WIRE_LEN;
+}
+
+void dsm_unpack_stripe_read(const uint8_t in[DSM_STRIPE_READ_WIRE_LEN], stripe_read_wire_t *r)
+{
+    r->stripe_id = get_u32(in + 0);
+    r->kind      = in[4];
+    memcpy(r->reserved, in + 5, 3);
+}
+
+size_t dsm_pack_page_payload(const uint8_t *data, uint8_t *out, uint32_t len)
+{
+    if (!data || !out || len == 0) {
+        return 0;
+    }
+    memcpy(out, data, len);
+    return len;
+}
+
+void dsm_unpack_page_payload(const uint8_t *in, uint8_t *data, uint32_t len)
+{
+    if (!in || !data || len == 0) {
+        return;
+    }
+    memcpy(data, in, len);
+}
+
+size_t dsm_pack_stripe_data(const uint8_t *data, uint8_t *out, uint32_t len)
+{
+    return dsm_pack_page_payload(data, out, len);
+}
+
+void dsm_unpack_stripe_data(const uint8_t *in, uint8_t *data, uint32_t len)
+{
+    dsm_unpack_page_payload(in, data, len);
+}
+
+size_t dsm_pack_page_move(const uint8_t *data, uint8_t *out, uint32_t len)
+{
+    return dsm_pack_page_payload(data, out, len);
+}
+
+void dsm_unpack_page_move(const uint8_t *in, uint8_t *data, uint32_t len)
+{
+    dsm_unpack_page_payload(in, data, len);
+}
+
+size_t dsm_pack_page_move_ack(uint8_t *out)
+{
+    (void)out;
+    return 0;
+}
+
+void dsm_unpack_page_move_ack(const uint8_t *in)
+{
+    (void)in;
 }
 
 /* --- Consultas de diagnóstico --- */
@@ -495,6 +749,8 @@ const char *dsm_msg_type_name(uint16_t type)
     case MSG_BARRIER_GO:      return "BARRIER_GO";
     case MSG_QUERY_REQ:       return "QUERY_REQ";
     case MSG_QUERY_RESP:      return "QUERY_RESP";
+    case MSG_DIST_RUN:        return "DIST_RUN";
+    case MSG_DIST_DONE:       return "DIST_DONE";
     case MSG_NACK:            return "NACK";
     default:                  return "UNKNOWN";
     }
@@ -506,7 +762,8 @@ bool dsm_msg_is_response(uint16_t type)
             type == MSG_PAGE_DATA || type == MSG_GRANT ||
             type == MSG_INVALIDATE_ACK || type == MSG_DOWNGRADE_ACK ||
             type == MSG_WRITEBACK_ACK || type == MSG_LOCK_GRANT ||
-            type == MSG_QUERY_RESP || type == MSG_NACK);
+            type == MSG_QUERY_RESP || type == MSG_DIST_DONE ||
+            type == MSG_NACK);
 }
 
 bool dsm_msg_is_membership(uint16_t type)

@@ -154,7 +154,10 @@ enum {
     /** El mensaje es un reintento de una solicitud anterior. */
     DSM_FLAG_RETRY     = 1u << 3,
     /** El mensaje es una sonda de descubrimiento de pares. */
-    DSM_FLAG_PROBE     = 1u << 4
+    DSM_FLAG_PROBE     = 1u << 4,
+    /** WRITEBACK de traspaso de home: persiste el respaldo sin emitir el
+     *  delta de paridad, porque el contenido no cambia, solo su custodio. */
+    DSM_FLAG_TRANSFER  = 1u << 5
 };
 
 /**
@@ -217,6 +220,22 @@ typedef struct {
     uint64_t pages_s;
     /** Páginas de la vista local en estado Invalid. */
     uint64_t pages_i;
+    /** Respuestas descartadas por un número de secuencia de transacción repetido o antiguo. */
+    uint64_t tseq_discarded;
+    /** Deltas de paridad enviados a los pares del cluster. */
+    uint64_t parity_deltas;
+    /** Bytes de paridad transmitidos a los pares del cluster. */
+    uint64_t parity_bytes;
+    /** Franjas de paridad reconstruidas a partir de los datos supervivientes. */
+    uint64_t stripe_rebuilds;
+    /** Suma acumulada de la latencia de paridad, en microsegundos. */
+    uint64_t parity_latency_us;
+    /** Particiones de ejecución distribuida ejecutadas correctamente. */
+    uint64_t dist_tasks_run;
+    /** Particiones de ejecución distribuida que terminaron en fallo. */
+    uint64_t dist_tasks_failed;
+    /** Latidos perdidos acumulados respecto de los pares del cluster. */
+    uint64_t hb_missed;
     /** Cantidad de operaciones de página pendientes de respuesta. */
     uint32_t pending_count;
     /** Entradas ocupadas del conjunto de espera de peticiones. */

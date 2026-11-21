@@ -183,6 +183,11 @@ static int parse_hosts(char *val_str, dsm_config_t *cfg)
 #define KEY_LOCK_TIMEOUT_MS     (1ULL << 26)
 #define KEY_WORKER_QUEUE_CAP    (1ULL << 27)
 #define KEY_LOG_LEVEL           (1ULL << 28)
+#define KEY_RAID_K              (1ULL << 29)
+#define KEY_CHUNK_PAGES         (1ULL << 30)
+#define KEY_WAIT_POOL_ENTRIES   (1ULL << 31)
+#define KEY_OUTPUT_DIR          (1ULL << 32)
+#define KEY_DIST_TIMEOUT_MS     (1ULL << 33)
 
 /* Rol del proceso segun DSM_NODE_MODE; se aplica despues de leer el archivo. */
 static int config_load_mode(dsm_config_t *cfg);
@@ -204,6 +209,8 @@ int config_load(dsm_config_t *cfg, const char *path)
     cfg->max_runtime_nodes    = 256;
     cfg->vnodes_per_mb        = 16;
     cfg->redundancy_raid5     = false;
+    cfg->raid_k               = 2;
+    cfg->chunk_pages          = 1;
     cfg->port_min             = 27600;
     cfg->port_max             = 27699;
     cfg->connect_timeout_ms   = 200;
@@ -222,7 +229,10 @@ int config_load(dsm_config_t *cfg, const char *path)
     cfg->home_slack_permille   = 1250;
     cfg->lock_timeout_ms      = 10000;
     cfg->worker_queue_cap     = 4096;
+    cfg->wait_pool_entries    = 64;
+    cfg->dist_timeout_ms      = 5000;
     strncpy(cfg->log_level, "INFO", sizeof(cfg->log_level) - 1);
+    snprintf(cfg->output_dir, sizeof(cfg->output_dir), "%s", "reports");
 
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -335,6 +345,12 @@ int config_load(dsm_config_t *cfg, const char *path)
             } else {
                 parse_err = -1;
             }
+        } else if (strcasecmp(key, "RAID_K") == 0) {
+            mask = KEY_RAID_K;
+            parse_err = parse_u32(val, &cfg->raid_k);
+        } else if (strcasecmp(key, "CHUNK_PAGES") == 0) {
+            mask = KEY_CHUNK_PAGES;
+            parse_err = parse_u32(val, &cfg->chunk_pages);
         } else if (strcasecmp(key, "PORT_MIN") == 0) {
             mask = KEY_PORT_MIN;
             parse_err = parse_u16(val, &cfg->port_min);
@@ -392,6 +408,19 @@ int config_load(dsm_config_t *cfg, const char *path)
         } else if (strcasecmp(key, "WORKER_QUEUE_CAP") == 0) {
             mask = KEY_WORKER_QUEUE_CAP;
             parse_err = parse_u32(val, &cfg->worker_queue_cap);
+        } else if (strcasecmp(key, "WAIT_POOL_ENTRIES") == 0) {
+            mask = KEY_WAIT_POOL_ENTRIES;
+            parse_err = parse_u32(val, &cfg->wait_pool_entries);
+        } else if (strcasecmp(key, "DIST_TIMEOUT_MS") == 0) {
+            mask = KEY_DIST_TIMEOUT_MS;
+            parse_err = parse_u32(val, &cfg->dist_timeout_ms);
+        } else if (strcasecmp(key, "OUTPUT_DIR") == 0) {
+            mask = KEY_OUTPUT_DIR;
+            if (strlen(val) < sizeof(cfg->output_dir)) {
+                snprintf(cfg->output_dir, sizeof(cfg->output_dir), "%s", val);
+            } else {
+                parse_err = -1;
+            }
         } else if (strcasecmp(key, "DSM_LOG_LEVEL") == 0 || strcasecmp(key, "LOG_LEVEL") == 0) {
             mask = KEY_LOG_LEVEL;
             strncpy(cfg->log_level, val, sizeof(cfg->log_level) - 1);
@@ -571,8 +600,31 @@ int config_validate(dsm_config_t *cfg)
         return DSM_ERR_CONFIG;
     }
 
-    if (cfg->redundancy_raid5) {
-        DSM_LOG_ERR("RAID5 no esta soportado (desactive con REDUNDANCY = NONE)");
+    if (cfg->raid_k < 2 || cfg->raid_k > 8) {
+        DSM_LOG_ERR("RAID_K debe estar entre 2 y 8");
+        return DSM_ERR_CONFIG;
+    }
+
+    /* RAID5 necesita K custodios de datos y al menos una ranura mas para la
+     * paridad; con menos nodos la franja no puede formarse. */
+    if (cfg->redundancy_raid5 && cfg->max_runtime_nodes < cfg->raid_k + 1u) {
+        DSM_LOG_ERR("RAID5 requiere MAX_RUNTIME_NODES >= RAID_K + 1 (%u)",
+                    cfg->raid_k + 1u);
+        return DSM_ERR_CONFIG;
+    }
+
+    if (cfg->chunk_pages < 1) {
+        DSM_LOG_ERR("CHUNK_PAGES debe ser al menos 1");
+        return DSM_ERR_CONFIG;
+    }
+
+    if (cfg->wait_pool_entries < 1) {
+        DSM_LOG_ERR("WAIT_POOL_ENTRIES debe ser al menos 1");
+        return DSM_ERR_CONFIG;
+    }
+
+    if (cfg->dist_timeout_ms == 0) {
+        DSM_LOG_ERR("DIST_TIMEOUT_MS debe ser mayor que cero");
         return DSM_ERR_CONFIG;
     }
 
@@ -604,6 +656,13 @@ int config_validate(dsm_config_t *cfg)
     return DSM_OK;
 }
 
+/**
+ * @brief Libera los recursos de una configuración cargada.
+ *
+ * La estructura no tiene miembros dinámicos: todas las cadenas y arreglos son
+ * de longitud fija y viven dentro de @p cfg. No hay recursos que liberar, por
+ * lo que la función no realiza ninguna operación.
+ */
 void config_free(dsm_config_t *cfg)
 {
     (void)cfg;
@@ -628,6 +687,11 @@ void config_dump(const dsm_config_t *cfg)
                  cfg->worker_threads, cfg->dispatcher_threads);
     DSM_LOG_INFO("  HOME_SLACK        = %u.%03u",
                  cfg->home_slack_permille / 1000, cfg->home_slack_permille % 1000);
+    DSM_LOG_INFO("  RAID_K            = %u", cfg->raid_k);
+    DSM_LOG_INFO("  CHUNK_PAGES       = %u", cfg->chunk_pages);
+    DSM_LOG_INFO("  WAIT_POOL_ENTRIES = %u", cfg->wait_pool_entries);
+    DSM_LOG_INFO("  OUTPUT_DIR        = %s", cfg->output_dir);
+    DSM_LOG_INFO("  DIST_TIMEOUT_MS   = %u", cfg->dist_timeout_ms);
     DSM_LOG_INFO("  MODO_PROCESO      = %s", cfg->client_mode ? "cliente" : "nodo");
     DSM_LOG_INFO("  RAW_HASH          = 0x%08X", cfg->raw_hash);
 }

@@ -99,6 +99,10 @@ enum dsm_msg_type {
 
     MSG_QUERY_REQ        = 0x40,
     MSG_QUERY_RESP       = 0x41,
+
+    MSG_DIST_RUN         = 0x50,
+    MSG_DIST_DONE        = 0x51,
+
     MSG_NACK             = 0x7F
 };
 
@@ -145,6 +149,84 @@ typedef struct {                 /* 72 B */
 } dir_entry_t;
 
 #define DSM_DIR_ENTRY_LEN 72u
+
+/* --- Ejecución distribuida (DIST_RUN / DIST_DONE) ---
+ *
+ * El coordinador envía DIST_RUN con el rango de direcciones y el plazo de la
+ * partición. Cada nodo responde DIST_DONE con el resultado del trabajo.
+ * Los campos se serializan en el orden indicado por los desplazamientos de
+ * dsm_pack_dist_run y dsm_pack_dist_done, nunca con memcpy de la estructura. */
+
+/* 48 B exactos en el cable */
+typedef struct {
+    uint64_t src_va;
+    uint64_t dst_va;
+    uint64_t nbytes;
+    uint32_t job;
+    uint32_t kernel;
+    uint32_t part_id;
+    uint32_t nparts;
+    uint32_t deadline_ms;
+    uint32_t launch_seq;
+} dist_run_wire_t;
+
+#define DSM_DIST_RUN_WIRE_LEN 48u
+
+/* 44 B exactos en el cable */
+typedef struct {
+    uint32_t job;
+    uint32_t part_id;
+    uint32_t status;
+    uint32_t items;
+    uint64_t crc;
+    uint64_t us;
+    uint32_t launch_seq;
+    uint32_t faults_r;
+    uint32_t faults_w;
+} dist_done_wire_t;
+
+#define DSM_DIST_DONE_WIRE_LEN 44u
+
+/* --- Paridad y migración de páginas --- */
+
+/* 76 B exactos en el cable: identificador, K, custodio de paridad y las
+ * listas de páginas y custodios de hasta ocho miembros de datos. */
+typedef struct {
+    uint32_t stripe_id;
+    uint8_t  k;
+    uint8_t  reserved[3];
+    uint32_t parity_slot;
+    uint32_t data_page[8];
+    uint32_t data_slot[8];
+} stripe_wire_t;
+
+#define DSM_STRIPE_WIRE_LEN      76u
+#define DSM_STRIPE_DATA_SLOTS    8u
+
+/* Cabecera de PARITY_DELTA; el vector XOR ocupa page_size bytes más */
+typedef struct {
+    uint32_t stripe_id;
+} parity_delta_wire_t;
+
+#define DSM_PARITY_DELTA_HDR_LEN 4u
+#define DSM_PARITY_DELTA_WIRE_LEN(ps) (DSM_PARITY_DELTA_HDR_LEN + (uint32_t)(ps))
+
+/* Palabra de 4 B compartida por PARITY_ACK, STRIPE_PUT_ACK, STATE_REPORT
+ * y DIR_DONE. En el ACK transporta el identificador de la franja. */
+typedef struct {
+    uint32_t value;
+} wire_word_t;
+
+#define DSM_WIRE_WORD_LEN        4u
+
+/* 8 B exactos en el cable */
+typedef struct {
+    uint32_t stripe_id;
+    uint8_t  kind;
+    uint8_t  reserved[3];
+} stripe_read_wire_t;
+
+#define DSM_STRIPE_READ_WIRE_LEN 8u
 
 /* --- Consultas de diagnóstico (QUERY_REQ / QUERY_RESP) ---
  *
@@ -224,12 +306,34 @@ typedef struct {
     alloc_rec_t allocs[64];
 } welcome_t;
 
+/* Tamano maximo del WELCOME en el cable: cabecera, todas las membresias y
+ * todas las reservas que caben en welcome_t. Dimensiona el bufer del
+ * respondedor para que ningun cluser legible quede sin respuesta. */
+#define DSM_WELCOME_WIRE_MAX \
+    (28u + (size_t)MAX_NODES * DSM_MEMBERSHIP_WIRE_LEN + 4u + \
+     64u * DSM_ALLOC_REC_LEN)
+
 /* Verificaciones estáticas de estructura en memoria */
 _Static_assert(sizeof(msg_header_t)  == 64, "msg_header_t debe ser 64 B");
 _Static_assert(_Alignof(msg_header_t) == 8,  "msg_header_t debe alinear a 8");
 _Static_assert(sizeof(membership_wire_t) == 40, "membership_wire_t en memoria debe ser 40 B");
 _Static_assert(sizeof(alloc_rec_t)  == 24, "alloc_rec_t debe ser 24 B");
 _Static_assert(sizeof(dir_entry_t)  == 72, "dir_entry_t debe ser 72 B");
+_Static_assert(DSM_DIST_RUN_WIRE_LEN == 48u, "DIST_RUN debe ser 48 B en el cable");
+_Static_assert(sizeof(dist_run_wire_t) == DSM_DIST_RUN_WIRE_LEN, "dist_run_wire_t debe ser 48 B");
+_Static_assert(DSM_DIST_DONE_WIRE_LEN == 44u, "DIST_DONE debe ser 44 B en el cable");
+/* En memoria la estructura acolchada a 8 bytes ocupa 48: el cable usa los
+ * desplazamientos exactos de dsm_pack_dist_done, nunca sizeof. */
+_Static_assert(sizeof(dist_done_wire_t) >= DSM_DIST_DONE_WIRE_LEN,
+               "dist_done_wire_t debe cubrir la carga de DIST_DONE");
+_Static_assert(DSM_STRIPE_WIRE_LEN == 76u, "STRIPE_PUT debe ser 76 B en el cable");
+_Static_assert(sizeof(stripe_wire_t) == DSM_STRIPE_WIRE_LEN, "stripe_wire_t debe ser 76 B");
+_Static_assert(DSM_PARITY_DELTA_HDR_LEN == 4u, "la cabecera de PARITY_DELTA debe ser 4 B");
+_Static_assert(sizeof(parity_delta_wire_t) == DSM_PARITY_DELTA_HDR_LEN, "parity_delta_wire_t debe ser 4 B");
+_Static_assert(DSM_WIRE_WORD_LEN == 4u, "la palabra de estado debe ser 4 B");
+_Static_assert(sizeof(wire_word_t) == DSM_WIRE_WORD_LEN, "wire_word_t debe ser 4 B");
+_Static_assert(DSM_STRIPE_READ_WIRE_LEN == 8u, "STRIPE_READ debe ser 8 B en el cable");
+_Static_assert(sizeof(stripe_read_wire_t) == DSM_STRIPE_READ_WIRE_LEN, "stripe_read_wire_t debe ser 8 B");
 
 /* --- Funciones de serialización y validación --- */
 
@@ -275,6 +379,40 @@ void   dsm_unpack_node_rec(const uint8_t in[DSM_NODE_REC_LEN], node_rec_t *n);
 
 size_t dsm_pack_page_rec(const page_rec_t *p, uint8_t out[DSM_PAGE_REC_LEN]);
 void   dsm_unpack_page_rec(const uint8_t in[DSM_PAGE_REC_LEN], page_rec_t *p);
+
+/* Empaquetado de ejecución distribuida */
+size_t dsm_pack_dist_run(const dist_run_wire_t *d, uint8_t out[DSM_DIST_RUN_WIRE_LEN]);
+void   dsm_unpack_dist_run(const uint8_t in[DSM_DIST_RUN_WIRE_LEN], dist_run_wire_t *d);
+size_t dsm_pack_dist_done(const dist_done_wire_t *d, uint8_t out[DSM_DIST_DONE_WIRE_LEN]);
+void   dsm_unpack_dist_done(const uint8_t in[DSM_DIST_DONE_WIRE_LEN], dist_done_wire_t *d);
+
+/* Empaquetado de paridad y migración de páginas */
+size_t dsm_pack_stripe(const stripe_wire_t *s, uint8_t out[DSM_STRIPE_WIRE_LEN]);
+void   dsm_unpack_stripe(const uint8_t in[DSM_STRIPE_WIRE_LEN], stripe_wire_t *s);
+size_t dsm_pack_parity_delta(const parity_delta_wire_t *d, const uint8_t *delta,
+                             uint32_t page_size, uint8_t *out);
+void   dsm_unpack_parity_delta(const uint8_t *in, uint32_t page_size,
+                               parity_delta_wire_t *d, uint8_t *delta);
+size_t dsm_pack_word(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN]);
+void   dsm_unpack_word(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w);
+size_t dsm_pack_parity_ack(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN]);
+void   dsm_unpack_parity_ack(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w);
+size_t dsm_pack_stripe_put_ack(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN]);
+void   dsm_unpack_stripe_put_ack(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w);
+size_t dsm_pack_state_report(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN]);
+void   dsm_unpack_state_report(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w);
+size_t dsm_pack_dir_done(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN]);
+void   dsm_unpack_dir_done(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w);
+size_t dsm_pack_stripe_read(const stripe_read_wire_t *r, uint8_t out[DSM_STRIPE_READ_WIRE_LEN]);
+void   dsm_unpack_stripe_read(const uint8_t in[DSM_STRIPE_READ_WIRE_LEN], stripe_read_wire_t *r);
+size_t dsm_pack_page_payload(const uint8_t *data, uint8_t *out, uint32_t len);
+void   dsm_unpack_page_payload(const uint8_t *in, uint8_t *data, uint32_t len);
+size_t dsm_pack_stripe_data(const uint8_t *data, uint8_t *out, uint32_t len);
+void   dsm_unpack_stripe_data(const uint8_t *in, uint8_t *data, uint32_t len);
+size_t dsm_pack_page_move(const uint8_t *data, uint8_t *out, uint32_t len);
+void   dsm_unpack_page_move(const uint8_t *in, uint8_t *data, uint32_t len);
+size_t dsm_pack_page_move_ack(uint8_t *out);
+void   dsm_unpack_page_move_ack(const uint8_t *in);
 
 /* Empaquetado de WELCOME */
 size_t dsm_pack_welcome(const welcome_t *w, uint8_t *out, size_t max_out);
