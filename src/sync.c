@@ -85,6 +85,8 @@ static dsm_sync_pending_t *sync_pending_add(dsm_ctx_t *ctx, uint8_t kind,
             c->done   = 0;
             c->result = DSM_ERR_TIMEOUT;
             c->active = 1;
+            atomic_fetch_add_explicit(&ctx->ctr.wait_pool_used, 1,
+                                      memory_order_relaxed);
             p = c;
             break;
         }
@@ -98,7 +100,21 @@ static void sync_pending_release(dsm_ctx_t *ctx, dsm_sync_pending_t *p)
     pthread_mutex_lock(&ctx->sync.mu);
     p->active = 0;
     p->done   = 0;
+    atomic_fetch_sub_explicit(&ctx->ctr.wait_pool_used, 1,
+                              memory_order_relaxed);
     pthread_mutex_unlock(&ctx->sync.mu);
+}
+
+/* Registra una espera de acuse identificada por el req_id de la trama enviada. */
+static dsm_sync_pending_t *sync_ack_begin(dsm_ctx_t *ctx, uint32_t req_id)
+{
+    dsm_sync_pending_t *p = sync_pending_add(ctx, DSM_SYNC_WAIT_ACK, 0);
+    if (!p) return NULL;
+
+    pthread_mutex_lock(&ctx->sync.mu);
+    p->req_id = req_id;
+    pthread_mutex_unlock(&ctx->sync.mu);
+    return p;
 }
 
 /*
@@ -315,6 +331,27 @@ static int sync_send_lock_rel(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
     return sync_send_msg(ctx, dst, &hdr, NULL);
 }
 
+/* El PROBE distingue el acuse de una concesion de una liberation ordinaria:
+ * ambos viajan en MSG_LOCK_REL pero solo el segundo suelta el cerrojo. */
+void sync_send_lock_ack(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
+                        uint32_t req_id)
+{
+    msg_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.magic         = DSM_MAGIC;
+    hdr.cluster_id    = ctx->cfg.cluster_id;
+    hdr.proto_version = DSM_PROTO_VERSION;
+    hdr.type          = MSG_LOCK_REL;
+    hdr.src_slot      = ctx->memb.self_slot;
+    hdr.dst_slot      = dst;
+    hdr.req_id        = req_id;
+    hdr.page_id       = id;
+    hdr.epoch         = ctx->memb.epoch;
+    hdr.flags         = DSM_FLAG_PROBE;
+
+    (void)sync_send_msg(ctx, dst, &hdr, NULL);
+}
+
 static int sync_send_barrier_arrive(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
                                     uint32_t n, uint32_t req_id)
 {
@@ -341,7 +378,8 @@ static int sync_send_barrier_arrive(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
 }
 
 static int sync_send_barrier_go(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
-                                uint32_t generation)
+                                uint32_t generation, uint32_t req_id,
+                                uint8_t flags)
 {
     uint8_t payload[4];
     uint32_t gen_net = htonl(generation);
@@ -355,11 +393,76 @@ static int sync_send_barrier_go(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
     hdr.type          = MSG_BARRIER_GO;
     hdr.src_slot      = ctx->memb.self_slot;
     hdr.dst_slot      = dst;
+    hdr.req_id        = req_id;
     hdr.page_id       = id;
     hdr.epoch         = ctx->memb.epoch;
+    hdr.flags         = flags;
     hdr.payload_len   = 4;
 
     return sync_send_msg(ctx, dst, &hdr, payload);
+}
+
+/* Entrega una concesion o un aviso de barrera y reenvia como maximo
+ * REQUEST_RETRIES veces si el destinatario no confirma antes del plazo. El
+ * plazo total sigue siendo LOCK_TIMEOUT_MS. */
+static int sync_deliver_grant(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
+                              uint32_t req_id)
+{
+    dsm_sync_pending_t *ack = sync_ack_begin(ctx, req_id);
+    if (!ack) return sync_send_lock_grant(ctx, dst, id, req_id);
+
+    uint32_t limit = sync_timeout_ms(ctx);
+    uint32_t retries = ctx->cfg.request_retries ? ctx->cfg.request_retries : 1u;
+    if (retries > DSM_MAX_REQUEST_RETRIES) retries = DSM_MAX_REQUEST_RETRIES;
+
+    uint64_t start = mono_ms();
+    int rc = DSM_ERR_TIMEOUT;
+    for (uint32_t attempt = 0; attempt < retries; attempt++) {
+        if (sync_send_lock_grant(ctx, dst, id, req_id) != DSM_OK) {
+            rc = DSM_ERR_NET;
+            break;
+        }
+        uint64_t elapsed = mono_ms() - start;
+        if (elapsed >= limit) {
+            rc = DSM_ERR_TIMEOUT;
+            break;
+        }
+        rc = sync_pending_wait(ctx, ack, (uint32_t)(limit - elapsed));
+        if (rc == DSM_OK) break;
+    }
+    sync_pending_release(ctx, ack);
+    return rc;
+}
+
+static int sync_deliver_barrier_go(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
+                                   uint32_t generation, uint32_t req_id)
+{
+    dsm_sync_pending_t *ack = sync_ack_begin(ctx, req_id);
+    if (!ack) {
+        return sync_send_barrier_go(ctx, dst, id, generation, req_id, 0);
+    }
+
+    uint32_t limit = sync_timeout_ms(ctx);
+    uint32_t retries = ctx->cfg.request_retries ? ctx->cfg.request_retries : 1u;
+    if (retries > DSM_MAX_REQUEST_RETRIES) retries = DSM_MAX_REQUEST_RETRIES;
+
+    uint64_t start = mono_ms();
+    int rc = DSM_ERR_TIMEOUT;
+    for (uint32_t attempt = 0; attempt < retries; attempt++) {
+        if (sync_send_barrier_go(ctx, dst, id, generation, req_id, 0) != DSM_OK) {
+            rc = DSM_ERR_NET;
+            break;
+        }
+        uint64_t elapsed = mono_ms() - start;
+        if (elapsed >= limit) {
+            rc = DSM_ERR_TIMEOUT;
+            break;
+        }
+        rc = sync_pending_wait(ctx, ack, (uint32_t)(limit - elapsed));
+        if (rc == DSM_OK) break;
+    }
+    sync_pending_release(ctx, ack);
+    return rc;
 }
 
 /* --- Peticiones de cerrojo en la tabla de red --- */
@@ -371,6 +474,7 @@ static void sync_net_pending_add(dsm_ctx_t *ctx, pending_req_t *pending)
     pthread_mutex_lock(&ctx->net.pending_mu);
     pending->next = ctx->net.pending[bucket];
     ctx->net.pending[bucket] = pending;
+    atomic_fetch_add_explicit(&ctx->ctr.pending_count, 1, memory_order_relaxed);
     pthread_mutex_unlock(&ctx->net.pending_mu);
 }
 
@@ -383,6 +487,8 @@ static void sync_net_pending_del(dsm_ctx_t *ctx, pending_req_t *pending)
     while (*link) {
         if (*link == pending) {
             *link = pending->next;
+            atomic_fetch_sub_explicit(&ctx->ctr.pending_count, 1,
+                                      memory_order_relaxed);
             break;
         }
         link = &(*link)->next;
@@ -398,6 +504,21 @@ static dsm_sync_held_t *sync_held_find_locked(dsm_ctx_t *ctx, uint32_t id)
     for (int i = 0; i < DSM_MAX_HELD; i++) {
         dsm_sync_held_t *h = &ctx->sync.held[i];
         if (h->active && h->lock_id == id && pthread_equal(h->owner, self)) {
+            return h;
+        }
+    }
+    return NULL;
+}
+
+/* Busca una propiedad por identificador de peticion, sin exigir el hilo
+ * propietario: los grant duplicados los atiende un worker, no el hilo que
+ * adquirio el cerrojo. El req_id identifica la concesion de forma univoca. */
+static dsm_sync_held_t *sync_held_find_req(dsm_ctx_t *ctx, uint32_t id,
+                                           uint32_t req_id)
+{
+    for (int i = 0; i < DSM_MAX_HELD; i++) {
+        dsm_sync_held_t *h = &ctx->sync.held[i];
+        if (h->active && h->lock_id == id && h->req_id == req_id) {
             return h;
         }
     }
@@ -471,7 +592,7 @@ static void sync_lock_handoff(dsm_ctx_t *ctx, dsm_lock_dir_t *e)
             return;
         }
 
-        if (sync_send_lock_grant(ctx, dst, id, req) == DSM_OK) {
+        if (sync_deliver_grant(ctx, dst, id, req) == DSM_OK) {
             return;
         }
 
@@ -735,11 +856,16 @@ static int sync_barrier_arrive(dsm_ctx_t *ctx, uint32_t id, uint32_t n,
         pthread_mutex_unlock(&ctx->sync.mu);
         return DSM_ERR_NO_SPACE;
     }
-    if (b->count == 0) {
+    /* El primer arribo fija el umbral de la ronda. Un participante que anuncie
+     * otro valor no altera el estado de la barrera. */
+    if (b->threshold != 0 && n != b->threshold) {
+        pthread_mutex_unlock(&ctx->sync.mu);
+        return DSM_ERR_INVALID;
+    }
+    if (b->threshold == 0) {
         b->threshold = n;
         memset(b->arrived_map, 0, sizeof(b->arrived_map));
     }
-    if (b->threshold == 0) b->threshold = n;
 
     uint32_t byte = src / 8u;
     uint8_t  bit  = (uint8_t)(1u << (src % 8u));
@@ -767,7 +893,8 @@ static int sync_barrier_arrive(dsm_ctx_t *ctx, uint32_t id, uint32_t n,
     if (!broadcast) return DSM_OK;
 
     for (uint32_t i = 0; i < nrelease; i++) {
-        if (sync_send_barrier_go(ctx, release[i], id, generation) != DSM_OK) {
+        uint32_t req = sync_new_req(ctx);
+        if (sync_deliver_barrier_go(ctx, release[i], id, generation, req) != DSM_OK) {
             DSM_LOG_WARN("No se pudo difundir BARRIER_GO al slot %u", release[i]);
         }
     }
@@ -837,7 +964,7 @@ void sync_on_lock_req(dsm_ctx_t *ctx, const dsm_msg_t *m)
     pthread_mutex_unlock(&ctx->sync.mu);
 
     if (dst != DSM_SLOT_NONE &&
-        sync_send_lock_grant(ctx, dst, id, req) != DSM_OK) {
+        sync_deliver_grant(ctx, dst, id, req) != DSM_OK) {
         pthread_mutex_lock(&ctx->sync.mu);
         if (e->owner_slot == dst && e->owner_req == req) {
             e->owner_slot = DSM_SLOT_NONE;
@@ -850,14 +977,26 @@ void sync_on_lock_req(dsm_ctx_t *ctx, const dsm_msg_t *m)
 
 void sync_on_lock_grant(dsm_ctx_t *ctx, const dsm_msg_t *m)
 {
-    /* El listener completa las concesiones desde la tabla de red. Una
-     * concesion que llega hasta el worker no tiene peticion registrada: el
-     * custodio ya la dio por entregada, asi que se devuelve de inmediato para
-     * que no quede retenida por un solicitante que ya no la espera. */
+    uint32_t id  = m->hdr.page_id;
     uint32_t src = m->hdr.src_slot;
+    uint32_t req = m->hdr.req_id;
 
     if (src >= MAX_NODES || src == ctx->memb.self_slot) return;
-    (void)sync_send_lock_rel(ctx, src, m->hdr.page_id, m->hdr.req_id);
+
+    /* Se acusa siempre para que el custodio deje de reenviar la concesion. */
+    sync_send_lock_ack(ctx, src, id, req);
+
+    /* Un grant duplicado cuyo acuse se perdio encuentra al solicitante ya
+     * despertado y con la propiedad registrada. Devolverlo aqui liberaria en
+     * el custodio un cerrojo que este nodo todavia sostiene. */
+    pthread_mutex_lock(&ctx->sync.mu);
+    int held = (sync_held_find_req(ctx, id, req) != NULL);
+    pthread_mutex_unlock(&ctx->sync.mu);
+
+    if (!held) {
+        /* Concesion huerfana: sin propiedad local ni peticion pendiente. */
+        (void)sync_send_lock_rel(ctx, src, id, req);
+    }
 }
 
 void sync_on_lock_rel(dsm_ctx_t *ctx, const dsm_msg_t *m)
@@ -868,6 +1007,10 @@ void sync_on_lock_rel(dsm_ctx_t *ctx, const dsm_msg_t *m)
     int released = 0;
 
     if (src >= MAX_NODES) return;
+    if (m->hdr.flags & DSM_FLAG_PROBE) {
+        sync_pending_wake_req(ctx, req, DSM_OK);
+        return;
+    }
 
     pthread_mutex_lock(&ctx->sync.mu);
     dsm_lock_dir_t *e = sync_lock_slot(ctx, id, 0);
@@ -908,9 +1051,46 @@ void sync_on_barrier_go(dsm_ctx_t *ctx, const dsm_msg_t *m)
         gen = ntohl(gen_net);
     }
 
+    if (m->hdr.flags & DSM_FLAG_PROBE) {
+        sync_pending_wake_req(ctx, m->hdr.req_id, DSM_OK);
+        return;
+    }
+
+    (void)sync_send_barrier_go(ctx, m->hdr.src_slot, m->hdr.page_id, gen,
+                               m->hdr.req_id, DSM_FLAG_PROBE);
     /* El aviso corresponde a la ronda 'gen': libera a los participantes que
      * esperan una generacion anterior y deja intactas las esperas posteriores. */
     sync_pending_wake_barrier(ctx, m->hdr.page_id, gen + 1);
+}
+
+void sync_ack_received(dsm_ctx_t *ctx, uint32_t req_id)
+{
+    sync_pending_wake_req(ctx, req_id, DSM_OK);
+}
+
+/* --- Reasignación tras una baja --- */
+
+/* Los cerrojos cuyo custodio era el nodo caido pasan al nuevo custodio del
+ * anillo, con la cola de espera reiniciada. */
+void sync_on_node_down(dsm_ctx_t *ctx, uint32_t slot)
+{
+    if (!ctx || slot >= MAX_NODES) return;
+
+    pthread_mutex_lock(&ctx->sync.mu);
+    for (uint32_t i = 0; i < DSM_LOCK_SLOTS; i++) {
+        dsm_lock_dir_t *e = &ctx->sync.locks[i];
+        if (!e->used) continue;
+
+        uint32_t home = ring_home_of(ctx, e->lock_id);
+        if (home == DSM_SLOT_NONE || home == slot) continue;
+
+        e->owner_slot = home;
+        e->owner_req  = 0;
+        e->head = 0;
+        e->tail = 0;
+        e->count = 0;
+    }
+    pthread_mutex_unlock(&ctx->sync.mu);
 }
 
 /* --- Ciclo de vida --- */

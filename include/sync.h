@@ -43,7 +43,8 @@ typedef struct {
 /* Clase de espera registrada en la tabla de peticiones en vuelo */
 enum dsm_sync_wait_kind {
     DSM_SYNC_WAIT_LOCK    = 1,
-    DSM_SYNC_WAIT_BARRIER = 2
+    DSM_SYNC_WAIT_BARRIER = 2,
+    DSM_SYNC_WAIT_ACK     = 3
 };
 
 typedef struct {
@@ -91,5 +92,9 @@ void sync_on_lock_grant(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void sync_on_lock_rel(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void sync_on_barrier_arrive(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void sync_on_barrier_go(dsm_ctx_t *ctx, const dsm_msg_t *m);
+void sync_on_node_down(dsm_ctx_t *ctx, uint32_t slot);
+void sync_send_lock_ack(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
+                        uint32_t req_id);
+void sync_ack_received(dsm_ctx_t *ctx, uint32_t req_id);
 
 #endif /* DSM_SYNC_H */
