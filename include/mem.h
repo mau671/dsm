@@ -16,7 +16,10 @@ typedef struct {
     uint8_t  reserved;
     uint32_t version;
     uint32_t tseq_seen;
-    uint32_t wait_head;      /* Cabeza de hilos locales esperando */
+    /** Proceso que reservó esta página con dsm_alloc(); 0 si está libre. */
+    uint32_t pid;
+    /** Índice de la página dentro del bloque reservado (0..npages-1). */
+    uint32_t order;
 } page_local_t;
 
 /* Estado del marco de respaldo de una página. DSM_BACKING_VALID contiene la
@@ -40,11 +43,11 @@ typedef struct dsm_mem {
     pthread_mutex_t  frames_mu;      /* Protege frames, backing_state y frame_used */
     page_local_t    *local;          /* npages entradas de estado */
     /*
-     * El estado MSI de cada página se protege con un semáforo POSIX por
-     * stripe, inicializado en uno, de modo que la tabla de estados usa la
-     * primitiva que el enunciado exige. El directorio, que guarda el owner y
-     * la lista de copias, se protege con un mutex, porque ahí la exclusión es
-     * sobre índices y mapas de bits y no sobre un contador.
+     * El estado MSI de cada página se protege con un semáforo binario por
+     * franja porque la exclusión protege un contador (tseq_seen). El
+     * directorio, que guarda el owner y la lista de copias, se protege con un
+     * mutex, porque ahí la exclusión es sobre índices y mapas de bits y no
+     * sobre un contador.
      */
     sem_t           *stripe_sems;    /* Un semáforo por stripe, valor inicial 1 */
     uint32_t         nstripes;

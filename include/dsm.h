@@ -26,6 +26,17 @@
  * determinista por identificador: el nodo que el anillo de dispersión asigna
  * al cerrojo o a la barrera mantiene su estado y el resto le pide la
  * concesión. La propiedad de un cerrojo es por hilo.
+ *
+ * @note Los fallos de página concurrentes sobre una misma página se coordinan
+ * con una cola FIFO por página: la solicitud que llega durante una transición
+ * en curso se encola y aguarda en una variable de condición hasta que la
+ * transición termina, con plazo LOCK_TIMEOUT_MS. No hay rechazos por sondeo ni
+ * esperas de duración fija; cada finalización despierta a todos los
+ * esperadores de la página para que reintenten una sola vez. Si el dueño
+ * remoto de una copia modificada murió, el home responde con un rechazo
+ * terminal que se traduce a DSM_ERR_NODE_DOWN: la página no es servible hasta
+ * que la recuperación de baja reasigne el directorio, y el hilo de aplicación
+ * vuelve a fallar al reacceder. Ese estado nunca se reencola como BUSY.
  */
 
 #ifdef __cplusplus
@@ -130,18 +141,28 @@ dsm_status_t dsm_thread_detach(void);
  *
  * Asigna un bloque contiguo de páginas dentro de la vista DSM del nodo local y
  * devuelve su dirección virtual base. El tamaño se redondea hacia arriba a un
- * múltiplo del tamaño de página configurado. La búsqueda es first-fit: primero
- * recorre la lista de huecos que dejaron las liberaciones previas y toma el
- * primer rango que alcanza el tamaño pedido, partiendo el sobrante si el hueco
- * es mayor; solo si ningún hueco encaja avanza el cursor de asignación sobre
- * las páginas que nunca se reservaron. La reserva es local al nodo: no
- * coordina la asignación con otros nodos ni notifica el bloque al cluster,
- * salvo la petición coordinada que se incorporará en una fase posterior. La
- * llamada es segura entre hilos del mismo proceso.
+ * múltiplo del tamaño de página configurado. La asignación se coordina con el
+ * resto del clúster: el nodo vivo de menor ranura mantiene el mapa global de la
+ * vista y entrega rangos únicos; los demás nodos le piden el rango por red. Si
+ * el llamador es el coordinador, la búsqueda es first-fit sobre los huecos que
+ * dejaron las liberaciones previas y solo después avanza el cursor de
+ * asignación. La llamada es segura entre hilos del mismo proceso.
  *
- * Cada reserva ocupa una entrada de la tabla interna de bloques vivos, de
- * capacidad acotada. Un bloque liberado con dsm_free() deja libre su entrada y
- * puede volver a entregarse a otra reserva.
+ * Cada página del bloque queda anotada con el PID del proceso y con su índice
+ * dentro del bloque (orden), datos que exponen dsmctl y los informes. Cada
+ * reserva ocupa una entrada de la tabla interna de bloques vivos, de capacidad
+ * acotada. Un bloque liberado con dsm_free() deja libre su entrada y puede
+ * volver a entregarse a otra reserva.
+ *
+ * Si el coordinador no responde, la llamada devuelve DSM_ERR_NET: no hay una
+ * reserva local silenciosa que pueda colisionar con la de otro nodo.
+ *
+ * Todos los nodos mapean la vista en la misma dirección base, pero el mapa
+ * global entrega rangos distintos a cada reserva. Dos procesos que llaman a
+ * dsm_alloc() no obtienen el mismo bloque: para compartir memoria, el creador
+ * debe comunicar a los demás la dirección virtual que recibió y ellos usan esa
+ * dirección dentro de su propia vista. La dirección es válida en todo el
+ * clúster porque la vista se mapea con BASE_ADDR idéntica en cada nodo.
  *
  * @param size Cantidad de bytes a reservar. Debe ser mayor que 0.
  * @param out Puntero de salida donde se escribe la dirección virtual base del
@@ -149,25 +170,30 @@ dsm_status_t dsm_thread_detach(void);
  * @return DSM_OK en éxito; DSM_ERR_NOT_INIT si el subsistema no está
  *         inicializado; DSM_ERR_INVALID si @p out es NULL o @p size es 0;
  *         DSM_ERR_NO_SPACE si el bloque no cabe en las páginas de la vista ni
- *         en ningún hueco libre, o si la tabla de bloques vivos está llena.
+ *         en ningún hueco libre, o si la tabla de bloques vivos está llena;
+ *         DSM_ERR_NET si el coordinador no responde a la petición de rango;
+ *         DSM_ERR_AGAIN si la respuesta proviene de un nodo que ya no es el
+ *         coordinador; DSM_ERR_BUSY si el coordinador aún no reconstruyó el
+ *         mapa global tras un relevo; DSM_ERR_PROTO si la respuesta del
+ *         coordinador no describe un rango válido dentro de la vista.
  */
 dsm_status_t dsm_alloc(uint64_t size, void **out);
 
 /**
  * @brief Liberación de memoria reservada con dsm_alloc().
  *
- * Devuelve el bloque al espacio libre del nodo y lo deja disponible para una
- * reserva posterior. La llamada valida que @p ptr sea la dirección base de un
- * bloque vivo de la vista, que esté alineado a página y que @p size redondee
- * al mismo número de páginas con que se reservó; si alguna condición falla
- * devuelve DSM_ERR_INVALID sin modificar el estado. En éxito, todas las
- * páginas del bloque quedan en estado Invalid y sin permisos de acceso,
- * marcadas como inaccesibles para que la próxima reserva que las ocupe no
- * observe el contenido anterior, y el rango se anexa a la lista de huecos,
- * fusionándose con los rangos contiguos que ya estuvieran libres.
+ * Devuelve el bloque al espacio libre y lo deja disponible para una reserva
+ * posterior. La llamada valida que @p ptr sea la dirección base de un bloque
+ * vivo de la vista, que esté alineado a página y que @p size redondee al mismo
+ * número de páginas con que se reservó; si alguna condición falla devuelve
+ * DSM_ERR_INVALID sin modificar el estado. En éxito, todas las páginas del
+ * bloque quedan en estado Invalid y sin permisos de acceso, marcadas como
+ * inaccesibles para que la próxima reserva que las ocupe no observe el
+ * contenido anterior, y se limpian el PID y el orden anotados en dsm_alloc().
  *
- * La liberación es local al nodo, igual que la reserva. Cada llamada consume
- * una entrada de la lista de huecos, de capacidad acotada.
+ * El rango se libera en el mapa global del coordinador y en la copia local del
+ * nodo. Si el coordinador no confirma la liberación, el bloque sigue vivo y la
+ * llamada devuelve DSM_ERR_NET para que pueda reintentarse.
  *
  * @param ptr Dirección base devuelta por dsm_alloc(). No puede ser NULL.
  * @param size Cantidad de bytes del bloque. Debe coincidir, tras redondear a
@@ -175,7 +201,12 @@ dsm_status_t dsm_alloc(uint64_t size, void **out);
  * @return DSM_OK en éxito; DSM_ERR_NOT_INIT si el subsistema no está
  *         inicializado; DSM_ERR_INVALID si @p ptr es NULL, no pertenece a la
  *         vista, está desalineado, no corresponde a un bloque vivo o @p size
- *         no coincide; DSM_ERR_NO_SPACE si la lista de huecos está llena.
+ *         no coincide; DSM_ERR_NO_SPACE si el mapa global no admite más
+ *         huecos; DSM_ERR_NET si el coordinador no responde o la página no se
+ *         pudo persistir en su custodio; DSM_ERR_AGAIN si la respuesta
+ *         proviene de un nodo que ya no es el coordinador; DSM_ERR_BUSY si
+ *         alguna página del bloque tiene una transición de coherencia en
+ *         curso o una copia remota no pudo invalidarse.
  */
 dsm_status_t dsm_free(void *ptr, uint64_t size);
 
@@ -203,8 +234,10 @@ dsm_status_t dsm_sync(void);
  * hilo espera MSG_LOCK_GRANT con un plazo de LOCK_TIMEOUT_MS. La propiedad se
  * registra por hilo, de modo que dos hilos del mismo nodo quedan serializados
  * igual que dos nodos distintos. Si el hilo poseedor termina sin liberar, el
- * cerrojo permanece retenido hasta LOCK_TIMEOUT_MS; no hay herencia ni
- * detección de muerte del poseedor.
+ * cerrojo permanece retenido hasta LOCK_TIMEOUT_MS. Al caer el custodio, los
+ * nodos supervivientes migran la propiedad y la cola al nuevo custodio; si el
+ * dueño también cayó, el cerrojo queda libre y se concede al primero de la
+ * cola. Las concesiones de una época anterior se descartan.
  *
  * @param lock_id Identificador del cerrojo.
  * @return DSM_OK si el cerrojo quedó adquirido; DSM_ERR_NOT_INIT si el
@@ -240,7 +273,8 @@ dsm_status_t dsm_unlock(uint32_t lock_id);
  * @param barrier_id Identificador de la barrera.
  * @param n Cantidad de participantes esperados. Debe ser mayor que cero.
  * @return DSM_OK si la ronda se cerró; DSM_ERR_NOT_INIT si el subsistema no
- *         está inicializado; DSM_ERR_INVALID si @p n es cero; DSM_ERR_TIMEOUT
+ *         está inicializado; DSM_ERR_INVALID si @p n es cero o no coincide
+ *         con el umbral ya fijado por el custodio; DSM_ERR_TIMEOUT
  *         si no llegan todos los participantes dentro del plazo;
  *         DSM_ERR_NO_SPACE si se agotan las entradas locales de espera o las
  *         ranuras de barrera del custodio; DSM_ERR_NET si el enlace con el
@@ -249,6 +283,16 @@ dsm_status_t dsm_unlock(uint32_t lock_id);
 dsm_status_t dsm_barrier(uint32_t barrier_id, uint32_t n);
 
 /* --- Ejecución distribuida --------------------------------------------- */
+
+/**
+ * Kernel de demostración disponible en todos los nodos.
+ *
+ * Copia @c nbytes desde la dirección de origen a la de destino de la
+ * partición; si @c src_va es cero, rellena el destino con ceros. El resultado
+ * informa en @c items la cantidad de bytes procesados y el CRC32 lo calcula
+ * el nodo trabajador sobre el rango de salida.
+ */
+#define DSM_DIST_KERNEL_DEMO UINT32_C(0xD15D0001)
 
 /**
  * @brief Descriptor de una partición de una ejecución distribuida.
@@ -311,7 +355,12 @@ typedef void (*dsm_dist_kernel_fn)(void *arg, const dsm_dist_part_t *part,
  * Asocia @p kernel_id con la función @p fn y con el argumento opaco @p arg,
  * que se entrega a cada invocación del kernel. Registrar un identificador ya
  * existente reemplaza su función y su argumento. El registro es local al nodo
- * y no se propaga al resto del cluster.
+ * y no se propaga al resto del cluster: el coordinador solo envía el
+ * identificador de la partición, nunca el código. Por eso, un kernel debe
+ * estar compilado en cada nodo que lo ejecute o registrado por la aplicación
+ * en ese nodo después de dsm_init(). La biblioteca registra en todos los nodos
+ * el kernel de demostración DSM_DIST_KERNEL_DEMO, de modo que un daemon sin
+ * kernels de aplicación puede atender una copia o un CRC de rango.
  *
  * @param kernel_id Identificador del kernel.
  * @param fn Función a registrar. No puede ser NULL.
@@ -424,7 +473,8 @@ dsm_status_t dsm_node_id(uint32_t *out);
  *
  * Recorre la tabla de membresía y cuenta las ranuras presentes cuyo estado no
  * es DSM_NODE_DEAD, es decir, las ranuras ALIVE y SUSPECT. El nodo local se
- * incluye en el conteo.
+ * incluye en el conteo. Quedan fuera los clientes y las ranuras que no
+ * aportan memoria al clúster.
  *
  * @param out Puntero de salida donde se escribe la cantidad de nodos. No puede
  *        ser NULL.
@@ -491,9 +541,12 @@ dsm_status_t dsm_pages_global(uint32_t first, uint32_t max, char *out,
  * Crea un archivo HTML por nodo presente y un archivo global resumen dentro de
  * @p out_dir. El directorio se crea si no existe y el proceso debe tener
  * permisos de escritura. Cada archivo describe la tabla de páginas de su nodo
- * con el propietario, el estado MSI, el copyset y la franja de paridad; el
- * archivo global agrega las tablas de todos los nodos. Los clientes se
- * muestran con su rol y no se cuentan como nodos.
+ * con el propietario, el proceso que reservó cada página, su orden dentro del
+ * bloque, el estado MSI, el copyset y la franja de paridad; el archivo global
+ * agrega las tablas de todos los nodos. Los clientes se muestran con su rol y
+ * no se cuentan como nodos. Solo se consultan las páginas materializadas de la
+ * vista local, de modo que la generación no recorre un millón de páginas sin
+ * datos.
  *
  * @param out_dir Ruta al directorio donde se escriben los informes. Si es NULL
  *        o una cadena vacía se usa OUTPUT_DIR de la configuración.

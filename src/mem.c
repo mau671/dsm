@@ -71,7 +71,20 @@ int dsm_mem_init(dsm_mem_t *m, const dsm_config_t *cfg)
         m->frames[i] = DSM_PAGE_ID_NONE;
         m->backing_state[i] = DSM_BACKING_NONE;
     }
-    pthread_mutex_init(&m->frames_mu, NULL);
+    if (pthread_mutex_init(&m->frames_mu, NULL) != 0) {
+        /* El mutex no llegó a inicializarse: se liberan las estructuras ya
+         * creadas sin destruirlo, igual que el resto de rutas de error. */
+        free(m->backing);
+        free(m->frames);
+        free(m->backing_state);
+        free(m->frame_used);
+        free(m->local);
+        for (uint32_t i = 0; i < m->nstripes; i++) {
+            sem_destroy(&m->stripe_sems[i]);
+        }
+        free(m->stripe_sems);
+        return DSM_ERR_MEM;
+    }
 
     /* Doble mapeo con memfd_create */
     m->memfd = memfd_create("dsm-shared", MFD_CLOEXEC | MFD_ALLOW_SEALING);

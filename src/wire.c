@@ -169,13 +169,7 @@ bool wire_payload_ok(uint16_t type, uint8_t flags, uint32_t len, uint32_t page_s
         return len == 12u; /* incarnation[8] + free_pages[4] */
     case MSG_LEAVE:
     case MSG_NODE_DOWN:
-    case MSG_MEMBERSHIP_REQ:
         return len == 0 || len == 28u;
-    case MSG_MEMBERSHIP_RESP:
-        /* epoch[8] + count[4] + count * membership[36]. Un multiplo de 36
-         * evita que un contador corrupto pase como longitud plausible. */
-        return len >= 12u && len <= DSM_MAX_PAYLOAD &&
-               ((len - 12u) % DSM_MEMBERSHIP_WIRE_LEN) == 0;
     case MSG_PAGE_REQUEST:
     case MSG_DOWNGRADE:
     case MSG_WRITEBACK_ACK:
@@ -204,6 +198,13 @@ bool wire_payload_ok(uint16_t type, uint8_t flags, uint32_t len, uint32_t page_s
         return len == 8u; /* n[4] + generation[4] */
     case MSG_BARRIER_GO:
         return len == 4u; /* generation[4] */
+    case MSG_LOCK_MIGRATE:
+        return len == DSM_LOCK_MIGRATE_WIRE_LEN;
+    case MSG_LOCK_STATE:
+        return len >= DSM_LOCK_STATE_HDR_LEN &&
+               (len - DSM_LOCK_STATE_HDR_LEN) % DSM_LOCK_STATE_REC_LEN == 0 &&
+               (len - DSM_LOCK_STATE_HDR_LEN) / DSM_LOCK_STATE_REC_LEN <=
+                   DSM_LOCK_STATE_MAX_RECS;
     case MSG_DIST_RUN:
         return len == DSM_DIST_RUN_WIRE_LEN;
     case MSG_DIST_DONE:
@@ -226,6 +227,11 @@ bool wire_payload_ok(uint16_t type, uint8_t flags, uint32_t len, uint32_t page_s
         return len == DSM_STRIPE_WIRE_LEN;
     case MSG_STRIPE_READ:
         return len == DSM_STRIPE_READ_WIRE_LEN;
+    case MSG_ALLOC_REQ:
+    case MSG_ALLOC_RESP:
+    case MSG_FREE_REQ:
+    case MSG_FREE_RESP:
+        return len == DSM_ALLOC_MSG_LEN;
     default:
         return len <= DSM_MAX_PAYLOAD;
     }
@@ -439,46 +445,6 @@ void dsm_unpack_word(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w)
     w->value = get_u32(in + 0);
 }
 
-size_t dsm_pack_parity_ack(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN])
-{
-    return dsm_pack_word(w, out);
-}
-
-void dsm_unpack_parity_ack(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w)
-{
-    dsm_unpack_word(in, w);
-}
-
-size_t dsm_pack_stripe_put_ack(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN])
-{
-    return dsm_pack_word(w, out);
-}
-
-void dsm_unpack_stripe_put_ack(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w)
-{
-    dsm_unpack_word(in, w);
-}
-
-size_t dsm_pack_state_report(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN])
-{
-    return dsm_pack_word(w, out);
-}
-
-void dsm_unpack_state_report(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w)
-{
-    dsm_unpack_word(in, w);
-}
-
-size_t dsm_pack_dir_done(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN])
-{
-    return dsm_pack_word(w, out);
-}
-
-void dsm_unpack_dir_done(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w)
-{
-    dsm_unpack_word(in, w);
-}
-
 size_t dsm_pack_stripe_read(const stripe_read_wire_t *r, uint8_t out[DSM_STRIPE_READ_WIRE_LEN])
 {
     put_u32(out + 0, r->stripe_id);
@@ -492,6 +458,25 @@ void dsm_unpack_stripe_read(const uint8_t in[DSM_STRIPE_READ_WIRE_LEN], stripe_r
     r->stripe_id = get_u32(in + 0);
     r->kind      = in[4];
     memcpy(r->reserved, in + 5, 3);
+}
+
+/* --- Coordinación del espacio global de la vista --- */
+
+size_t dsm_pack_alloc_msg(const alloc_msg_t *a, uint8_t out[DSM_ALLOC_MSG_LEN])
+{
+    put_u32(out + 0, a->npages);
+    put_u32(out + 4, a->first_page);
+    put_u32(out + 8, a->status);
+    put_u32(out + 12, a->pid);
+    return DSM_ALLOC_MSG_LEN;
+}
+
+void dsm_unpack_alloc_msg(const uint8_t in[DSM_ALLOC_MSG_LEN], alloc_msg_t *a)
+{
+    a->npages     = get_u32(in + 0);
+    a->first_page = get_u32(in + 4);
+    a->status     = get_u32(in + 8);
+    a->pid        = get_u32(in + 12);
 }
 
 size_t dsm_pack_page_payload(const uint8_t *data, uint8_t *out, uint32_t len)
@@ -524,22 +509,6 @@ void dsm_unpack_stripe_data(const uint8_t *in, uint8_t *data, uint32_t len)
 size_t dsm_pack_page_move(const uint8_t *data, uint8_t *out, uint32_t len)
 {
     return dsm_pack_page_payload(data, out, len);
-}
-
-void dsm_unpack_page_move(const uint8_t *in, uint8_t *data, uint32_t len)
-{
-    dsm_unpack_page_payload(in, data, len);
-}
-
-size_t dsm_pack_page_move_ack(uint8_t *out)
-{
-    (void)out;
-    return 0;
-}
-
-void dsm_unpack_page_move_ack(const uint8_t *in)
-{
-    (void)in;
 }
 
 /* --- Consultas de diagnóstico --- */
@@ -580,6 +549,106 @@ void dsm_unpack_query_resp(const uint8_t in[DSM_QUERY_RESP_HDR_LEN], query_resp_
     r->count    = get_u32(in + 4);
 }
 
+/* --- Estadísticas para dsmctl --- */
+
+size_t dsm_pack_stats(const stats_wire_t *s, uint8_t out[DSM_STATS_WIRE_LEN])
+{
+    put_u64(out +  0, s->read_faults);
+    put_u64(out +  8, s->write_faults);
+    put_u64(out + 16, s->msgs_sent);
+    put_u64(out + 24, s->msgs_recv);
+    put_u64(out + 32, s->bytes_sent);
+    put_u64(out + 40, s->bytes_recv);
+    put_u64(out + 48, s->dist_tasks_run);
+    put_u64(out + 56, s->dist_tasks_failed);
+    put_u64(out + 64, s->parity_deltas);
+    put_u64(out + 72, s->stripe_rebuilds);
+    put_u64(out + 80, s->tseq_discarded);
+    put_u64(out + 88, s->hb_missed);
+    return DSM_STATS_WIRE_LEN;
+}
+
+void dsm_unpack_stats(const uint8_t in[DSM_STATS_WIRE_LEN], stats_wire_t *s)
+{
+    s->read_faults       = get_u64(in +  0);
+    s->write_faults      = get_u64(in +  8);
+    s->msgs_sent         = get_u64(in + 16);
+    s->msgs_recv         = get_u64(in + 24);
+    s->bytes_sent        = get_u64(in + 32);
+    s->bytes_recv        = get_u64(in + 40);
+    s->dist_tasks_run    = get_u64(in + 48);
+    s->dist_tasks_failed = get_u64(in + 56);
+    s->parity_deltas     = get_u64(in + 64);
+    s->stripe_rebuilds   = get_u64(in + 72);
+    s->tseq_discarded    = get_u64(in + 80);
+    s->hb_missed         = get_u64(in + 88);
+}
+
+/* --- Migración de cerrojos --- */
+
+size_t dsm_pack_lock_migrate(const lock_migrate_wire_t *m,
+                             uint8_t out[DSM_LOCK_MIGRATE_WIRE_LEN])
+{
+    put_u64(out + 0, m->epoch);
+    put_u32(out + 8, m->dead_slot);
+    return DSM_LOCK_MIGRATE_WIRE_LEN;
+}
+
+void dsm_unpack_lock_migrate(const uint8_t in[DSM_LOCK_MIGRATE_WIRE_LEN],
+                             lock_migrate_wire_t *m)
+{
+    m->epoch     = get_u64(in + 0);
+    m->dead_slot = get_u32(in + 8);
+}
+
+size_t dsm_pack_lock_state(const lock_state_wire_t *s,
+                           const lock_state_rec_t *recs, uint8_t *out)
+{
+    put_u64(out + 0, s->epoch);
+    put_u32(out + 8, s->dead_slot);
+    put_u32(out + 12, s->slot);
+    put_u32(out + 16, s->count);
+
+    size_t off = DSM_LOCK_STATE_HDR_LEN;
+    for (uint32_t i = 0; i < s->count; i++) {
+        put_u32(out + off + 0, recs[i].lock_id);
+        put_u32(out + off + 4, recs[i].req_id);
+        out[off + 8] = recs[i].owner ? 1u : 0u;
+        out[off + 9] = 0;
+        out[off + 10] = 0;
+        out[off + 11] = 0;
+        off += DSM_LOCK_STATE_REC_LEN;
+    }
+    return off;
+}
+
+int dsm_unpack_lock_state(const uint8_t *in, size_t len,
+                          lock_state_wire_t *s, lock_state_rec_t *recs)
+{
+    if (!in || !s || len < DSM_LOCK_STATE_HDR_LEN) return DSM_ERR_PROTO;
+
+    s->epoch     = get_u64(in + 0);
+    s->dead_slot = get_u32(in + 8);
+    s->slot      = get_u32(in + 12);
+    s->count     = get_u32(in + 16);
+
+    if (s->count > DSM_LOCK_STATE_MAX_RECS ||
+        DSM_LOCK_STATE_HDR_LEN + (size_t)s->count * DSM_LOCK_STATE_REC_LEN != len) {
+        return DSM_ERR_PROTO;
+    }
+    if (!recs && s->count > 0) return DSM_ERR_PROTO;
+
+    size_t off = DSM_LOCK_STATE_HDR_LEN;
+    for (uint32_t i = 0; i < s->count; i++) {
+        recs[i].lock_id = get_u32(in + off + 0);
+        recs[i].req_id  = get_u32(in + off + 4);
+        recs[i].owner   = in[off + 8] ? 1u : 0u;
+        memset(recs[i].reserved, 0, sizeof(recs[i].reserved));
+        off += DSM_LOCK_STATE_REC_LEN;
+    }
+    return DSM_OK;
+}
+
 size_t dsm_pack_node_rec(const node_rec_t *n, uint8_t out[DSM_NODE_REC_LEN])
 {
     put_u32(out + 0, n->slot);
@@ -618,6 +687,8 @@ size_t dsm_pack_page_rec(const page_rec_t *p, uint8_t out[DSM_PAGE_REC_LEN])
     out[13] = p->pend_inval;
     out[14] = p->pend_down;
     out[15] = p->reserved;
+    put_u32(out + 16, p->pid);
+    put_u32(out + 20, p->order);
     return DSM_PAGE_REC_LEN;
 }
 
@@ -630,6 +701,8 @@ void dsm_unpack_page_rec(const uint8_t in[DSM_PAGE_REC_LEN], page_rec_t *p)
     p->pend_inval = in[13];
     p->pend_down  = in[14];
     p->reserved   = in[15];
+    p->pid        = get_u32(in + 16);
+    p->order      = get_u32(in + 20);
 }
 
 size_t dsm_pack_welcome(const welcome_t *w, uint8_t *out, size_t max_out)
@@ -721,8 +794,6 @@ const char *dsm_msg_type_name(uint16_t type)
     case MSG_HEARTBEAT:       return "HEARTBEAT";
     case MSG_LEAVE:           return "LEAVE";
     case MSG_NODE_DOWN:       return "NODE_DOWN";
-    case MSG_MEMBERSHIP_REQ:  return "MEMBERSHIP_REQ";
-    case MSG_MEMBERSHIP_RESP: return "MEMBERSHIP_RESP";
     case MSG_PAGE_MOVE:       return "PAGE_MOVE";
     case MSG_PAGE_MOVE_ACK:   return "PAGE_MOVE_ACK";
     case MSG_PAGE_REQUEST:    return "PAGE_REQUEST";
@@ -747,10 +818,16 @@ const char *dsm_msg_type_name(uint16_t type)
     case MSG_LOCK_REL:        return "LOCK_REL";
     case MSG_BARRIER_ARRIVE:  return "BARRIER_ARRIVE";
     case MSG_BARRIER_GO:      return "BARRIER_GO";
+    case MSG_LOCK_MIGRATE:    return "LOCK_MIGRATE";
+    case MSG_LOCK_STATE:      return "LOCK_STATE";
     case MSG_QUERY_REQ:       return "QUERY_REQ";
     case MSG_QUERY_RESP:      return "QUERY_RESP";
     case MSG_DIST_RUN:        return "DIST_RUN";
     case MSG_DIST_DONE:       return "DIST_DONE";
+    case MSG_ALLOC_REQ:       return "ALLOC_REQ";
+    case MSG_ALLOC_RESP:      return "ALLOC_RESP";
+    case MSG_FREE_REQ:        return "FREE_REQ";
+    case MSG_FREE_RESP:       return "FREE_RESP";
     case MSG_NACK:            return "NACK";
     default:                  return "UNKNOWN";
     }
@@ -763,6 +840,7 @@ bool dsm_msg_is_response(uint16_t type)
             type == MSG_INVALIDATE_ACK || type == MSG_DOWNGRADE_ACK ||
             type == MSG_WRITEBACK_ACK || type == MSG_LOCK_GRANT ||
             type == MSG_QUERY_RESP || type == MSG_DIST_DONE ||
+            type == MSG_ALLOC_RESP || type == MSG_FREE_RESP ||
             type == MSG_NACK);
 }
 
@@ -771,6 +849,5 @@ bool dsm_msg_is_membership(uint16_t type)
     return (type == MSG_HELLO || type == MSG_WELCOME ||
             type == MSG_JOIN || type == MSG_JOIN_ACK ||
             type == MSG_HEARTBEAT || type == MSG_LEAVE ||
-            type == MSG_NODE_DOWN || type == MSG_MEMBERSHIP_REQ ||
-            type == MSG_MEMBERSHIP_RESP);
+            type == MSG_NODE_DOWN);
 }

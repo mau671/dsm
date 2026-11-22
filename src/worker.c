@@ -18,71 +18,98 @@ static void fault_slot_wake(fault_slot_t *slot)
     syscall(SYS_futex, (int *)&slot->done, FUTEX_WAKE, 1, NULL, NULL, 0);
 }
 
-/* Límite de reintentos consecutivos por ranura de fallo: una página cuyo
- * dueño en M murió devuelve BUSY indefinidamente y no debe monopolizar al
- * despachador. Al agotarlos se despierta al hilo de aplicación, que vuelve
- * a fallar y reencolar, y el despachador queda libre para otras páginas. */
+/* Límite de reintentos consecutivos por ranura de fallo. Es la red de
+ * seguridad de la espera bloqueada: una página cuya transacción nunca
+ * señala su fin no debe monopolizar al despachador. Al agotarlo se despierta
+ * al hilo de aplicación, que vuelve a fallar y reencolar, y el despachador
+ * queda libre para otras páginas. */
 #define DSM_FAULT_BUSY_ATTEMPTS 64u
 
 static void *dispatcher_thread_main(void *arg)
 {
     dsm_ctx_t *ctx = (dsm_ctx_t *)arg;
-    uint32_t jitter_seed = (uint32_t)(uintptr_t)pthread_self();
-    if (jitter_seed == 0) jitter_seed = 1;
 
     while (atomic_load(&ctx->running)) {
+        /* La cola de fallos avisa con su semáforo contador: el hilo se
+         * bloquea en faultq_pop y no sondea con suspensiones temporizadas. */
         fault_slot_t *slot = faultq_pop();
         if (!slot) {
-            sleep_ms(1);
             continue;
         }
 
         /*
-         * Localmente el fallo solo puede quedar pendiente si otro despachador
-         * ya lo esta resolviendo; la ranura se libera cuando ese despachador
-         * instala los permisos, asi que se reintenta hasta salir de PEND.
-         * La latencia abarca la resolucion completa, reintentos incluidos.
+         * Un BUSY transitorio significa que otra transición de la página está
+         * en curso. La ranura se encola en la cola FIFO de esa página y el
+         * despachador aguarda en su condvar con plazo LOCK_TIMEOUT_MS; cada
+         * finalización difunde la señal y provoca un solo reintento. No hay
+         * suspensiones de duración fija ni bucles de rechazo.
+         *
+         * El plazo es absoluto para toda la estancia en la cola: al vencer se
+         * devuelve el error una sola vez y se libera la ranura. El tope de
+         * reintentos subsiste como red de seguridad.
+         *
+         * DSM_ERR_NODE_DOWN es la condición terminal del dueño muerto en M:
+         * ningún reintento la resuelve, así que el ciclo no espera ni repite
+         * en ese estado. El hilo de aplicación vuelve a fallar al despertar y
+         * reencolará el acceso; cada ciclo nuevo la rechaza de inmediato.
+         * La latencia abarca la resolución completa, reintentos incluidos.
          */
+        uint32_t timeout_ms = ctx->cfg.lock_timeout_ms
+                                  ? ctx->cfg.lock_timeout_ms : 10000u;
         uint64_t t0 = mono_us();
+        uint64_t deadline_us = 0;
         int rc;
         uint32_t busy_attempts = 0;
         do {
+            uint64_t generation = msi_page_generation(ctx, slot->page);
             rc = msi_local_fault(ctx, slot);
-            if (rc == DSM_ERR_BUSY) {
-                busy_attempts++;
-                if (busy_attempts >= DSM_FAULT_BUSY_ATTEMPTS) {
-                    /* Página atascada (p. ej. dueño muerto en M): se libera
-                     * la ranura sin resolver; el acceso reencolará y otros
-                     * fallos no esperan detrás de esta página. */
-                    DSM_LOG_WARN("Fallo de la página %u sin progreso tras %u "
-                                 "reintentos; se libera la ranura",
-                                 slot->page, busy_attempts);
-                    rc = DSM_ERR_BUSY;
-                    break;
-                }
-                /* Limitación temporal: hasta que exista retry_at diferido,
-                 * este despachador reintenta con jitter sin conservar locks.
-                 * Cada hilo usa su propia semilla; no usa rand() global. */
-                jitter_seed ^= jitter_seed << 13;
-                jitter_seed ^= jitter_seed >> 17;
-                jitter_seed ^= jitter_seed << 5;
-                uint32_t us = 500u + (jitter_seed % 1501u);
-                struct timespec ts;
-                ts.tv_sec = 0;
-                ts.tv_nsec = (long)us * 1000L;
-                while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
-                    /* EINTR conserva el tiempo restante en ts. */
-                }
-            } else {
-                busy_attempts = 0;
+            if (rc != DSM_ERR_BUSY) {
+                break;
             }
-        } while (rc == DSM_ERR_BUSY && atomic_load(&ctx->running));
+            busy_attempts++;
+            if (busy_attempts >= DSM_FAULT_BUSY_ATTEMPTS) {
+                /* Red de seguridad: una página que nunca publica su fin no
+                 * debe monopolizar al despachador. */
+                DSM_LOG_WARN("Fallo de la página %u sin progreso tras %u "
+                             "reintentos; se libera la ranura",
+                             slot->page, busy_attempts);
+                break;
+            }
+            if (deadline_us == 0) {
+                deadline_us = mono_us() + (uint64_t)timeout_ms * 1000u;
+            }
+            uint64_t now = mono_us();
+            if (now >= deadline_us) {
+                rc = DSM_ERR_TIMEOUT;
+                break;
+            }
+            uint32_t remaining_ms = (uint32_t)((deadline_us - now) / 1000u);
+            if (remaining_ms == 0) {
+                rc = DSM_ERR_TIMEOUT;
+                break;
+            }
+            int wait_rc = msi_page_wait(ctx, slot->page, slot, generation,
+                                        remaining_ms);
+            if (wait_rc != DSM_OK) {
+                rc = wait_rc;
+                break;
+            }
+        } while (atomic_load(&ctx->running));
         uint64_t elapsed = mono_us() - t0;
 
         atomic_fetch_add_explicit(&ctx->ctr.fault_latency_us_total, elapsed,
                                   memory_order_relaxed);
         atomic_fetch_add_explicit(&ctx->ctr.faults_serviced, 1,
                                   memory_order_relaxed);
+
+        /* Un dueño muerto en M o una ranura inválida no se resuelven con otro
+         * intento. El motivo se publica en la ranura y el manejador reenvía
+         * SIGSEGV: el fallo termina el proceso en lugar de repetirse. */
+        if (rc == DSM_ERR_NODE_DOWN || rc == DSM_ERR_INVALID) {
+            DSM_LOG_ERR("Fallo terminal en la página %u (acceso %u): %d; se "
+                        "reenvía SIGSEGV al hilo", slot->page, slot->access, rc);
+            __atomic_store_n(&slot->error, (uint16_t)(-rc), __ATOMIC_RELEASE);
+        }
 
         fault_slot_wake(slot);
         atomic_fetch_add_explicit(&ctx->ctr.slots_woken, 1, memory_order_relaxed);
@@ -172,10 +199,12 @@ static void *worker_thread_main(void *arg)
         case MSG_NACK:
             atomic_fetch_add_explicit(&ctx->ctr.nacks_received, 1,
                                       memory_order_relaxed);
-            DSM_LOG_WARN("NACK del slot %u para la peticion %u (pagina %u, "
-                         "estado %u) sin peticion pendiente local",
-                         item->msg.hdr.src_slot, item->msg.hdr.req_id,
-                         item->msg.hdr.page_id, item->msg.hdr.status);
+            if (!sync_on_barrier_nack(ctx, &item->msg)) {
+                DSM_LOG_WARN("NACK del slot %u para la peticion %u (pagina %u, "
+                             "estado %u) sin peticion pendiente local",
+                             item->msg.hdr.src_slot, item->msg.hdr.req_id,
+                             item->msg.hdr.page_id, item->msg.hdr.status);
+            }
             break;
         case MSG_LOCK_REQ:
             sync_on_lock_req(ctx, &item->msg);
@@ -185,6 +214,12 @@ static void *worker_thread_main(void *arg)
             break;
         case MSG_LOCK_GRANT:
             sync_on_lock_grant(ctx, &item->msg);
+            break;
+        case MSG_LOCK_MIGRATE:
+            sync_on_lock_migrate(ctx, &item->msg);
+            break;
+        case MSG_LOCK_STATE:
+            sync_on_lock_state(ctx, &item->msg);
             break;
         case MSG_BARRIER_ARRIVE:
             sync_on_barrier_arrive(ctx, &item->msg);
@@ -197,6 +232,22 @@ static void *worker_thread_main(void *arg)
             break;
         case MSG_DIST_DONE:
             dist_on_done(ctx, &item->msg);
+            break;
+        case MSG_ALLOC_REQ:
+            dsm_alloc_on_request(ctx, &item->msg);
+            break;
+        case MSG_FREE_REQ:
+            dsm_free_on_request(ctx, &item->msg);
+            break;
+        case MSG_WELCOME:
+            /* WELCOME no solicitado: réplica del mapa global del coordinador. */
+            dsm_alloc_on_welcome(ctx, &item->msg);
+            break;
+        case MSG_ALLOC_SYNC:
+            dsm_alloc_on_sync_request(ctx, &item->msg);
+            break;
+        case MSG_ALLOC_STATE:
+            dsm_alloc_on_sync_state(ctx, &item->msg);
             break;
         case MSG_NODE_DOWN:
             /* Mensaje sintético encolado por quien cerró la ranura: la
@@ -223,7 +274,9 @@ int worker_start(dsm_ctx_t *ctx)
 {
     dsm_worker_t *w = &ctx->worker;
     memset(w, 0, sizeof(*w));
-    pthread_mutex_init(&w->mu, NULL);
+    if (pthread_mutex_init(&w->mu, NULL) != 0) {
+        return DSM_ERR_MEM;
+    }
 
     w->cap      = ctx->cfg.worker_queue_cap ? ctx->cfg.worker_queue_cap : 4096;
     w->nthreads = ctx->cfg.worker_threads ? ctx->cfg.worker_threads : 4;

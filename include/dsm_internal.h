@@ -31,6 +31,12 @@ typedef struct {
     uint32_t first_page;
     uint32_t npages;
     uint32_t alloc_id;
+    uint32_t pid;            /* Proceso que hizo la reserva */
+    /**
+     * dsm_free() retiró la entrada de la pila y libera sus páginas fuera del
+     * mutex del mapa. Mientras está en curso, la ranura no se reutiliza.
+     */
+    bool     retiring;
 } alloc_block_t;
 
 /* Rango contiguo de paginas devuelto a la lista de espacio libre por
@@ -43,6 +49,9 @@ typedef struct {
 
 typedef struct {
     pthread_mutex_t mu;
+    /* En el coordinador next_page es la marca de agua del mapa global de la
+     * vista; en un nodo cliente solo conserva la cota superior observada para
+     * no reutilizar rangos ajenos si llega a asumir la coordinación. */
     uint32_t        next_page;
     uint32_t        total_pages;
     uint64_t        epoch;
@@ -51,6 +60,32 @@ typedef struct {
     uint32_t        depth;
     alloc_hole_t    holes[ALLOC_HOLE_MAX];
     uint32_t        nholes;
+    /**
+     * Verdadero cuando esta copia del mapa global conoce la marca de agua y
+     * los huecos vigentes. Un nodo que asume la coordinación sin un mapa
+     * importado sincroniza la marca de agua con los pares vivos o rechaza la
+     * petición; nunca reparte espacio con una vista incompleta.
+     */
+    bool            map_valid;
+    /** Origen y secuencia de la instantánea vigente del mapa. Un WELCOME con
+     *  la misma procedencia y una secuencia menor es una vista atrasada y no
+     *  puede reinsertar huecos que el coordinador ya entregó. */
+    uint32_t        map_origin;
+    uint32_t        map_seq;
+    /** Falso hasta que este nodo, al asumir la coordinación, contrastó su
+     *  marca de agua con los pares vivos. Un coordinador sin sincronizar no
+     *  reparte espacio. */
+    bool            map_synced;
+    /** Respuestas de sincronización que aún se esperan. */
+    uint32_t        map_sync_pending;
+    /** Se señaliza cuando map_sync_pending llega a cero. Comparte mu con el
+     *  contador, de modo que la comprobación y la espera no pierden avisos. */
+    pthread_cond_t  sync_cv;
+    /** Verdadero si esta llamada encontró a este nodo como coordinador vivo
+     *  de menor ranura; falso si el rango se pidió a otro nodo. */
+    bool            coordinator;
+    /** Ranura del coordinador consultado cuando coordinator es falso. */
+    uint32_t        coordinator_slot;
 } dsm_alloc_t;
 
 typedef struct {
@@ -107,5 +142,28 @@ dsm_ctx_t *dsm_ctx_create_test(void);
  * publicas lo resuelvan con dsm_ctx_get(). */
 void        dsm_ctx_install_test(dsm_ctx_t *ctx);
 #endif
+
+/* Manejadores del coordinador para las peticiones de espacio global. Se
+ * ejecutan en un worker a partir de MSG_ALLOC_REQ y MSG_FREE_REQ. */
+void dsm_alloc_on_request(dsm_ctx_t *ctx, const dsm_msg_t *m);
+void dsm_free_on_request(dsm_ctx_t *ctx, const dsm_msg_t *m);
+
+/* Instantánea del mapa global que viaja en WELCOME. Devuelve la cantidad de
+ * registros escritos y deja el mapa intacto si esta copia no es válida. */
+uint32_t dsm_alloc_export(dsm_ctx_t *ctx, alloc_rec_t *recs, uint32_t cap);
+
+/* Incorpora una instantánea recibida en WELCOME. La marca de agua solo avanza
+ * y los huecos se reemplazan por los de la vista vigente; una instantánea
+ * atrasada del mismo origen se descarta. */
+void dsm_alloc_import(dsm_ctx_t *ctx, const alloc_rec_t *recs, uint32_t count);
+
+/* WELCOME no solicitado con la instantánea que el coordinador replica tras
+ * cada cambio del mapa global. */
+void dsm_alloc_on_welcome(dsm_ctx_t *ctx, const dsm_msg_t *m);
+
+/* Sondeo de marca de agua al asumir la coordinación. Cada par responde con su
+ * instantánea y el nuevo coordinador toma el máximo antes de repartir. */
+void dsm_alloc_on_sync_request(dsm_ctx_t *ctx, const dsm_msg_t *m);
+void dsm_alloc_on_sync_state(dsm_ctx_t *ctx, const dsm_msg_t *m);
 
 #endif /* DSM_INTERNAL_H */

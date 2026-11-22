@@ -67,8 +67,6 @@ enum dsm_msg_type {
     MSG_HEARTBEAT        = 0x05,
     MSG_LEAVE            = 0x06,
     MSG_NODE_DOWN        = 0x07,
-    MSG_MEMBERSHIP_REQ   = 0x08,
-    MSG_MEMBERSHIP_RESP  = 0x09,
     MSG_PAGE_MOVE        = 0x0A,
     MSG_PAGE_MOVE_ACK    = 0x0B,
 
@@ -96,12 +94,22 @@ enum dsm_msg_type {
     MSG_LOCK_REL         = 0x32,
     MSG_BARRIER_ARRIVE   = 0x33,
     MSG_BARRIER_GO       = 0x34,
+    MSG_LOCK_MIGRATE     = 0x36,
+    MSG_LOCK_STATE       = 0x37,
 
     MSG_QUERY_REQ        = 0x40,
     MSG_QUERY_RESP       = 0x41,
 
     MSG_DIST_RUN         = 0x50,
     MSG_DIST_DONE        = 0x51,
+
+    MSG_ALLOC_REQ        = 0x60,
+    MSG_ALLOC_RESP       = 0x61,
+    MSG_FREE_REQ         = 0x62,
+    MSG_FREE_RESP        = 0x63,
+    /** Sincronización del mapa global al asumir la coordinación. */
+    MSG_ALLOC_SYNC       = 0x64,
+    MSG_ALLOC_STATE      = 0x65,
 
     MSG_NACK             = 0x7F
 };
@@ -131,6 +139,16 @@ typedef struct {                 /* 24 B */
 } alloc_rec_t;
 
 #define DSM_ALLOC_REC_LEN 24u
+
+/** Tipo de registro de la instantánea del mapa global en WELCOME. */
+enum alloc_rec_kind {
+    /** Bloque vivo transferido con su rango exacto. */
+    DSM_ALLOC_REC_LIVE      = 0u,
+    /** Hueco libre que el coordinador puede reutilizar. */
+    DSM_ALLOC_REC_HOLE      = 1u,
+    /** Marca de agua: first_page es el cursor de asignación. */
+    DSM_ALLOC_REC_WATERMARK = 2u
+};
 
 typedef struct {                 /* 72 B */
     uint32_t page_id;
@@ -228,6 +246,22 @@ typedef struct {
 
 #define DSM_STRIPE_READ_WIRE_LEN 8u
 
+/* --- Coordinación del espacio global de la vista (ALLOC/FREE) ---
+ *
+ * El coordinador del clúster —el nodo vivo de menor ranura— mantiene el mapa
+ * global de reservas sobre el mismo rango de páginas que todos los nodos
+ * mapean en BASE_ADDR. Cliente y coordinador intercambian esta carga útil
+ * idéntica en petición y respuesta; el campo status viaja en la carga y no en
+ * la cabecera para no mezclar rechazos de transporte con rechazos del mapa. */
+typedef struct {
+    uint32_t npages;      /**< Páginas solicitadas o concedidas. */
+    uint32_t first_page;  /**< Primera página concedida, o DSM_PAGE_ID_NONE. */
+    uint32_t status;      /**< dsm_status_code_t del mapa global. */
+    uint32_t pid;         /**< Proceso solicitante, para trazabilidad. */
+} alloc_msg_t;
+
+#define DSM_ALLOC_MSG_LEN 16u
+
 /* --- Consultas de diagnóstico (QUERY_REQ / QUERY_RESP) ---
  *
  * dsmctl no integra la membresía: abre una conexión TCP efímera al puerto de
@@ -283,7 +317,7 @@ typedef struct {
 
 #define DSM_NODE_REC_LEN 52u
 
-/* Registro de la tabla de páginas local: 16 B en el cable */
+/* Registro de la tabla de páginas local: 24 B en el cable */
 typedef struct {
     uint32_t page_id;
     uint32_t home;
@@ -292,9 +326,67 @@ typedef struct {
     uint8_t  pend_inval;
     uint8_t  pend_down;
     uint8_t  reserved;
+    uint32_t pid;     /**< Proceso que reservó la página, 0 si no hay bloque. */
+    uint32_t order;   /**< Índice de la página dentro de su bloque reservado. */
 } page_rec_t;
 
-#define DSM_PAGE_REC_LEN 16u
+#define DSM_PAGE_REC_LEN 24u
+
+/* --- Migración de cerrojos (LOCK_MIGRATE / LOCK_STATE) ---
+ *
+ * Al cerrarse una ranura, quien detecta la baja difunde LOCK_MIGRATE con la
+ * época de sincronización vigente. Cada nodo responde con LOCK_STATE a los
+ * custodios que corresponda, exponiendo los cerrojos que sostiene y las
+ * peticiones que tiene en vuelo. El nuevo custodio reconstruye así la tabla
+ * sin depender del estado volátil del nodo caído. Todos los campos viajan
+ * serializados por separado, nunca con memcpy de la estructura. */
+
+/* 12 B en el cable */
+typedef struct {
+    uint64_t epoch;       /* Época de sincronización, no la de membresía */
+    uint32_t dead_slot;
+} lock_migrate_wire_t;
+
+#define DSM_LOCK_MIGRATE_WIRE_LEN 12u
+
+/* 12 B en el cable por registro */
+typedef struct {
+    uint32_t lock_id;
+    uint32_t req_id;
+    uint8_t  owner;       /* 1 si el emisor es el dueño, 0 si está esperando */
+    uint8_t  reserved[3];
+} lock_state_rec_t;
+
+#define DSM_LOCK_STATE_REC_LEN 12u
+
+/* 20 B en el cable más los registros */
+typedef struct {
+    uint64_t epoch;
+    uint32_t dead_slot;
+    uint32_t slot;        /* Ranura que informa */
+    uint32_t count;       /* Cantidad de registros incluidos */
+} lock_state_wire_t;
+
+#define DSM_LOCK_STATE_HDR_LEN 20u
+#define DSM_LOCK_STATE_MAX_RECS 512u
+
+/* 96 B en el cable: doce contadores de 64 bits para dsmctl stats */
+typedef struct {
+    uint64_t read_faults;
+    uint64_t write_faults;
+    uint64_t msgs_sent;
+    uint64_t msgs_recv;
+    uint64_t bytes_sent;
+    uint64_t bytes_recv;
+    uint64_t dist_tasks_run;
+    uint64_t dist_tasks_failed;
+    uint64_t parity_deltas;
+    uint64_t stripe_rebuilds;
+    uint64_t tseq_discarded;
+    uint64_t hb_missed;
+} stats_wire_t;
+
+#define DSM_STATS_WIRE_LEN 96u
 
 /* Carga del mensaje WELCOME */
 typedef struct {
@@ -308,7 +400,7 @@ typedef struct {
 
 /* Tamano maximo del WELCOME en el cable: cabecera, todas las membresias y
  * todas las reservas que caben en welcome_t. Dimensiona el bufer del
- * respondedor para que ningun cluser legible quede sin respuesta. */
+ * respondedor para que ningun clúster legible quede sin respuesta. */
 #define DSM_WELCOME_WIRE_MAX \
     (28u + (size_t)MAX_NODES * DSM_MEMBERSHIP_WIRE_LEN + 4u + \
      64u * DSM_ALLOC_REC_LEN)
@@ -334,6 +426,15 @@ _Static_assert(DSM_WIRE_WORD_LEN == 4u, "la palabra de estado debe ser 4 B");
 _Static_assert(sizeof(wire_word_t) == DSM_WIRE_WORD_LEN, "wire_word_t debe ser 4 B");
 _Static_assert(DSM_STRIPE_READ_WIRE_LEN == 8u, "STRIPE_READ debe ser 8 B en el cable");
 _Static_assert(sizeof(stripe_read_wire_t) == DSM_STRIPE_READ_WIRE_LEN, "stripe_read_wire_t debe ser 8 B");
+_Static_assert(DSM_ALLOC_MSG_LEN == 16u, "ALLOC/FREE debe ser 16 B en el cable");
+_Static_assert(sizeof(alloc_msg_t) == DSM_ALLOC_MSG_LEN, "alloc_msg_t debe ser 16 B");
+_Static_assert(DSM_PAGE_REC_LEN == 24u, "page_rec_t debe ser 24 B en el cable");
+_Static_assert(sizeof(page_rec_t) == DSM_PAGE_REC_LEN, "page_rec_t debe ser 24 B");
+_Static_assert(DSM_LOCK_MIGRATE_WIRE_LEN == 12u, "LOCK_MIGRATE debe ser 12 B en el cable");
+_Static_assert(DSM_LOCK_STATE_HDR_LEN == 20u, "LOCK_STATE debe tener 20 B de cabecera");
+_Static_assert(DSM_LOCK_STATE_REC_LEN == 12u, "cada registro de LOCK_STATE debe ser 12 B");
+_Static_assert(DSM_STATS_WIRE_LEN == 96u, "las estadísticas deben ser 96 B en el cable");
+_Static_assert(sizeof(stats_wire_t) == DSM_STATS_WIRE_LEN, "stats_wire_t debe ser 96 B");
 
 /* --- Funciones de serialización y validación --- */
 
@@ -374,6 +475,18 @@ void   dsm_unpack_query_req(const uint8_t in[DSM_QUERY_REQ_LEN], query_req_t *q)
 size_t dsm_pack_query_resp(const query_resp_t *r, uint8_t out[DSM_QUERY_RESP_HDR_LEN]);
 void   dsm_unpack_query_resp(const uint8_t in[DSM_QUERY_RESP_HDR_LEN], query_resp_t *r);
 
+size_t dsm_pack_stats(const stats_wire_t *s, uint8_t out[DSM_STATS_WIRE_LEN]);
+void   dsm_unpack_stats(const uint8_t in[DSM_STATS_WIRE_LEN], stats_wire_t *s);
+
+size_t dsm_pack_lock_migrate(const lock_migrate_wire_t *m,
+                             uint8_t out[DSM_LOCK_MIGRATE_WIRE_LEN]);
+void   dsm_unpack_lock_migrate(const uint8_t in[DSM_LOCK_MIGRATE_WIRE_LEN],
+                               lock_migrate_wire_t *m);
+size_t dsm_pack_lock_state(const lock_state_wire_t *s,
+                           const lock_state_rec_t *recs, uint8_t *out);
+int    dsm_unpack_lock_state(const uint8_t *in, size_t len,
+                             lock_state_wire_t *s, lock_state_rec_t *recs);
+
 size_t dsm_pack_node_rec(const node_rec_t *n, uint8_t out[DSM_NODE_REC_LEN]);
 void   dsm_unpack_node_rec(const uint8_t in[DSM_NODE_REC_LEN], node_rec_t *n);
 
@@ -395,24 +508,17 @@ void   dsm_unpack_parity_delta(const uint8_t *in, uint32_t page_size,
                                parity_delta_wire_t *d, uint8_t *delta);
 size_t dsm_pack_word(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN]);
 void   dsm_unpack_word(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w);
-size_t dsm_pack_parity_ack(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN]);
-void   dsm_unpack_parity_ack(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w);
-size_t dsm_pack_stripe_put_ack(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN]);
-void   dsm_unpack_stripe_put_ack(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w);
-size_t dsm_pack_state_report(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN]);
-void   dsm_unpack_state_report(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w);
-size_t dsm_pack_dir_done(const wire_word_t *w, uint8_t out[DSM_WIRE_WORD_LEN]);
-void   dsm_unpack_dir_done(const uint8_t in[DSM_WIRE_WORD_LEN], wire_word_t *w);
 size_t dsm_pack_stripe_read(const stripe_read_wire_t *r, uint8_t out[DSM_STRIPE_READ_WIRE_LEN]);
 void   dsm_unpack_stripe_read(const uint8_t in[DSM_STRIPE_READ_WIRE_LEN], stripe_read_wire_t *r);
+
+/* Empaquetado de la coordinación de espacio global */
+size_t dsm_pack_alloc_msg(const alloc_msg_t *a, uint8_t out[DSM_ALLOC_MSG_LEN]);
+void   dsm_unpack_alloc_msg(const uint8_t in[DSM_ALLOC_MSG_LEN], alloc_msg_t *a);
 size_t dsm_pack_page_payload(const uint8_t *data, uint8_t *out, uint32_t len);
 void   dsm_unpack_page_payload(const uint8_t *in, uint8_t *data, uint32_t len);
 size_t dsm_pack_stripe_data(const uint8_t *data, uint8_t *out, uint32_t len);
 void   dsm_unpack_stripe_data(const uint8_t *in, uint8_t *data, uint32_t len);
 size_t dsm_pack_page_move(const uint8_t *data, uint8_t *out, uint32_t len);
-void   dsm_unpack_page_move(const uint8_t *in, uint8_t *data, uint32_t len);
-size_t dsm_pack_page_move_ack(uint8_t *out);
-void   dsm_unpack_page_move_ack(const uint8_t *in);
 
 /* Empaquetado de WELCOME */
 size_t dsm_pack_welcome(const welcome_t *w, uint8_t *out, size_t max_out);

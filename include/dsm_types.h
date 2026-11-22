@@ -182,7 +182,15 @@ typedef enum {
     /** No quedan páginas o ranuras disponibles. */
     DSM_ST_NO_SPACE        = 7,
     /** El archivo de configuración del par no coincide (raw_hash distinto). */
-    DSM_ST_CONFIG_MISMATCH = 8
+    DSM_ST_CONFIG_MISMATCH = 8,
+    /**
+     * El dueño de la copia modificada murió antes de devolverla. El estado es
+     * terminal: el directorio no puede servirse hasta que la recuperación de
+     * baja reasigne la página. El solicitante lo traduce a DSM_ERR_NODE_DOWN.
+     */
+    DSM_ST_NODE_DOWN       = 9,
+    /** Un participante anunció un parámetro distinto del fijado por el custodio. */
+    DSM_ST_INVALID         = 10
 } dsm_status_code_t;
 
 /**
