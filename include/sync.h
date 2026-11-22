@@ -29,6 +29,7 @@ typedef struct {
     uint32_t wait_req[DSM_LOCK_QUEUE];
     uint8_t  head, tail, count;
     uint8_t  used;
+    uint64_t epoch;       /* Época de sincronización de la última migración */
 } dsm_lock_dir_t;
 
 typedef struct {
@@ -67,12 +68,40 @@ typedef struct {
     uint8_t   active;
 } dsm_sync_held_t;
 
+/* Petición de cerrojo remota en vuelo. Se registra aparte de la tabla de red
+ * para que la migración pueda reconstruir la cola del custodio con el req_id
+ * original cuando el hilo todavía está esperando la concesión. */
+typedef struct {
+    uint32_t lock_id;
+    uint32_t req_id;
+    uint8_t  active;
+} dsm_sync_remote_wait_t;
+
+#define DSM_SYNC_REMOTE_WAIT 128u
+
 typedef struct dsm_sync {
     pthread_mutex_t     mu;
     dsm_lock_dir_t      locks[DSM_LOCK_SLOTS];
     dsm_barrier_dir_t   barriers[DSM_BARRIER_SLOTS];
     dsm_sync_pending_t  pending[DSM_SYNC_PENDING];
     dsm_sync_held_t     held[DSM_MAX_HELD];
+    dsm_sync_remote_wait_t remote_wait[DSM_SYNC_REMOTE_WAIT];
+    /* Época de sincronización: crece con cada baja. Las concesiones con época
+     * anterior se descartan para que un grant del custodio caído no reescriba
+     * el estado reconstruido por el nuevo. */
+    uint64_t            epoch;
+    uint64_t            migrate_epoch;
+    uint32_t            migrate_dead;
+    uint64_t            migrate_deadline_ms;
+    uint8_t             migrate_active;
+    /** Ranuras muertas procesadas en la migración vigente. Dos bajas
+     *  simultáneas comparten época pero son slots distintos y no se pueden
+     *  descartar mutuamente. */
+    uint8_t             migrate_dead_map[MAX_NODES / 8];
+    uint8_t             migrate_reported[MAX_NODES / 8];
+    uint32_t            migrate_nreport;
+    uint32_t            migrate_nexpect;
+    uint8_t             migrate_tick_queued;
 } dsm_sync_t;
 
 struct dsm_ctx;
@@ -90,11 +119,22 @@ int  sync_barrier(dsm_ctx_t *ctx, uint32_t barrier_id, uint32_t n);
 void sync_on_lock_req(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void sync_on_lock_grant(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void sync_on_lock_rel(dsm_ctx_t *ctx, const dsm_msg_t *m);
+void sync_on_lock_migrate(dsm_ctx_t *ctx, const dsm_msg_t *m);
+void sync_on_lock_state(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void sync_on_barrier_arrive(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void sync_on_barrier_go(dsm_ctx_t *ctx, const dsm_msg_t *m);
+/* Despierta la espera de barrera indicada por el NACK. Devuelve verdadero si
+ * consumió una espera local; falso si el NACK no era de barrera o ya venció. */
+bool sync_on_barrier_nack(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void sync_on_node_down(dsm_ctx_t *ctx, uint32_t slot);
+/* Cierra por plazo una migración cuyos informes no llegaron completos. */
+void sync_migrate_tick(dsm_ctx_t *ctx);
 void sync_send_lock_ack(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
                         uint32_t req_id);
 void sync_ack_received(dsm_ctx_t *ctx, uint32_t req_id);
+
+/* Verdadero si una concesión pertenece a una época ya superada por una
+ * migración. La usa la capa de red antes de despertar una petición. */
+bool sync_epoch_stale(const dsm_ctx_t *ctx, uint64_t epoch);
 
 #endif /* DSM_SYNC_H */

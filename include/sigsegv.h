@@ -14,7 +14,15 @@ typedef struct {
     uint32_t     page;
     uint32_t     next;
     uint8_t      access;     /* DSM_ACCESS_READ / WRITE */
-    uint8_t      pad[3];
+    uint8_t      pad;
+    /**
+     * Código de error terminal del despachador, como valor positivo de
+     * dsm_status_t. Cero significa que el fallo se resolvió y el hilo puede
+     * reejecutar la instrucción; distinto de cero hace que el manejador
+     * restaure el manejador anterior y reenvíe SIGSEGV para que el fallo sea
+     * observable en lugar de repetirse en un bucle.
+     */
+    uint16_t     error;
 } fault_slot_t;
 
 _Static_assert(sizeof(fault_slot_t) == 16, "fault_slot_t debe ser 16 B");
@@ -24,6 +32,7 @@ void          dsm_sig_restore(void);
 dsm_status_t  dsm_sig_thread_attach(void);
 dsm_status_t  dsm_sig_thread_detach(void);
 int           faultq_init(void);
+void          faultq_destroy(void);
 bool          faultq_push(fault_slot_t *s);
 fault_slot_t *faultq_pop(void);
 

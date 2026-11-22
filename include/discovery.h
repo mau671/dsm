@@ -32,6 +32,9 @@ typedef struct {
     uint64_t         reusable_after_ms[MAX_NODES];
     uint32_t         self_slot;
     uint8_t          self_uuid[16];
+    /* IP de este nodo observada en una conexion entrante o saliente. Cero
+     * mientras no se conozca una direccion alcanzable. */
+    uint32_t         self_ip;
     uint64_t         epoch;
     uint64_t         election_tiebreak;
     /*
@@ -62,6 +65,9 @@ void discovery_leave(dsm_ctx_t *ctx);
 int  membership_init(dsm_ctx_t *ctx);
 void membership_destroy(dsm_ctx_t *ctx);
 void membership_add_self(dsm_ctx_t *ctx);
+void membership_observe_self_ip(dsm_ctx_t *ctx, uint32_t ip);
+void membership_observe_peer_ip(dsm_ctx_t *ctx, const uint8_t uuid[16],
+                                uint32_t ip);
 void membership_claim_slot(dsm_ctx_t *ctx, uint32_t slot);
 uint32_t membership_first_free_slot(dsm_ctx_t *ctx);
 uint32_t membership_next_free_slot(dsm_ctx_t *ctx, uint32_t from);

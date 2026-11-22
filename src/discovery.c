@@ -75,6 +75,58 @@ static void discovery_lock_release(int fd)
     }
 }
 
+/* Direccion IPv4 en orden de red. INADDR_ANY no identifica un destino
+ * alcanzable y se trata como desconocida. */
+static bool ip_is_usable(uint32_t ip)
+{
+    return ip != 0 && ip != htonl(INADDR_ANY);
+}
+
+static bool ip_is_loopback(uint32_t ip)
+{
+    return (ip & htonl(0xFF000000u)) == htonl(0x7F000000u);
+}
+
+/* Una observacion loopback no reemplaza una direccion ya alcanzable: sirve
+ * para el mismo equipo, pero no debe publicarse al resto del cluster. */
+static bool ip_replaceable(uint32_t current, uint32_t observed)
+{
+    if (!ip_is_usable(observed)) {
+        return false;
+    }
+    if (!ip_is_usable(current)) {
+        return true;
+    }
+    return !(ip_is_loopback(observed) && !ip_is_loopback(current));
+}
+
+/* IP del extremo remoto de un socket ya conectado, en orden de red. */
+static uint32_t socket_peer_ip(int fd)
+{
+    struct sockaddr_in sa;
+    socklen_t len = sizeof(sa);
+
+    if (fd < 0 || getpeername(fd, (struct sockaddr *)&sa, &len) != 0 ||
+        sa.sin_family != AF_INET) {
+        return 0;
+    }
+    return sa.sin_addr.s_addr;
+}
+
+/* IP local que el kernel eligio para un socket, en orden de red. Es la
+ * direccion con la que el par alcanza a este nodo. */
+static uint32_t socket_local_ip(int fd)
+{
+    struct sockaddr_in sa;
+    socklen_t len = sizeof(sa);
+
+    if (fd < 0 || getsockname(fd, (struct sockaddr *)&sa, &len) != 0 ||
+        sa.sin_family != AF_INET) {
+        return 0;
+    }
+    return sa.sin_addr.s_addr;
+}
+
 int uuid_load_or_create(dsm_ctx_t *ctx, uint8_t out[16])
 {
     const char *tag = getenv("DSM_NODE_TAG");
@@ -144,6 +196,10 @@ static int probe_peer(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t 
 {
     int fd = dsm_connect_timeout(addr, ctx->cfg.connect_timeout_ms);
     if (fd < 0) return DSM_ERR_NET;
+
+    /* La direccion local de esta conexion es una IP real de este nodo y la
+     * unica que el par puede usar para responderle. */
+    membership_observe_self_ip(ctx, socket_local_ip(fd));
 
     /* Enviar mensaje HELLO: 20 bytes (uuid[16] + raw_hash[4]) */
     uint8_t hello_payload[20];
@@ -336,6 +392,17 @@ static int discovery_visit_peer(dsm_ctx_t *ctx, const welcome_t *w,
     if (walk->merge) {
         membership_merge_wire(&ctx->memb, w);
     }
+    /* Cada WELCOME es también un punto de replica del mapa global. La
+     * importación avanza la marca de agua y reemplaza los huecos por los de la
+     * instantánea vigente, de modo que una vista atrasada no reutilice páginas
+     * que el coordinador ya reservó. */
+    if (w->alloc_count != 0) {
+        dsm_alloc_import(ctx, w->allocs, w->alloc_count);
+    }
+    /* La direccion desde la que respondio el par es la que este nodo debe
+     * usar para enviarle; sustituye cualquier IP loopback que el par haya
+     * publicado de si mismo. */
+    membership_observe_peer_ip(ctx, w->origin_uuid, addr->sin_addr.s_addr);
     if (walk->capture_first && !walk->have_first) {
         *walk->first = *w;
         walk->have_first = true;
@@ -501,9 +568,14 @@ static int discovery_send_join_all(dsm_ctx_t *ctx, const discovery_walk_t *walk,
     membership_wire_t my_wire;
     memset(&my_wire, 0, sizeof(my_wire));
     memcpy(my_wire.uuid, ctx->memb.self_uuid, 16);
-    my_wire.ip          = htonl(INADDR_LOOPBACK);
+    pthread_rwlock_rdlock(&ctx->memb.rw);
+    my_wire.ip   = ctx->memb.self_ip;
+    my_wire.slot = (uint8_t)ctx->memb.self_slot;
+    pthread_rwlock_unlock(&ctx->memb.rw);
+    if (!ip_is_usable(my_wire.ip)) {
+        my_wire.ip = htonl(INADDR_LOOPBACK);
+    }
     my_wire.port        = ctx->net.listen_port;
-    my_wire.slot        = (uint8_t)ctx->memb.self_slot;
     my_wire.state       = DSM_NODE_ALIVE;
     my_wire.incarnation = 1;
     /* El JOIN publica la memoria aportada: un cliente no aporta ninguna y el
@@ -511,9 +583,6 @@ static int discovery_send_join_all(dsm_ctx_t *ctx, const discovery_walk_t *walk,
     my_wire.mem_pages   = ctx->cfg.client_mode
                               ? 0u
                               : (uint32_t)(ctx->cfg.node_mem / ctx->cfg.page_size);
-
-    uint8_t join_payload[DSM_MEMBERSHIP_WIRE_LEN];
-    dsm_pack_membership(&my_wire, join_payload);
 
     for (uint32_t i = 0; i < walk->nep; i++) {
         const peer_ep_t *ep = &walk->ep[i];
@@ -531,6 +600,18 @@ static int discovery_send_join_all(dsm_ctx_t *ctx, const discovery_walk_t *walk,
         if (fd < 0) {
             continue;
         }
+
+        /* La IP publicada es la que el kernel uso para llegar a este par; la
+         * loopback solo queda para un unico nodo que aun no observo otra. */
+        uint32_t local_ip = socket_local_ip(fd);
+        membership_wire_t wire = my_wire;
+        if (ip_is_usable(local_ip)) {
+            wire.ip = local_ip;
+            membership_observe_self_ip(ctx, local_ip);
+        }
+
+        uint8_t join_payload[DSM_MEMBERSHIP_WIRE_LEN];
+        dsm_pack_membership(&wire, join_payload);
 
         msg_header_t hdr;
         memset(&hdr, 0, sizeof(hdr));
@@ -832,15 +913,10 @@ static int discovery_resolve_slots(dsm_ctx_t *ctx, uint32_t *peers_out)
                 return DSM_OK;
             }
             if (acked >= walk.nep) {
-                /* Todos los pares alcanzables registraron la ranura propia, de
-                 * modo que los latidos encuentran entrada en ambos lados y la
-                 * tabla converge sin depender de un nuevo escaneo. */
-                for (uint32_t i = 0; i < walk.nep; i++) {
-                    uint32_t s = membership_slot_of_uuid(ctx, walk.ep[i].uuid);
-                    if (s != DSM_SLOT_NONE) {
-                        peer_ensure_connected(ctx, s);
-                    }
-                }
+                /* Todos los pares alcanzables registraron la ranura propia.
+                 * Cada envio abre su propio enlace y lo cierra al terminar la
+                 * trama, de modo que no quedan sockets pre-abiertos que el par
+                 * pueda cerrar antes del primer latido. */
                 *peers_out = walk.peers;
                 return DSM_OK;
             }
@@ -1113,7 +1189,10 @@ void membership_add_self(dsm_ctx_t *ctx)
         node_info_t *ni = &m->nodes[s];
         memcpy(ni->uuid, m->self_uuid, 16);
         ni->slot        = s;
-        ni->ip          = htonl(INADDR_LOOPBACK);
+        /* Solo se publica loopback como IP propia mientras no se haya
+         * observado una direccion alcanzable en una conexion real. */
+        ni->ip          = ip_is_usable(m->self_ip) ? m->self_ip
+                                                   : htonl(INADDR_LOOPBACK);
         ni->port        = ctx->net.listen_port;
         ni->state       = DSM_NODE_ALIVE;
         ni->incarnation = 1;
@@ -1125,6 +1204,67 @@ void membership_add_self(dsm_ctx_t *ctx)
         ni->missed_hb   = 0;
 
         m->present[s / 8] |= (uint8_t)(1u << (s % 8));
+    }
+
+    pthread_rwlock_unlock(&m->rw);
+}
+
+/* Registra la IP con la que este nodo alcanza a un par. La observacion sale
+ * de la conexion, no de lo que el par publica: la tabla del receptor es la
+ * autoridad sobre su propia direccion. */
+void membership_observe_peer_ip(dsm_ctx_t *ctx, const uint8_t uuid[16],
+                                uint32_t ip)
+{
+    if (!ctx || !uuid || !ip_is_usable(ip)) {
+        return;
+    }
+
+    dsm_membership_t *m = &ctx->memb;
+    pthread_rwlock_wrlock(&m->rw);
+
+    if (memcmp(uuid, m->self_uuid, 16) == 0) {
+        if (ip_replaceable(m->self_ip, ip)) {
+            m->self_ip = ip;
+            uint32_t s = m->self_slot;
+            if (s < MAX_NODES && membership_slot_present(ctx, s) &&
+                memcmp(m->nodes[s].uuid, m->self_uuid, 16) == 0) {
+                m->nodes[s].ip = ip;
+            }
+        }
+        pthread_rwlock_unlock(&m->rw);
+        return;
+    }
+
+    for (uint32_t s = 0; s < MAX_NODES; s++) {
+        if (!membership_slot_present(ctx, s)) continue;
+        if (memcmp(m->nodes[s].uuid, uuid, 16) != 0) continue;
+        if (ip_replaceable(m->nodes[s].ip, ip)) {
+            m->nodes[s].ip = ip;
+        }
+        break;
+    }
+
+    pthread_rwlock_unlock(&m->rw);
+}
+
+/* Registra la IP local observada en un socket. No cambia el puerto de
+ * escucha: en un socket saliente el puerto local es efimero. */
+void membership_observe_self_ip(dsm_ctx_t *ctx, uint32_t ip)
+{
+    if (!ctx || !ip_is_usable(ip)) {
+        return;
+    }
+
+    dsm_membership_t *m = &ctx->memb;
+    pthread_rwlock_wrlock(&m->rw);
+
+    if (ip_replaceable(m->self_ip, ip)) {
+        m->self_ip = ip;
+        uint32_t s = m->self_slot;
+        if (s < MAX_NODES && membership_slot_present(ctx, s) &&
+            memcmp(m->nodes[s].uuid, m->self_uuid, 16) == 0) {
+            m->nodes[s].ip = ip;
+        }
     }
 
     pthread_rwlock_unlock(&m->rw);
@@ -1247,9 +1387,14 @@ void membership_merge_wire(dsm_membership_t *m, const welcome_t *w)
         }
 
         node_info_t *ni = &m->nodes[s];
+        uint32_t previous_ip = present ? ni->ip : 0;
         memcpy(ni->uuid, wire->uuid, 16);
         ni->slot        = s;
-        ni->ip          = wire->ip;
+        /* Una vista que aun publica loopback no degrada la IP observada por
+         * una conexion directa con ese mismo par. */
+        ni->ip          = (!present || ip_replaceable(previous_ip, wire->ip))
+                              ? wire->ip
+                              : previous_ip;
         ni->port        = wire->port;
         ni->state       = wire->state;
         ni->incarnation = wire->incarnation;
@@ -1341,6 +1486,15 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
         return;
     }
 
+    /* La IP del solicitante se toma del socket aceptado y no del payload:
+     * getpeername devuelve la direccion observada por el kernel. El puerto de
+     * escucha si viaja en el JOIN, porque el puerto remoto de esta conexion es
+     * efimero. */
+    uint32_t observed_ip = socket_peer_ip(cfd);
+    if (cfd >= 0) {
+        membership_observe_self_ip(ctx, socket_local_ip(cfd));
+    }
+
     pthread_rwlock_wrlock(&ctx->memb.rw);
 
     /* El nodo que se reubica deja una vista vieja en su ranura previa: se
@@ -1369,7 +1523,7 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
     node_info_t *ni = &ctx->memb.nodes[s];
     memcpy(ni->uuid, wire.uuid, 16);
     ni->slot        = s;
-    ni->ip          = wire.ip;
+    ni->ip          = ip_is_usable(observed_ip) ? observed_ip : wire.ip;
     ni->port        = wire.port;
     ni->state       = DSM_NODE_ALIVE;
     ni->incarnation = wire.incarnation;
@@ -1388,10 +1542,9 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
 
     pthread_rwlock_unlock(&ctx->memb.rw);
 
-    /* Establecer conexion saliente de vuelta hacia el nodo que se incorpora */
-    peer_ensure_connected(ctx, s);
-
-    /* Responder con JOIN_ACK directamente en el socket abierto si existe */
+    /* Responder con JOIN_ACK directamente en el socket abierto si existe. No
+     * se pre-abre un enlace de vuelta: cada envio posterior conecta bajo
+     * demanda y cierra su descriptor al terminar la trama. */
     msg_header_t ack_hdr;
     memset(&ack_hdr, 0, sizeof(ack_hdr));
     ack_hdr.magic         = DSM_MAGIC;
@@ -1610,14 +1763,27 @@ static uint32_t query_collect_pages(dsm_ctx_t *ctx, uint32_t first, uint32_t max
         page_local_t *loc = dsm_mem_local(&ctx->mem, p);
         if (!loc) break;
 
+        /* El registro se copia bajo el cerrojo de franja para no observar una
+         * transacción a medias. El home se calcula después, con la franja
+         * liberada: ring_home_of consulta el anillo y la membresía y no debe
+         * llamarse con la franja tomada. */
+        page_local_t snap;
+        dsm_mem_stripe_lock(&ctx->mem, p);
+        snap = *loc;
+        dsm_mem_stripe_unlock(&ctx->mem, p);
+
+        uint32_t home = ring_home_of(ctx, p);
+
         page_rec_t rec;
         memset(&rec, 0, sizeof(rec));
         rec.page_id    = p;
-        rec.home       = ring_home_of(ctx, p);
-        rec.version    = loc->version;
-        rec.state      = loc->state;
-        rec.pend_inval = loc->pend_inval;
-        rec.pend_down  = loc->pend_down;
+        rec.home       = home;
+        rec.version    = snap.version;
+        rec.state      = snap.state;
+        rec.pend_inval = snap.pend_inval;
+        rec.pend_down  = snap.pend_down;
+        rec.pid        = snap.pid;
+        rec.order      = snap.order;
 
         uint8_t raw[DSM_PAGE_REC_LEN];
         dsm_pack_page_rec(&rec, raw);
@@ -1633,15 +1799,23 @@ static uint16_t query_fill_global(dsm_ctx_t *ctx, query_builder_t *b)
     dsm_stats_t st;
     if (dsm_stats(&st) != DSM_OK) return DSM_ST_BUSY;
 
-    uint64_t bytes[6] = {
-        st.read_faults, st.write_faults, st.msgs_sent,
-        st.msgs_recv, st.bytes_sent, st.bytes_recv
-    };
-    uint8_t raw[48];
-    for (uint32_t i = 0; i < 6; i++) {
-        uint64_t v = dsm_htonll(bytes[i]);
-        memcpy(raw + i * 8, &v, 8);
-    }
+    stats_wire_t sw;
+    memset(&sw, 0, sizeof(sw));
+    sw.read_faults       = st.read_faults;
+    sw.write_faults      = st.write_faults;
+    sw.msgs_sent         = st.msgs_sent;
+    sw.msgs_recv         = st.msgs_recv;
+    sw.bytes_sent        = st.bytes_sent;
+    sw.bytes_recv        = st.bytes_recv;
+    sw.dist_tasks_run    = st.dist_tasks_run;
+    sw.dist_tasks_failed = st.dist_tasks_failed;
+    sw.parity_deltas     = st.parity_deltas;
+    sw.stripe_rebuilds   = st.stripe_rebuilds;
+    sw.tseq_discarded    = st.tseq_discarded;
+    sw.hb_missed         = st.hb_missed;
+
+    uint8_t raw[DSM_STATS_WIRE_LEN];
+    dsm_pack_stats(&sw, raw);
     query_builder_put(b, raw, sizeof(raw));
     return DSM_ST_OK;
 }
@@ -1740,7 +1914,7 @@ void membership_handle_query_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
         total += (size_t)hdr.count *
                  ((hdr.kind == DSM_QUERY_NODES) ? DSM_NODE_REC_LEN :
                   (hdr.kind == DSM_QUERY_PAGES) ? DSM_PAGE_REC_LEN : 0u);
-        if (hdr.kind == DSM_QUERY_STATS) total += 48u;
+        if (hdr.kind == DSM_QUERY_STATS) total += DSM_STATS_WIRE_LEN;
     }
 
     uint8_t raw_hdr[DSM_HDR_LEN];
@@ -1853,6 +2027,7 @@ static void *hb_thread_main(void *arg)
 
         uint64_t now = mono_ms();
         membership_evaluate(ctx, now);
+        sync_migrate_tick(ctx);
 
         uint32_t dst[MAX_NODES];
         uint32_t ndst = 0;

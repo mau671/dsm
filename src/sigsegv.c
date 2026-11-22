@@ -3,10 +3,14 @@
 #include <signal.h>
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
+#include <time.h>
+#include <semaphore.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <sys/mman.h>
 #include <ucontext.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define STACK_SIZE (64 * 1024)
@@ -36,6 +40,17 @@ static fault_cell_t g_fault_queue[DSM_FAULTQ_CAP];
 static _Atomic uint32_t g_fq_head = 0;
 static _Atomic uint32_t g_fq_tail = 0;
 
+/* Contador de elementos en la cola. El productor es el manejador de SIGSEGV,
+ * donde sem_post es async-signal-safe, y el consumidor es el despachador, que
+ * se bloquea en él en lugar de sondear. Se destruye solo en faultq_destroy,
+ * después de restaurar el manejador: ningún handler puede hacer sem_post sobre
+ * un semáforo liberado. */
+static sem_t g_fq_sem;
+
+/* Plazo de la espera del despachador: al vencer revisa ctx->running y no
+ * queda bloqueado durante el apagado. */
+#define DSM_FAULTQ_WAIT_MS 100u
+
 _Static_assert((DSM_FAULTQ_CAP & (DSM_FAULTQ_CAP - 1)) == 0,
                "DSM_FAULTQ_CAP debe ser potencia de dos");
 
@@ -47,7 +62,15 @@ int faultq_init(void)
         g_fault_queue[i].slot = NULL;
         atomic_store_explicit(&g_fault_queue[i].seq, i, memory_order_relaxed);
     }
+    if (sem_init(&g_fq_sem, 0, 0) != 0) {
+        return -1;
+    }
     return 0;
+}
+
+void faultq_destroy(void)
+{
+    sem_destroy(&g_fq_sem);
 }
 
 bool faultq_push(fault_slot_t *s)
@@ -65,6 +88,9 @@ bool faultq_push(fault_slot_t *s)
                                                       memory_order_relaxed)) {
                 cell->slot = s;
                 atomic_store_explicit(&cell->seq, pos + 1, memory_order_release);
+                /* sem_post es async-signal-safe: avisa al despachador sin
+                 * tomar cerrojos y mantiene el diseño lock-free de la cola. */
+                sem_post(&g_fq_sem);
                 return true;
             }
         } else if (dif < 0) {
@@ -78,6 +104,25 @@ bool faultq_push(fault_slot_t *s)
 fault_slot_t *faultq_pop(void)
 {
     const uint32_t mask = DSM_FAULTQ_CAP - 1;
+
+    /* Bloqueo con plazo en el contador de la cola: cada sem_post de un
+     * productor habilita exactamente un consumo, y el vencimiento devuelve
+     * NULL para que el despachador revise el ciclo de ejecución. EINTR se
+     * reintenta porque el hilo solo abandona por timeout o por señal. */
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec  += DSM_FAULTQ_WAIT_MS / 1000u;
+    deadline.tv_nsec += (long)(DSM_FAULTQ_WAIT_MS % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (sem_timedwait(&g_fq_sem, &deadline) != 0) {
+        if (errno != EINTR) {
+            return NULL;
+        }
+    }
+
     uint32_t pos = atomic_load_explicit(&g_fq_head, memory_order_relaxed);
 
     for (;;) {
@@ -127,6 +172,7 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext_raw)
     fault_slot_t *s = &g_thread_slot;
     s->page   = page;
     s->access = access;
+    s->error  = 0;
     s->done   = 0;
 
     if (!faultq_push(s)) {
@@ -143,6 +189,27 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext_raw)
     /* Dormir en futex hasta que el despachador resuelva el permiso */
     while (__atomic_load_n(&s->done, __ATOMIC_ACQUIRE) == 0) {
         syscall(SYS_futex, (int *)&s->done, FUTEX_WAIT, 0, NULL, NULL, 0);
+    }
+
+    /* Un fallo terminal no se puede reintentar: el despachador dejó el motivo
+     * en la ranura. Se restaura el manejador previo y se reenvía la señal para
+     * que el proceso termine en vez de repetir el acceso en un bucle de CPU.
+     * Quien maneje la señal recibe el mismo si_addr y el estado de la página. */
+    if (__atomic_load_n(&s->error, __ATOMIC_ACQUIRE) != 0) {
+        /* El despachador agotó el único camino posible para este fallo. Se
+         * restaura el manejador anterior y se reenvía SIGSEGV; el abort queda
+         * como cierre si la acción anterior no termina el proceso. */
+        sigaction(SIGSEGV, &g_old_sa, NULL);
+        g_sig_installed = false;
+
+        /* SIGSEGV sigue bloqueado por estar dentro de su manejador: se
+         * desbloquea para que la acción restaurada se ejecute en el acto. */
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGSEGV);
+        sigprocmask(SIG_UNBLOCK, &set, NULL);
+        raise(SIGSEGV);
+        abort();
     }
 }
 
