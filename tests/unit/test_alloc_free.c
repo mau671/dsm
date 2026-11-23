@@ -60,6 +60,7 @@ static void ctx_destroy(void)
     sync_destroy(ctx);
     membership_destroy(ctx);
     net_destroy(ctx);
+    pthread_cond_destroy(&ctx->alloc.sync_cv);
     pthread_mutex_destroy(&ctx->alloc.mu);
     free(ctx);
 }

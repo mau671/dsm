@@ -196,8 +196,8 @@ static int abrir_entrada(const char *ruta, int *fd_out, video_info_t *info)
     info_desde_crudo(info, crudo);
 
     if (!info_valida(info)) {
-        fprintf(stderr, "filtro_video: dimensiones invalidas en '%s' "
-                        "(%u x %u, %u cuadros)\n",
+        fprintf(stderr, "filtro_video: dimensiones inválidas en '%s': "
+                        "%u x %u, %u cuadros\n",
                 ruta, info->ancho, info->alto, info->cuadros);
         close(fd);
         return -1;
@@ -205,7 +205,7 @@ static int abrir_entrada(const char *ruta, int *fd_out, video_info_t *info)
 
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        fprintf(stderr, "filtro_video: fstat fallo sobre '%s': %s\n",
+        fprintf(stderr, "filtro_video: fstat falló sobre '%s': %s\n",
                 ruta, strerror(errno));
         close(fd);
         return -1;
@@ -275,13 +275,13 @@ static void imprimir_estadisticas_dsm(void)
 {
     dsm_stats_t stats;
     if (dsm_stats(&stats) != DSM_OK) {
-        printf("Estadisticas DSM: no disponibles\n");
+        printf("Estadísticas DSM: no disponibles\n");
         return;
     }
-    printf("Fallos de pagina: lectura=%lu escritura=%lu\n",
+    printf("Fallos de página: lectura=%lu escritura=%lu\n",
            (unsigned long)stats.read_faults,
            (unsigned long)stats.write_faults);
-    printf("Paginas locales: M=%lu S=%lu I=%lu\n",
+    printf("Páginas locales: M=%lu S=%lu I=%lu\n",
            (unsigned long)stats.pages_m,
            (unsigned long)stats.pages_s,
            (unsigned long)stats.pages_i);
@@ -314,7 +314,7 @@ static int procesar(const char *conf, const char *ruta_entrada,
         if (access(ruta_entrada, F_OK) == 0) {
             return 1;
         }
-        printf("Entrada '%s' inexistente: se genera un video sintetico\n",
+        printf("Entrada '%s' inexistente: se genera un vídeo sintético\n",
                ruta_entrada);
         if (generar(ruta_entrada, ANCHO_SINTETICO, ALTO_SINTETICO,
                     CUADROS_SINTETICOS) != 0 ||
@@ -331,8 +331,7 @@ static int procesar(const char *conf, const char *ruta_entrada,
 
     dsm_status_t st = dsm_init(conf, 0);
     if (st != DSM_OK) {
-        fprintf(stderr, "filtro_video: dsm_init fallo: %s (%d)\n",
-                dsm_strerror(st), (int)st);
+        fprintf(stderr, "filtro_video: dsm_init falló: %s\n", dsm_strerror(st));
         goto fin;
     }
 
@@ -340,29 +339,29 @@ static int procesar(const char *conf, const char *ruta_entrada,
      * que necesita su ranura de fallo y su pila alternativa. */
     st = dsm_thread_attach();
     if (st != DSM_OK) {
-        fprintf(stderr, "filtro_video: dsm_thread_attach fallo: %s (%d)\n",
-                dsm_strerror(st), (int)st);
+        fprintf(stderr, "filtro_video: dsm_thread_attach falló: %s\n",
+                dsm_strerror(st));
         goto fin_dsm;
     }
 
     st = dsm_alloc(bytes_in, &mem_entrada);
     if (st != DSM_OK) {
-        fprintf(stderr, "filtro_video: dsm_alloc de entrada (%llu bytes) "
-                        "fallo: %s (%d)\n",
-                (unsigned long long)bytes_in, dsm_strerror(st), (int)st);
+        fprintf(stderr, "filtro_video: dsm_alloc de entrada de %llu bytes "
+                        "falló: %s\n",
+                (unsigned long long)bytes_in, dsm_strerror(st));
         goto fin_dsm;
     }
     st = dsm_alloc(bytes_out, &mem_salida);
     if (st != DSM_OK) {
-        fprintf(stderr, "filtro_video: dsm_alloc de salida (%llu bytes) "
-                        "fallo: %s (%d)\n",
-                (unsigned long long)bytes_out, dsm_strerror(st), (int)st);
+        fprintf(stderr, "filtro_video: dsm_alloc de salida de %llu bytes "
+                        "falló: %s\n",
+                (unsigned long long)bytes_out, dsm_strerror(st));
         goto fin_entrada;
     }
 
     if (!leer_completo(fd_entrada, mem_entrada, (size_t)bytes_in)) {
-        fprintf(stderr, "filtro_video: lectura incompleta de '%s' "
-                        "(%llu bytes en la region DSM en %p)\n",
+        fprintf(stderr, "filtro_video: lectura incompleta de '%s': "
+                        "%llu bytes en la región DSM en %p\n",
                 ruta_entrada, (unsigned long long)bytes_in, mem_entrada);
         goto fin_salida;
     }
@@ -377,11 +376,11 @@ static int procesar(const char *conf, const char *ruta_entrada,
     }
     repartir_cuadros(trabajos, hilos, info.cuadros);
 
-    printf("Video: %u x %u, %u cuadros (entrada %llu B, salida %llu B)\n",
-           info.ancho, info.alto, info.cuadros,
-           (unsigned long long)bytes_in,
-           (unsigned long long)bytes_out);
-    printf("Hilos de aplicacion: %u\n", hilos);
+    printf("Vídeo: %u x %u, %u cuadros\n",
+           info.ancho, info.alto, info.cuadros);
+    printf("Entrada : %llu B\n", (unsigned long long)bytes_in);
+    printf("Salida  : %llu B\n", (unsigned long long)bytes_out);
+    printf("Hilos de aplicación: %u\n", hilos);
 
     uint64_t inicio = instante_ns();
     uint32_t lanzados = 0;
@@ -404,14 +403,13 @@ static int procesar(const char *conf, const char *ruta_entrada,
         if (trabajos[i].fallo) fallo = 1;
     }
     if (fallo) {
-        fprintf(stderr, "filtro_video: algun hilo no pudo procesar su rango\n");
+        fprintf(stderr, "filtro_video: algún hilo no pudo procesar su rango\n");
         goto fin_salida;
     }
 
     st = dsm_sync();
     if (st != DSM_OK) {
-        fprintf(stderr, "filtro_video: dsm_sync fallo: %s (%d)\n",
-                dsm_strerror(st), (int)st);
+        fprintf(stderr, "filtro_video: dsm_sync falló: %s\n", dsm_strerror(st));
         goto fin_salida;
     }
     uint64_t fin_proceso = instante_ns();
@@ -438,10 +436,10 @@ static int procesar(const char *conf, const char *ruta_entrada,
     double mib = (double)(bytes_in + bytes_out) / (1024.0 * 1024.0);
     double mb_s = (segundos > 0.0) ? mib / segundos : 0.0;
 
-    printf("Cuadros procesados: %u\n", info.cuadros);
-    printf("Tiempo de filtrado: %.3f s (%.3f s con escritura a disco)\n",
-           segundos, segundos_total);
-    printf("Rendimiento: %.2f MiB/s (lectura + escritura)\n", mb_s);
+    printf("Cuadros procesados   : %u\n", info.cuadros);
+    printf("Tiempo de filtrado   : %.3f s\n", segundos);
+    printf("Tiempo con escritura : %.3f s\n", segundos_total);
+    printf("Rendimiento          : %.2f MiB/s\n", mb_s);
     imprimir_estadisticas_dsm();
     printf("Salida escrita en '%s'\n", ruta_salida);
     rc = 0;
@@ -488,7 +486,7 @@ static int generar(const char *ruta, uint32_t ancho, uint32_t alto,
     size_t ancho_bytes = (size_t)ancho * CANALES_RGB;
     uint8_t *fila = malloc(ancho_bytes);
     if (!fila) {
-        fprintf(stderr, "filtro_video: sin memoria para el cuadro sintetico\n");
+        fprintf(stderr, "filtro_video: sin memoria para el cuadro sintético\n");
         close(fd);
         return 1;
     }
@@ -539,8 +537,8 @@ static void uso(const char *programa)
             "Uso: %s [--conf <archivo>] <entrada> <salida> [hilos]\n"
             "     %s --generar <archivo> <ancho> <alto> <cuadros>\n"
             "\n"
-            "Sin --conf se usa dsm.conf del directorio actual. La aplicacion se\n"
-            "une al cluster como cliente: usa su memoria sin aportar ninguna.\n",
+            "Sin --conf se usa dsm.conf del directorio actual. La aplicación se\n"
+            "une al clúster como cliente: usa su memoria sin aportar ninguna.\n",
             programa, programa);
 }
 
@@ -553,7 +551,7 @@ int main(int argc, char **argv)
         if (!parsear_entero(argv[3], MAX_LADO, &ancho) ||
             !parsear_entero(argv[4], MAX_LADO, &alto) ||
             !parsear_entero(argv[5], MAX_CUADROS, &cuadros)) {
-            fprintf(stderr, "filtro_video: dimensiones invalidas\n");
+            fprintf(stderr, "filtro_video: dimensiones inválidas\n");
             uso(argv[0]);
             return 2;
         }
@@ -576,7 +574,7 @@ int main(int argc, char **argv)
 
     uint32_t hilos = 4;
     if (restantes == 3 && !parsear_entero(argv[arg + 2], MAX_HILOS, &hilos)) {
-        fprintf(stderr, "filtro_video: numero de hilos invalido '%s'\n", argv[arg + 2]);
+        fprintf(stderr, "filtro_video: número de hilos inválido '%s'\n", argv[arg + 2]);
         uso(argv[0]);
         return 2;
     }

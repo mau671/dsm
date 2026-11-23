@@ -20,7 +20,19 @@
 /* Paginas procesadas por bloque al recorrer la tabla global: acota la memoria
  * de trabajo del reporte sin reservar una entrada por pagina de la vista. */
 #define REPORT_CHUNK_PAGES  4096u
+/* Tope de filas y de rangos que escribe el informe HTML. Evita que una vista
+ * grande con pocas páginas materializadas se recorra completa y que un clúster
+ * con millones de páginas activas convierta el informe en una consulta sin
+ * fin. */
+#define REPORT_MAX_ROWS     4096u
+#define REPORT_MAX_RUNS     1024u
 #define REPORT_COPY_BYTES   (MAX_NODES / 8u)
+
+/* Rango contiguo de páginas materializadas en la vista local. */
+typedef struct {
+    uint32_t first_page;
+    uint32_t npages;
+} report_run_t;
 
 typedef struct {
     uint32_t slot;
@@ -183,6 +195,7 @@ static int report_query_remote(dsm_ctx_t *ctx, const report_node_t *n,
     if (dsm_wire_unpack(rx_hdr_raw, &rx_hdr) != DSM_OK ||
         rx_hdr.type != MSG_QUERY_RESP ||
         rx_hdr.req_id != hdr.req_id ||
+        rx_hdr.src_slot != n->slot ||
         rx_hdr.cluster_id != ctx->cfg.cluster_id) {
         rc = DSM_ERR_PROTO;
         goto out;
@@ -201,8 +214,8 @@ static int report_query_remote(dsm_ctx_t *ctx, const report_node_t *n,
         rc = DSM_ERR_NET;
         goto out;
     }
-    if (!dsm_wire_validate(&rx_hdr, rx_hdr_raw, payload,
-                           ctx->cfg.cluster_id)) {
+    if (dsm_wire_validate(&rx_hdr, rx_hdr_raw, payload,
+                          ctx->cfg.cluster_id) != DSM_OK) {
         rc = DSM_ERR_PROTO;
         goto out;
     }
@@ -249,6 +262,8 @@ static uint32_t report_fetch_local(dsm_ctx_t *ctx, uint32_t first,
         out[got].state      = loc->state;
         out[got].pend_inval = loc->pend_inval;
         out[got].pend_down  = loc->pend_down;
+        out[got].pid        = loc->pid;
+        out[got].order      = loc->order;
         got++;
     }
     return got;
@@ -312,12 +327,6 @@ static void report_format_copyset(const uint8_t *copyset, char *buf,
     }
 }
 
-static uint32_t report_order(const dsm_ctx_t *ctx, uint32_t page)
-{
-    uint32_t chunk = ctx->cfg.chunk_pages ? ctx->cfg.chunk_pages : 1u;
-    return page % chunk;
-}
-
 static uint32_t report_stripe(const dsm_ctx_t *ctx, uint32_t page)
 {
     uint32_t group = ctx->cfg.chunk_pages ? ctx->cfg.chunk_pages : 1u;
@@ -325,6 +334,15 @@ static uint32_t report_stripe(const dsm_ctx_t *ctx, uint32_t page)
         group = ctx->cfg.raid_k;
     }
     return page / group;
+}
+
+/* Texto de la columna Proceso: el PID real de la reserva o "-" si la página
+ * todavía no pertenece a ningún bloque. */
+static const char *report_pid_text(uint32_t pid, char *buf, size_t cap)
+{
+    if (pid == 0) return "-";
+    snprintf(buf, cap, "%u", pid);
+    return buf;
 }
 
 /* --- Tabla global de texto ---------------------------------------------- */
@@ -350,8 +368,8 @@ dsm_status_t dsm_pages_global(uint32_t first, uint32_t max, char *out,
 
     size_t len = 0;
     int rc = report_append(out, cap, &len,
-                           "Pagina  Propietario  Orden  Copyset  Franja\n"
-                           "------  -----------  -----  -------  ------\n");
+                           "Pagina  Propietario  Proceso  Orden  Copyset  Franja\n"
+                           "------  -----------  -------  -----  -------  ------\n");
     if (rc != DSM_OK) return (dsm_status_t)rc;
 
     uint32_t total = ctx->mem.npages;
@@ -369,10 +387,15 @@ dsm_status_t dsm_pages_global(uint32_t first, uint32_t max, char *out,
     uint32_t chunk = rows;
     if (chunk > REPORT_CHUNK_PAGES) chunk = REPORT_CHUNK_PAGES;
 
-    uint8_t *states = calloc((size_t)chunk * (nnodes ? nnodes : 1u), 1u);
+    size_t entries = (size_t)chunk * (nnodes ? nnodes : 1u);
+    uint8_t *states = calloc(entries, 1u);
+    uint32_t *pids = calloc(entries, sizeof(uint32_t));
+    uint32_t *orders = calloc(entries, sizeof(uint32_t));
     page_rec_t *recs = calloc(chunk, sizeof(page_rec_t));
-    if (!states || !recs) {
+    if (!states || !pids || !orders || !recs) {
         free(states);
+        free(pids);
+        free(orders);
         free(recs);
         return DSM_ERR_NO_SPACE;
     }
@@ -383,17 +406,24 @@ dsm_status_t dsm_pages_global(uint32_t first, uint32_t max, char *out,
         if (n > chunk) n = chunk;
 
         memset(states, 0, (size_t)n * (nnodes ? nnodes : 1u));
+        memset(pids, 0, (size_t)n * (nnodes ? nnodes : 1u) * sizeof(uint32_t));
+        memset(orders, 0, (size_t)n * (nnodes ? nnodes : 1u) * sizeof(uint32_t));
         for (uint32_t k = 0; k < nnodes; k++) {
             uint32_t got = 0;
             int frc = report_fetch_node(ctx, &nodes[k], first + done, n,
                                         recs, &got);
             if (frc != DSM_OK) {
                 free(states);
+                free(pids);
+                free(orders);
                 free(recs);
                 return (dsm_status_t)frc;
             }
             for (uint32_t i = 0; i < got; i++) {
-                states[(size_t)k * n + i] = recs[i].state;
+                size_t idx = (size_t)k * n + i;
+                states[idx] = recs[i].state;
+                pids[idx]   = recs[i].pid;
+                orders[idx] = recs[i].order;
             }
         }
 
@@ -402,22 +432,33 @@ dsm_status_t dsm_pages_global(uint32_t first, uint32_t max, char *out,
             uint8_t copyset[MAX_NODES / 8];
             memset(copyset, 0, sizeof(copyset));
 
+            uint32_t pid = 0;
+            uint32_t order = 0;
             for (uint32_t k = 0; k < nnodes; k++) {
-                uint8_t st = states[(size_t)k * n + i];
+                size_t idx = (size_t)k * n + i;
+                uint8_t st = states[idx];
                 if (st == DSM_PAGE_S || st == DSM_PAGE_M) {
                     uint32_t s = nodes[k].slot;
                     copyset[s / 8] |= (uint8_t)(1u << (s % 8));
+                    if (pid == 0 && pids[idx] != 0) {
+                        pid   = pids[idx];
+                        order = orders[idx];
+                    }
                 }
             }
 
             char cps[8 * MAX_NODES + 4];
+            char pidbuf[16];
             report_format_copyset(copyset, cps, sizeof(cps));
-            rc = report_append(out, cap, &len, "%-6u  %-11u  %-5u  %-7s  %-6u\n",
+            rc = report_append(out, cap, &len,
+                               "%-6u  %-11u  %-7s  %-5u  %-7s  %-6u\n",
                                page, ring_home_of(ctx, page),
-                               report_order(ctx, page), cps,
-                               report_stripe(ctx, page));
+                               report_pid_text(pid, pidbuf, sizeof(pidbuf)),
+                               order, cps, report_stripe(ctx, page));
             if (rc != DSM_OK) {
                 free(states);
+                free(pids);
+                free(orders);
                 free(recs);
                 return (dsm_status_t)rc;
             }
@@ -427,6 +468,8 @@ dsm_status_t dsm_pages_global(uint32_t first, uint32_t max, char *out,
     }
 
     free(states);
+    free(pids);
+    free(orders);
     free(recs);
     out[len] = '\0';
     return DSM_OK;
@@ -506,6 +549,45 @@ static int report_ensure_dir(const char *path)
     }
     if (mkdir(tmp, 0777) != 0 && errno != EEXIST) return DSM_ERR_NO_SPACE;
     return DSM_OK;
+}
+
+/* Reúne los rangos contiguos de páginas materializadas en la vista local. El
+ * informe consulta solo esos rangos: recorrer la vista completa con una
+ * consulta remota por bloque no terminaría en un tiempo razonable cuando la
+ * configuración por defecto mapea un millón de páginas y solo unas pocas
+ * tienen datos. */
+static uint32_t report_collect_runs(dsm_ctx_t *ctx, report_run_t *out,
+                                    uint32_t cap, uint32_t max_rows)
+{
+    uint32_t runs = 0;
+    uint32_t rows = 0;
+    uint32_t p = 0;
+
+    while (p < ctx->mem.npages && rows < max_rows) {
+        dsm_mem_stripe_lock(&ctx->mem, p);
+        uint8_t state = ctx->mem.local[p].state;
+        dsm_mem_stripe_unlock(&ctx->mem, p);
+        if (state == DSM_PAGE_I) {
+            p++;
+            continue;
+        }
+
+        uint32_t first = p;
+        while (p < ctx->mem.npages && rows < max_rows) {
+            dsm_mem_stripe_lock(&ctx->mem, p);
+            state = ctx->mem.local[p].state;
+            dsm_mem_stripe_unlock(&ctx->mem, p);
+            if (state == DSM_PAGE_I) break;
+            p++;
+            rows++;
+        }
+
+        if (runs >= cap) break;
+        out[runs].first_page = first;
+        out[runs].npages     = p - first;
+        runs++;
+    }
+    return runs;
 }
 
 dsm_status_t dsm_html_report(const char *out_dir)
@@ -599,7 +681,8 @@ dsm_status_t dsm_html_report(const char *out_dir)
 
     fprintf(global,
             "<h2>Tabla global de paginas</h2>\n"
-            "<table>\n<tr><th>Pagina</th><th>Propietario</th><th>Orden</th>"
+            "<table>\n<tr><th>Pagina</th><th>Propietario</th>"
+            "<th>Proceso</th><th>Orden</th>"
             "<th>Copyset</th><th>Franja</th></tr>\n");
 
     for (uint32_t k = 0; k < nnodes; k++) {
@@ -662,89 +745,132 @@ dsm_status_t dsm_html_report(const char *out_dir)
         fprintf(fp,
                 "<h2>Tabla de paginas</h2>\n"
                 "<table>\n<tr><th>Pagina</th><th>Estado</th>"
-                "<th>Propietario</th><th>Orden</th><th>Copyset</th>"
-                "<th>Franja</th></tr>\n");
+                "<th>Propietario</th><th>Proceso</th><th>Orden</th>"
+                "<th>Copyset</th><th>Franja</th></tr>\n");
     }
 
-    uint32_t total = ctx->mem.npages;
-    uint32_t chunk = REPORT_CHUNK_PAGES;
-    if (chunk > total && total > 0) chunk = total;
-    if (chunk == 0) chunk = 1;
+    report_run_t *runs = calloc(REPORT_MAX_RUNS, sizeof(report_run_t));
+    if (!runs) {
+        result = DSM_ERR_NO_SPACE;
+        goto cleanup;
+    }
+    uint32_t nruns = report_collect_runs(ctx, runs, REPORT_MAX_RUNS,
+                                         REPORT_MAX_ROWS);
 
-    uint8_t *states = calloc((size_t)chunk * (nnodes ? nnodes : 1u), 1u);
+    uint32_t chunk = REPORT_CHUNK_PAGES;
+    size_t entries = (size_t)chunk * (nnodes ? nnodes : 1u);
+    uint8_t *states = calloc(entries, 1u);
+    uint32_t *pids = calloc(entries, sizeof(uint32_t));
+    uint32_t *orders = calloc(entries, sizeof(uint32_t));
     page_rec_t *recs = calloc(chunk, sizeof(page_rec_t));
-    if (!states || !recs) {
+    if (!states || !pids || !orders || !recs) {
+        free(runs);
         free(states);
+        free(pids);
+        free(orders);
         free(recs);
         result = DSM_ERR_NO_SPACE;
         goto cleanup;
     }
 
     uint32_t materialized = 0;
-    for (uint32_t first = 0; first < total; first += chunk) {
-        uint32_t n = total - first;
-        if (n > chunk) n = chunk;
+    uint32_t row_budget = REPORT_MAX_ROWS;
 
-        memset(states, 0, (size_t)n * (nnodes ? nnodes : 1u));
-        for (uint32_t k = 0; k < nnodes; k++) {
-            uint32_t got = 0;
-            int frc = report_fetch_node(ctx, &nodes[k], first, n,
-                                        recs, &got);
-            if (frc != DSM_OK) {
-                free(states);
-                free(recs);
-                result = (dsm_status_t)frc;
-                goto cleanup;
-            }
-            for (uint32_t i = 0; i < got; i++) {
-                states[(size_t)k * n + i] = recs[i].state;
-            }
-        }
+    for (uint32_t r = 0; r < nruns && row_budget > 0; r++) {
+        uint32_t run_done = 0;
+        while (run_done < runs[r].npages && row_budget > 0) {
+            uint32_t n = runs[r].npages - run_done;
+            if (n > chunk) n = chunk;
+            if (n > row_budget) n = row_budget;
 
-        for (uint32_t i = 0; i < n; i++) {
-            uint32_t page = first + i;
-            uint8_t copyset[MAX_NODES / 8];
-            memset(copyset, 0, sizeof(copyset));
+            uint32_t first = runs[r].first_page + run_done;
 
+            memset(states, 0, (size_t)n * (nnodes ? nnodes : 1u));
+            memset(pids, 0, (size_t)n * (nnodes ? nnodes : 1u) * sizeof(uint32_t));
+            memset(orders, 0, (size_t)n * (nnodes ? nnodes : 1u) * sizeof(uint32_t));
             for (uint32_t k = 0; k < nnodes; k++) {
-                uint8_t s = states[(size_t)k * n + i];
-                if (s == DSM_PAGE_S || s == DSM_PAGE_M) {
-                    uint32_t slot = nodes[k].slot;
-                    copyset[slot / 8] |= (uint8_t)(1u << (slot % 8));
+                uint32_t got = 0;
+                int frc = report_fetch_node(ctx, &nodes[k], first, n,
+                                            recs, &got);
+                if (frc != DSM_OK) {
+                    free(runs);
+                    free(states);
+                    free(pids);
+                    free(orders);
+                    free(recs);
+                    result = (dsm_status_t)frc;
+                    goto cleanup;
+                }
+                for (uint32_t i = 0; i < got; i++) {
+                    size_t idx = (size_t)k * n + i;
+                    states[idx] = recs[i].state;
+                    pids[idx]   = recs[i].pid;
+                    orders[idx] = recs[i].order;
                 }
             }
 
-            char cps[8 * MAX_NODES + 4];
-            report_format_copyset(copyset, cps, sizeof(cps));
+            for (uint32_t i = 0; i < n; i++) {
+                uint32_t page = first + i;
+                uint8_t copyset[MAX_NODES / 8];
+                memset(copyset, 0, sizeof(copyset));
 
-            if (cps[0] != '-') {
-                materialized++;
-                fprintf(global,
-                        "<tr><td>%u</td><td>%u</td><td>%u</td>"
-                        "<td>%s</td><td>%u</td></tr>\n",
-                        page, ring_home_of(ctx, page), report_order(ctx, page),
-                        cps, report_stripe(ctx, page));
+                uint32_t pid = 0;
+                uint32_t order = 0;
+                for (uint32_t k = 0; k < nnodes; k++) {
+                    size_t idx = (size_t)k * n + i;
+                    uint8_t s = states[idx];
+                    if (s == DSM_PAGE_S || s == DSM_PAGE_M) {
+                        uint32_t slot = nodes[k].slot;
+                        copyset[slot / 8] |= (uint8_t)(1u << (slot % 8));
+                        if (pid == 0 && pids[idx] != 0) {
+                            pid   = pids[idx];
+                            order = orders[idx];
+                        }
+                    }
+                }
+
+                char cps[8 * MAX_NODES + 4];
+                char pidbuf[16];
+                report_format_copyset(copyset, cps, sizeof(cps));
+
+                if (cps[0] != '-') {
+                    materialized++;
+                    fprintf(global,
+                            "<tr><td>%u</td><td>%u</td><td>%s</td><td>%u</td>"
+                            "<td>%s</td><td>%u</td></tr>\n",
+                            page, ring_home_of(ctx, page),
+                            report_pid_text(pid, pidbuf, sizeof(pidbuf)),
+                            order, cps, report_stripe(ctx, page));
+                }
+
+                for (uint32_t k = 0; k < nfiles; k++) {
+                    size_t idx = (size_t)k * n + i;
+                    uint8_t s = states[idx];
+                    if (s == DSM_PAGE_I) continue;
+                    fprintf(files[k].fp,
+                            "<tr><td>%u</td><td>%s</td><td>%u</td>"
+                            "<td>%s</td><td>%u</td><td>%s</td><td>%u</td></tr>\n",
+                            page, report_state_name(s),
+                            ring_home_of(ctx, page),
+                            report_pid_text(pids[idx], pidbuf, sizeof(pidbuf)),
+                            orders[idx], cps, report_stripe(ctx, page));
+                }
             }
 
-            for (uint32_t k = 0; k < nfiles; k++) {
-                uint8_t s = states[(size_t)k * n + i];
-                if (s == DSM_PAGE_I) continue;
-                fprintf(files[k].fp,
-                        "<tr><td>%u</td><td>%s</td><td>%u</td><td>%u</td>"
-                        "<td>%s</td><td>%u</td></tr>\n",
-                        page, report_state_name(s),
-                        ring_home_of(ctx, page), report_order(ctx, page),
-                        cps, report_stripe(ctx, page));
-            }
+            run_done += n;
+            row_budget -= n;
         }
     }
 
+    free(runs);
     free(states);
+    free(pids);
+    free(orders);
     free(recs);
 
     if (materialized == 0) {
         fprintf(global,
-                "<tr><td colspan=\"5\">No hay paginas materializadas en la "
+                "<tr><td colspan=\"6\">No hay paginas materializadas en la "
                 "vista.</td></tr>\n");
     }
 

@@ -57,7 +57,7 @@ static void write_config(void)
     fclose(file);
 }
 
-static child_t start_child(const char *role)
+static child_t start_child(const char *role, const char *extra_arg)
 {
     int input_pipe[2];
     int output_pipe[2];
@@ -76,7 +76,11 @@ static child_t start_child(const char *role)
         close(output_pipe[0]);
         close(output_pipe[1]);
         if (null_fd >= 0) close(null_fd);
-        execl(TEST_APP, TEST_APP, role, CONF_PATH, (char *)NULL);
+        if (extra_arg) {
+            execl(TEST_APP, TEST_APP, role, CONF_PATH, extra_arg, (char *)NULL);
+        } else {
+            execl(TEST_APP, TEST_APP, role, CONF_PATH, (char *)NULL);
+        }
         _exit(127);
     }
 
@@ -110,6 +114,32 @@ static bool expect_line(child_t *child, const char *expected)
     }
     printf("  %s", line);
     return strstr(line, expected) != NULL;
+}
+
+/* Lee la linea A_READY PASS y copia la dirección virtual publicada por A. El
+ * resto de nodos no recibe el mismo rango de dsm_alloc: el mapa global entrega
+ * páginas distintas, así que B solo puede compartir el bloque si conoce la VA
+ * que A reservó. */
+static bool expect_a_ready(child_t *child, char *va, size_t va_cap)
+{
+    char line[512];
+    static const char marker[] = "A_READY PASS ";
+
+    if (!read_line(child, line, sizeof(line))) {
+        printf("  FAIL: no se recibio '%s' dentro del timeout\n", marker);
+        return false;
+    }
+    printf("  %s", line);
+
+    const char *pos = strstr(line, marker);
+    if (!pos) return false;
+    pos += sizeof(marker) - 1;
+
+    size_t n = strcspn(pos, "\r\n");
+    if (n == 0 || n >= va_cap) return false;
+    memcpy(va, pos, n);
+    va[n] = '\0';
+    return true;
 }
 
 static void send_command(child_t *child, const char *command)
@@ -169,13 +199,14 @@ int main(void)
 {
     child_t node_a = { 0 };
     child_t node_b = { 0 };
+    char va[64] = "";
     bool pass = true;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     write_config();
     printf("=== Integracion DSM: dos nodos y flujo MSI ===\n");
 
-    node_a = start_child("A");
+    node_a = start_child("A", NULL);
     if (node_a.pid < 0 || !node_a.input || !node_a.output) {
         printf("FAIL: no se pudo iniciar nodo A\n");
         stop_child(&node_a);
@@ -183,9 +214,9 @@ int main(void)
         return 1;
     }
     pass = expect_line(&node_a, "A_AFTER_WRITE stats") &&
-           expect_line(&node_a, "A_READY PASS");
+           expect_a_ready(&node_a, va, sizeof(va));
 
-    node_b = start_child("B");
+    node_b = pass ? start_child("B", va) : node_b;
     if (node_b.pid < 0 || !node_b.input || !node_b.output) {
         printf("FAIL: no se pudo iniciar nodo B\n");
         pass = false;

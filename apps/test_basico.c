@@ -74,7 +74,7 @@ static int run_node_a(const char *conf_path)
 
     fill_pattern((uint32_t *)base, 0xA0000000u);
     print_stats("A_AFTER_WRITE");
-    printf("A_READY PASS\n");
+    printf("A_READY PASS %p\n", base);
     fflush(stdout);
 
     if (!wait_for_command("READ")) {
@@ -91,14 +91,24 @@ static int run_node_a(const char *conf_path)
     return ok ? 0 : 1;
 }
 
-static int run_node_b(const char *conf_path)
+static int run_node_b(const char *conf_path, const char *va_text)
 {
-    void *base = NULL;
+    void *own = NULL;
     int ok = 1;
+
+    char *end = NULL;
+    unsigned long long raw = strtoull(va_text, &end, 0);
+
+    if (end == va_text || raw == 0 ||
+        raw % (unsigned long long)PAGE_BYTES != 0) {
+        printf("B INIT/ADDR FAIL\n");
+        return 1;
+    }
+    void *base = (void *)(uintptr_t)raw;
 
     if (dsm_init(conf_path, 0) != DSM_OK ||
         dsm_thread_attach() != DSM_OK ||
-        dsm_alloc(PAGE_BYTES, &base) != DSM_OK) {
+        dsm_alloc(PAGE_BYTES, &own) != DSM_OK) {
         printf("B INIT/ALLOC FAIL\n");
         return 1;
     }
@@ -122,14 +132,16 @@ static int run_node_b(const char *conf_path)
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    if (argc != 3 || (strcmp(argv[1], "A") != 0 && strcmp(argv[1], "B") != 0)) {
-        fprintf(stderr, "Uso: %s <A|B> <config>\n", argv[0]);
+    bool is_a = (argc >= 2 && strcmp(argv[1], "A") == 0);
+    bool is_b = (argc >= 2 && strcmp(argv[1], "B") == 0);
+
+    if (!((is_a && argc == 3) || (is_b && argc == 4))) {
+        fprintf(stderr, "Uso: %s A <config>\n"
+                        "     %s B <config> <direccion-de-A>\n",
+                argv[0], argv[0]);
         return 2;
     }
 
-    setenv("DSM_NODE_TAG",
-           strcmp(argv[1], "A") == 0 ? "integration_a" : "integration_b", 1);
-    return (strcmp(argv[1], "A") == 0)
-               ? run_node_a(argv[2])
-               : run_node_b(argv[2]);
+    setenv("DSM_NODE_TAG", is_a ? "integration_a" : "integration_b", 1);
+    return is_a ? run_node_a(argv[2]) : run_node_b(argv[2], argv[3]);
 }

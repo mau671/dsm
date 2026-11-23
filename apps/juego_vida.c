@@ -165,7 +165,7 @@ static uint8_t *leer_imagen_gris(const char *ruta, uint32_t ancho, uint32_t alto
             if (errno == EINTR) {
                 continue;
             }
-            fprintf(stderr, "juego_vida: fallo al leer '%s': %s\n", ruta,
+            fprintf(stderr, "juego_vida: falló al leer '%s': %s\n", ruta,
                     strerror(errno));
             close(fd);
             free(datos);
@@ -179,7 +179,7 @@ static uint8_t *leer_imagen_gris(const char *ruta, uint32_t ancho, uint32_t alto
     close(fd);
 
     if (leidos != (size_t)esperado) {
-        fprintf(stderr, "juego_vida: '%s' quedo incompleto\n", ruta);
+        fprintf(stderr, "juego_vida: '%s' quedó incompleto\n", ruta);
         free(datos);
         return NULL;
     }
@@ -378,18 +378,19 @@ static void imprimir_estadisticas_dsm(void)
 {
     dsm_stats_t stats;
     if (dsm_stats(&stats) != DSM_OK) {
-        printf("Estadisticas DSM: no disponibles\n");
+        printf("Estadísticas DSM: no disponibles\n");
         return;
     }
-    printf("Fallos de pagina: lectura=%lu escritura=%lu\n",
+    printf("Fallos de página: lectura=%lu escritura=%lu\n",
            (unsigned long)stats.read_faults,
            (unsigned long)stats.write_faults);
-    printf("Paginas locales: M=%lu S=%lu I=%lu\n",
+    printf("Páginas locales: M=%lu S=%lu I=%lu\n",
            (unsigned long)stats.pages_m,
            (unsigned long)stats.pages_s,
            (unsigned long)stats.pages_i);
-    printf("Latencia promedio por fallo: %lu us (%lu fallos atendidos)\n",
-           (unsigned long)stats.fault_latency_us_avg,
+    printf("Latencia promedio por fallo : %lu µs\n",
+           (unsigned long)stats.fault_latency_us_avg);
+    printf("Fallos atendidos            : %lu\n",
            (unsigned long)stats.faults_serviced);
     printf("Mensajes: enviados=%lu recibidos=%lu\n",
            (unsigned long)stats.msgs_sent,
@@ -408,17 +409,17 @@ static void informar_sin_espacio(uint64_t bytes_tablero)
     bool hay_nodos = (dsm_node_count(&nodos) == DSM_OK);
 
     fprintf(stderr, "juego_vida: el tablero no cabe en la memoria DSM\n");
-    fprintf(stderr, "  se necesitan %llu MiB (dos tableros de %llu B)\n",
+    fprintf(stderr, "  se necesitan %llu MiB en dos tableros de %llu B\n",
             (unsigned long long)((2 * bytes_tablero + UN_MIB - 1) / UN_MIB),
             (unsigned long long)bytes_tablero);
     if (hay_total && hay_nodos) {
-        fprintf(stderr, "  el cluster aporta %llu MiB en %u nodo(s)\n",
+        fprintf(stderr, "  el clúster aporta %llu MiB en %u nodos\n",
                 (unsigned long long)(total / UN_MIB), nodos);
     } else if (hay_total) {
-        fprintf(stderr, "  el cluster aporta %llu MiB\n",
+        fprintf(stderr, "  el clúster aporta %llu MiB\n",
                 (unsigned long long)(total / UN_MIB));
     } else {
-        fprintf(stderr, "  no se pudo consultar el tamano del cluster\n");
+        fprintf(stderr, "  no se pudo consultar el tamaño del clúster\n");
     }
     fprintf(stderr, "  reduzca <ancho> o <alto> para que el tablero quepa\n");
 }
@@ -483,7 +484,7 @@ static bool comparar_tableros(const uint8_t *dsm, const uint8_t *referencia,
         return true;
     }
 
-    printf("  DIVERGENCIAS: %llu celdas distintas de %llu\n",
+    printf("  Divergencias: %llu celdas distintas de %llu\n",
            (unsigned long long)distintas,
            (unsigned long long)((uint64_t)ancho * alto));
     printf("  Primera diferencia en fila %u, columna %u: DSM=%u secuencial=%u\n",
@@ -504,7 +505,7 @@ static int verificar_secuencial(const uint8_t *tablero_dsm,
 
     if (!ref_a || !ref_b) {
         fprintf(stderr, "juego_vida: sin memoria local para la referencia "
-                        "secuencial (%llu MiB)\n",
+                        "secuencial de %llu MiB\n",
                 (unsigned long long)((2 * (uint64_t)celdas + UN_MIB - 1) / UN_MIB));
         free(ref_a);
         free(ref_b);
@@ -523,14 +524,14 @@ static int verificar_secuencial(const uint8_t *tablero_dsm,
 
     const uint8_t *final_ref = (generaciones & 1u) ? ref_b : ref_a;
 
-    printf("Verificacion secuencial\n");
-    printf("  Simulacion de referencia: %u generaciones en %.3f s\n",
+    printf("Verificación secuencial\n");
+    printf("  Simulación de referencia: %u generaciones en %.3f s\n",
            generaciones, segundos);
 
     uint64_t diferencias = 0;
     if (comparar_tableros(tablero_dsm, final_ref, ancho, alto, &diferencias)) {
         printf("  Coincidencia exacta: el tablero DSM y la referencia "
-               "secuencial son identicos (%llu celdas)\n",
+               "secuencial son idénticos en %llu celdas\n",
                (unsigned long long)((uint64_t)ancho * alto));
         rc = 0;
     }
@@ -560,8 +561,7 @@ static int procesar(const char *conf, uint32_t ancho, uint32_t alto,
 
     dsm_status_t st = dsm_init(conf, 0);
     if (st != DSM_OK) {
-        fprintf(stderr, "juego_vida: dsm_init fallo: %s (%d)\n",
-                dsm_strerror(st), (int)st);
+        fprintf(stderr, "juego_vida: dsm_init falló: %s\n", dsm_strerror(st));
         return 1;
     }
 
@@ -570,8 +570,8 @@ static int procesar(const char *conf, uint32_t ancho, uint32_t alto,
      * alternativa. */
     st = dsm_thread_attach();
     if (st != DSM_OK) {
-        fprintf(stderr, "juego_vida: dsm_thread_attach fallo: %s (%d)\n",
-                dsm_strerror(st), (int)st);
+        fprintf(stderr, "juego_vida: dsm_thread_attach falló: %s\n",
+                dsm_strerror(st));
         goto fin_dsm;
     }
 
@@ -581,15 +581,15 @@ static int procesar(const char *conf, uint32_t ancho, uint32_t alto,
 
     st = dsm_alloc(bytes_tablero, &mem_a);
     if (st != DSM_OK) {
-        fprintf(stderr, "juego_vida: dsm_alloc del primer tablero fallo: %s (%d)\n",
-                dsm_strerror(st), (int)st);
+        fprintf(stderr, "juego_vida: dsm_alloc del primer tablero falló: %s\n",
+                dsm_strerror(st));
         informar_sin_espacio(bytes_tablero);
         goto fin_dsm;
     }
     st = dsm_alloc(bytes_tablero, &mem_b);
     if (st != DSM_OK) {
-        fprintf(stderr, "juego_vida: dsm_alloc del segundo tablero fallo: %s (%d)\n",
-                dsm_strerror(st), (int)st);
+        fprintf(stderr, "juego_vida: dsm_alloc del segundo tablero falló: %s\n",
+                dsm_strerror(st));
         informar_sin_espacio(bytes_tablero);
         goto fin_a;
     }
@@ -602,8 +602,8 @@ static int procesar(const char *conf, uint32_t ancho, uint32_t alto,
 
     printf("Juego de la vida sobre memoria DSM\n");
     printf("Tablero: %u x %u celdas\n", ancho, alto);
-    printf("Reserva DSM: dos tableros de %llu B (%.2f MiB por tablero, "
-           "%.2f MiB en total)\n",
+    printf("Reserva DSM: dos tableros de %llu B, %.2f MiB por tablero y "
+           "%.2f MiB en total\n",
            (unsigned long long)bytes_tablero,
            (double)bytes_tablero / (double)UN_MIB,
            2.0 * (double)bytes_tablero / (double)UN_MIB);
@@ -611,12 +611,15 @@ static int procesar(const char *conf, uint32_t ancho, uint32_t alto,
         printf("Estado inicial: imagen real de %u x %u, celdas vivas: %llu\n",
                ancho, alto, (unsigned long long)vivas_iniciales);
     } else if (patron) {
-        printf("Patron: %s (%u x %u centrado), celdas vivas iniciales: %llu\n",
-               patron->nombre, patron->filas, patron->columnas,
+        printf("Patrón: %s\n", patron->nombre);
+        printf("Tamaño: %u x %u centrado\n",
+               patron->filas, patron->columnas);
+        printf("Celdas vivas iniciales: %llu\n",
                (unsigned long long)vivas_iniciales);
     } else {
-        printf("Semilla: 0x%08X (densidad %u%%), celdas vivas iniciales: %llu\n",
-               SEMILLA_INICIAL, DENSIDAD_PORCENTAJE,
+        printf("Semilla: 0x%08X\n", SEMILLA_INICIAL);
+        printf("Densidad: %u%%\n", DENSIDAD_PORCENTAJE);
+        printf("Celdas vivas iniciales: %llu\n",
                (unsigned long long)vivas_iniciales);
     }
     printf("Generaciones: %u, hilos: %u, borde toroidal\n", generaciones, hilos);
@@ -646,7 +649,7 @@ static int procesar(const char *conf, uint32_t ancho, uint32_t alto,
         goto fin_b;
     }
     if (pthread_cond_init(&comun.puerta_cond, NULL) != 0) {
-        fprintf(stderr, "juego_vida: no se pudo inicializar la condicion de arranque\n");
+        fprintf(stderr, "juego_vida: no se pudo inicializar la condición de arranque\n");
         pthread_mutex_destroy(&comun.puerta_mu);
         pthread_barrier_destroy(&comun.barrera);
         goto fin_b;
@@ -683,7 +686,7 @@ static int procesar(const char *conf, uint32_t ancho, uint32_t alto,
     uint64_t fin = instante_ns();
 
     if (fallo) {
-        fprintf(stderr, "juego_vida: algun hilo no pudo procesar su bloque de filas\n");
+        fprintf(stderr, "juego_vida: algún hilo no pudo procesar su bloque de filas\n");
         goto fin_comun;
     }
 
@@ -703,9 +706,8 @@ static int procesar(const char *conf, uint32_t ancho, uint32_t alto,
     printf("Generaciones ejecutadas: %u\n", generaciones);
     printf("Celdas vivas finales: %llu\n", (unsigned long long)vivas);
     printf("Tiempo total: %.3f s\n", segundos);
-    printf("Rendimiento: %.0f celdas/s (%.2f Mcel/s)\n",
-           por_segundo, por_segundo / 1e6);
-    printf("Tablero: %.2f MiB por generacion\n",
+    printf("Rendimiento: %.0f celdas/s\n", por_segundo);
+    printf("Tablero: %.2f MiB por generación\n",
            (double)bytes_tablero / (double)UN_MIB);
     imprimir_estadisticas_dsm();
 
@@ -751,12 +753,12 @@ static void uso(const char *programa)
             "Uso: %s [--verificar] [--patron <nombre>] [--conf <archivo>]\n"
             "          <ancho> <alto> <generaciones> [hilos]\n"
             "\n"
-            "  --verificar        compara el tablero final con una simulacion\n"
+            "  --verificar        compara el tablero final con una simulación\n"
             "                     secuencial en memoria normal\n"
-            "  --patron <nombre>  siembra un patron clasico: %s, %s o %s\n"
+            "  --patron <nombre>  siembra un patrón clásico: %s, %s o %s\n"
             "  --imagen <archivo> siembra el tablero con una imagen en escala\n"
-            "                     de grises del tamano exacto del tablero\n"
-            "  --conf <archivo>   configuracion del cluster; por defecto dsm.conf\n",
+            "                     de grises del tamaño exacto del tablero\n"
+            "  --conf <archivo>   configuración del clúster; por defecto dsm.conf\n",
             programa,
             PATRONES[0].nombre, PATRONES[1].nombre, PATRONES[2].nombre);
 }
@@ -800,7 +802,7 @@ int main(int argc, char **argv)
             uso(argv[0]);
             return 0;
         } else if (argv[i][0] == '-' && argv[i][1] == '-') {
-            fprintf(stderr, "juego_vida: opcion desconocida '%s'\n", argv[i]);
+            fprintf(stderr, "juego_vida: opción desconocida '%s'\n", argv[i]);
             uso(argv[0]);
             return 2;
         } else {
@@ -842,7 +844,7 @@ int main(int argc, char **argv)
     if (nombre_patron) {
         patron = buscar_patron(nombre_patron);
         if (!patron) {
-            fprintf(stderr, "juego_vida: patron desconocido '%s'\n", nombre_patron);
+            fprintf(stderr, "juego_vida: patrón desconocido '%s'\n", nombre_patron);
             uso(argv[0]);
             return 2;
         }
@@ -851,8 +853,8 @@ int main(int argc, char **argv)
     uint32_t ancho, alto, generaciones;
     if (!parsear_entero(posicional[0], LADO_MAXIMO, &ancho) ||
         !parsear_entero(posicional[1], LADO_MAXIMO, &alto)) {
-        fprintf(stderr, "juego_vida: dimensiones invalidas '%s' x '%s' "
-                        "(rango 1..%u)\n",
+        fprintf(stderr, "juego_vida: dimensiones inválidas '%s' x '%s'; "
+                        "el rango válido es 1 a %u\n",
                 posicional[0], posicional[1], LADO_MAXIMO);
         return 2;
     }
@@ -862,21 +864,21 @@ int main(int argc, char **argv)
         return 2;
     }
     if ((uint64_t)ancho * alto > MAX_CELDAS) {
-        fprintf(stderr, "juego_vida: %u x %u supera el maximo de %llu celdas\n",
+        fprintf(stderr, "juego_vida: %u x %u supera el máximo de %llu celdas\n",
                 ancho, alto, (unsigned long long)MAX_CELDAS);
         return 2;
     }
     if (!parsear_entero(posicional[2], MAX_GENERACIONES, &generaciones)) {
-        fprintf(stderr, "juego_vida: numero de generaciones invalido '%s' "
-                        "(rango 1..%u)\n",
+        fprintf(stderr, "juego_vida: número de generaciones inválido '%s'; "
+                        "el rango válido es 1 a %u\n",
                 posicional[2], MAX_GENERACIONES);
         return 2;
     }
 
     uint32_t hilos = 4;
     if (npos == 4 && !parsear_entero(posicional[3], MAX_HILOS, &hilos)) {
-        fprintf(stderr, "juego_vida: numero de hilos invalido '%s' "
-                        "(rango 1..%u)\n",
+        fprintf(stderr, "juego_vida: número de hilos inválido '%s'; "
+                        "el rango válido es 1 a %u\n",
                 posicional[3], MAX_HILOS);
         return 2;
     }
@@ -891,7 +893,7 @@ int main(int argc, char **argv)
     if (verificar && (uint64_t)ancho * alto > MAX_CELDAS_VERIF) {
         fprintf(stderr, "juego_vida: --verificar admite hasta %llu celdas; "
                         "el tablero tiene %llu y la referencia secuencial "
-                        "necesitaria %llu MiB de memoria local\n",
+                        "necesitaría %llu MiB de memoria local\n",
                 (unsigned long long)MAX_CELDAS_VERIF,
                 (unsigned long long)((uint64_t)ancho * alto),
                 (unsigned long long)((2 * (uint64_t)ancho * alto +

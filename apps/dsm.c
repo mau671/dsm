@@ -1,6 +1,7 @@
 #include "dsm.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -16,34 +17,45 @@ int main(int argc, char **argv)
 {
     const char *conf_path = (argc > 1) ? argv[1] : "dsm.conf";
 
-    printf("Iniciando nodo DSM Daemon con configuracion '%s'...\n", conf_path);
+    printf("Iniciando el nodo DSM con la configuración '%s'.\n", conf_path);
 
-    signal(SIGINT, on_sigint);
-    signal(SIGTERM, on_sigint);
+    /* Registro con sigaction y SA_RESTART, como exige el manejo de señales
+     * del proyecto: una interrupción no aborta llamadas al sistema en curso
+     * y el ciclo principal solo observa la bandera de parada. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigint;
+    sa.sa_flags   = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGINT, &sa, NULL) != 0 ||
+        sigaction(SIGTERM, &sa, NULL) != 0) {
+        fprintf(stderr, "No se pudo registrar el manejador de terminación.\n");
+        return 1;
+    }
 
     dsm_status_t st = dsm_init(conf_path, 0);
     if (st != DSM_OK) {
-        fprintf(stderr, "Error al inicializar DSM: %s (%d)\n", dsm_strerror(st), st);
+        fprintf(stderr, "Error al inicializar DSM: %s\n", dsm_strerror(st));
         return 1;
     }
 
     uint32_t slot = 0;
     dsm_node_id(&slot);
-    printf("Nodo activo y en ejecucion (Slot %u). Presione Ctrl+C para detener.\n", slot);
+    printf("Nodo activo en la ranura %u. Pulse Ctrl+C para detenerlo.\n", slot);
 
     while (!g_stop) {
         sleep(1);
     }
 
-    printf("\nRecibida señal de terminacion. Finalizando nodo...\n");
+    printf("\nRecibida señal de terminación. Finalizando nodo.\n");
 
     dsm_stats_t stats;
     if (dsm_stats(&stats) == DSM_OK) {
-        printf("--- Estadisticas finales del nodo ---\n");
-        printf("Mensajes enviados : %lu\n", (unsigned long)stats.msgs_sent);
-        printf("Mensajes recibidos: %lu\n", (unsigned long)stats.msgs_recv);
-        printf("Fallos de lectura : %lu\n", (unsigned long)stats.read_faults);
-        printf("Fallos de escrit. : %lu\n", (unsigned long)stats.write_faults);
+        printf("Estadísticas finales del nodo\n");
+        printf("Mensajes enviados   : %lu\n", (unsigned long)stats.msgs_sent);
+        printf("Mensajes recibidos  : %lu\n", (unsigned long)stats.msgs_recv);
+        printf("Fallos de lectura   : %lu\n", (unsigned long)stats.read_faults);
+        printf("Fallos de escritura : %lu\n", (unsigned long)stats.write_faults);
     }
 
     dsm_finalize();

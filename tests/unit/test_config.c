@@ -514,7 +514,7 @@ static int test_raw_hash_single_byte_sensitivity(void)
             CHECK(m.raw_hash != ref.raw_hash);
         } else {
             rejected++;
-            /* Rechazo explicito: siginifica que el byte alterado rompio el
+            /* Rechazo explicito: significa que el byte alterado rompio el
              * parseo, lo cual tambien es una diferencia detectable. */
             CHECK(rc == DSM_ERR_CONFIG);
         }

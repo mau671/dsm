@@ -744,8 +744,6 @@ static int test_wire_payload_ok_matrix(void)
     CHECK(wire_payload_ok(MSG_LEAVE, 0, 27, ps) == false);
     CHECK(wire_payload_ok(MSG_NODE_DOWN, 0, 0, ps) == true);
     CHECK(wire_payload_ok(MSG_NODE_DOWN, 0, 28, ps) == true);
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_REQ, 0, 0, ps) == true);
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_REQ, 0, 28, ps) == true);
 
     /* MENSAJES sin carga */
     CHECK(wire_payload_ok(MSG_PAGE_REQUEST, 0, 0, ps) == true);
@@ -788,7 +786,7 @@ static int test_message_classification(void)
     /* Nombres de tipo: cada mensaje definido debe tener nombre != UNKNOWN */
     static const uint16_t all_types[] = {
         MSG_HELLO, MSG_WELCOME, MSG_JOIN, MSG_JOIN_ACK, MSG_HEARTBEAT,
-        MSG_LEAVE, MSG_NODE_DOWN, MSG_MEMBERSHIP_REQ, MSG_MEMBERSHIP_RESP,
+        MSG_LEAVE, MSG_NODE_DOWN,
         MSG_PAGE_MOVE, MSG_PAGE_MOVE_ACK, MSG_PAGE_REQUEST, MSG_PAGE_DATA,
         MSG_GRANT, MSG_INVALIDATE, MSG_INVALIDATE_ACK, MSG_DOWNGRADE,
         MSG_DOWNGRADE_ACK, MSG_WRITEBACK, MSG_WRITEBACK_ACK,
@@ -821,7 +819,6 @@ static int test_message_classification(void)
     CHECK(dsm_msg_is_membership(MSG_HELLO) == true);
     CHECK(dsm_msg_is_membership(MSG_WELCOME) == true);
     CHECK(dsm_msg_is_membership(MSG_JOIN) == true);
-    CHECK(dsm_msg_is_membership(MSG_MEMBERSHIP_RESP) == true);
     CHECK(dsm_msg_is_membership(MSG_PAGE_DATA) == false);
     CHECK(dsm_msg_is_membership(MSG_LOCK_REQ) == false);
 
@@ -1384,20 +1381,6 @@ static int test_rig_payload_ok_por_tipo(void)
     CHECK(wire_payload_ok(MSG_LEAVE, 0, 0, ps) == true);
     CHECK(wire_payload_ok(MSG_LEAVE, 0, 28, ps) == true);
     CHECK(wire_payload_ok(MSG_LEAVE, 0, 27, ps) == false);
-
-    /* MEMBERSHIP_REQ: 0 o 28. */
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_REQ, 0, 0, ps) == true);
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_REQ, 0, 28, ps) == true);
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_REQ, 0, 13, ps) == false);
-
-    /* MEMBERSHIP_RESP: 12 + 36*n, con n >= 0. */
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_RESP, 0, 12, ps) == true);
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_RESP, 0, 12 + 36, ps) == true);
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_RESP, 0, 12 + 2 * 36, ps) == true);
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_RESP, 0, 11, ps) == false);
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_RESP, 0, 13, ps) == false);
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_RESP, 0, 12 + 35, ps) == false);
-    CHECK(wire_payload_ok(MSG_MEMBERSHIP_RESP, 0, max + 1, ps) == false);
 
     /* WELCOME: min 32 (count=0, alloc_count=0) y cota global. */
     CHECK(wire_payload_ok(MSG_WELCOME, 0, 32, ps) == true);

@@ -63,7 +63,7 @@ static const char *node_state_name(uint8_t state)
     case DSM_NODE_ALIVE:   return "ALIVE";
     case DSM_NODE_SUSPECT: return "SUSPECT";
     case DSM_NODE_DEAD:    return "DEAD";
-    default:               return "DESCONOCIDO";
+    default:               return "Desconocido";
     }
 }
 
@@ -195,7 +195,7 @@ static int query_exchange(query_conn_t *c, uint8_t kind, uint8_t scope,
         goto out;
     }
     if (rx_hdr.type != MSG_QUERY_RESP) {
-        fprintf(stderr, "dsmctl: respuesta inesperada del nodo (%s)\n",
+        fprintf(stderr, "dsmctl: respuesta inesperada del nodo: %s\n",
                 dsm_msg_type_name(rx_hdr.type));
         rc = DSM_ERR_PROTO;
         goto out;
@@ -206,7 +206,7 @@ static int query_exchange(query_conn_t *c, uint8_t kind, uint8_t scope,
         goto out;
     }
     if (rx_hdr.status != DSM_ST_OK) {
-        fprintf(stderr, "dsmctl: el nodo rechazó la consulta (status %u)\n",
+        fprintf(stderr, "dsmctl: el nodo rechazó la consulta con estado %u\n",
                 (unsigned)rx_hdr.status);
         rc = DSM_ERR_PROTO;
         goto out;
@@ -225,7 +225,7 @@ static int query_exchange(query_conn_t *c, uint8_t kind, uint8_t scope,
         goto out;
     }
     if (dsm_wire_validate(&rx_hdr, rx_hdr_raw, rx, c->cluster_id) != DSM_OK) {
-        fprintf(stderr, "dsmctl: CRC32 o cluster_id inválidos en la respuesta\n");
+        fprintf(stderr, "dsmctl: CRC32 o identificador de clúster inválidos en la respuesta\n");
         rc = DSM_ERR_PROTO;
         goto out;
     }
@@ -250,36 +250,42 @@ static int cmd_stats(query_conn_t *c)
                             &resp, rx, &rx_len);
     if (rc != DSM_OK) return rc;
     if (resp.kind != DSM_QUERY_STATS || resp.count != 1 ||
-        rx_len != DSM_QUERY_RESP_HDR_LEN + 48u) {
+        rx_len != DSM_QUERY_RESP_HDR_LEN + DSM_STATS_WIRE_LEN) {
         fprintf(stderr, "dsmctl: carga de estadísticas inválida\n");
         return DSM_ERR_PROTO;
     }
 
-    uint64_t v[6];
-    for (uint32_t i = 0; i < 6; i++) {
-        memcpy(&v[i], rx + DSM_QUERY_RESP_HDR_LEN + i * 8, 8);
-        v[i] = dsm_ntohll(v[i]);
-    }
+    stats_wire_t st;
+    dsm_unpack_stats(rx + DSM_QUERY_RESP_HDR_LEN, &st);
 
     char sent[32], recv[32];
-    format_bytes(v[4], sent, sizeof(sent));
-    format_bytes(v[5], recv, sizeof(recv));
+    format_bytes(st.bytes_sent, sent, sizeof(sent));
+    format_bytes(st.bytes_recv, recv, sizeof(recv));
 
-    print_rule('=', 62);
     printf("Estadísticas del nodo consultado\n");
-    print_rule('=', 62);
-    printf("  Fallos de lectura        : %lu\n", (unsigned long)v[0]);
-    printf("  Fallos de escritura      : %lu\n", (unsigned long)v[1]);
-    printf("  Mensajes enviados        : %lu\n", (unsigned long)v[2]);
-    printf("  Mensajes recibidos       : %lu\n", (unsigned long)v[3]);
-    printf("  Bytes enviados           : %lu (%s)\n",
-           (unsigned long)v[4], sent);
-    printf("  Bytes recibidos          : %lu (%s)\n",
-           (unsigned long)v[5], recv);
-    if (v[0] + v[1] > 0) {
+    printf("  Fallos de lectura        : %lu\n", (unsigned long)st.read_faults);
+    printf("  Fallos de escritura      : %lu\n", (unsigned long)st.write_faults);
+    printf("  Mensajes enviados        : %lu\n", (unsigned long)st.msgs_sent);
+    printf("  Mensajes recibidos       : %lu\n", (unsigned long)st.msgs_recv);
+    printf("  Bytes enviados           : %lu, equivalente a %s\n",
+           (unsigned long)st.bytes_sent, sent);
+    printf("  Bytes recibidos          : %lu, equivalente a %s\n",
+           (unsigned long)st.bytes_recv, recv);
+    if (st.read_faults + st.write_faults > 0) {
         printf("  Fallos totales           : %lu\n",
-               (unsigned long)(v[0] + v[1]));
+               (unsigned long)(st.read_faults + st.write_faults));
     }
+    printf("  Tareas distribuidas      : %lu correctas, %lu fallidas\n",
+           (unsigned long)st.dist_tasks_run,
+           (unsigned long)st.dist_tasks_failed);
+    printf("  Deltas de paridad        : %lu\n",
+           (unsigned long)st.parity_deltas);
+    printf("  Franjas reconstruidas    : %lu\n",
+           (unsigned long)st.stripe_rebuilds);
+    printf("  Respuestas descartadas   : %lu\n",
+           (unsigned long)st.tseq_discarded);
+    printf("  Latidos perdidos         : %lu\n",
+           (unsigned long)st.hb_missed);
     return DSM_OK;
 }
 
@@ -314,11 +320,11 @@ static int cmd_nodes(query_conn_t *c, const cli_opts_t *opts)
         /* La cabecera se imprime una vez confirmada la primera respuesta,
          * para no mostrar una tabla vacía si el nodo no contesta. */
         if (!header_printed) {
-            print_rule('=', 104);
-            printf("%-4s  %-36s  %-15s  %-5s  %-15s  %-8s  %-8s  %s\n",
-                   "Slot", "UUID", "IP", "Puerto", "Estado", "Páginas",
-                   "Libres", "Epoch");
-            print_rule('=', 104);
+            print_rule('=', 118);
+            printf("%-4s  %-36s  %-15s  %-5s  %-8s  %-15s  %-8s  %-8s  %s\n",
+                   "Ranura", "UUID", "IP", "Puerto", "Rol", "Estado",
+                   "Páginas", "Libres", "Época");
+            print_rule('=', 118);
             header_printed = true;
         }
 
@@ -330,22 +336,23 @@ static int cmd_nodes(query_conn_t *c, const cli_opts_t *opts)
             char uuid[37];
             char ip[INET_ADDRSTRLEN];
             char estado[32];
+            const char *rol;
             uuid_to_str(rec.uuid, uuid);
             format_ip(rec.ip, ip, sizeof(ip));
+            snprintf(estado, sizeof(estado), "%s", node_state_name(rec.state));
 
             /* Un miembro que no aporta páginas es un cliente: usa la memoria
              * del cluster sin custodiar ninguna página. */
             if (rec.mem_pages == 0) {
-                snprintf(estado, sizeof(estado), "%s (cliente)",
-                         node_state_name(rec.state));
+                rol = "cliente";
                 clients++;
             } else {
-                snprintf(estado, sizeof(estado), "%s", node_state_name(rec.state));
+                rol = "nodo";
             }
 
-            printf("%-4u  %-36s  %-15s  %-5u  %-15s  %-8u  %-8u  %lu\n",
+            printf("%-4u  %-36s  %-15s  %-5u  %-8s  %-15s  %-8u  %-8u  %lu\n",
                    rec.slot, uuid, ip, (unsigned)rec.port,
-                   estado, rec.mem_pages,
+                   rol, estado, rec.mem_pages,
                    rec.free_pages, (unsigned long)rec.epoch);
             printed++;
         }
@@ -354,7 +361,7 @@ static int cmd_nodes(query_conn_t *c, const cli_opts_t *opts)
         first += count;
     }
 
-    print_rule('-', 104);
+    print_rule('-', 118);
     printf("Nodos listados: %u\n", printed - clients);
     if (clients > 0) {
         printf("Clientes listados: %u\n", clients);
@@ -405,13 +412,11 @@ static int cmd_pages(query_conn_t *c, const cli_opts_t *opts)
         if (!resp.more) break;
     }
 
-    print_rule('=', 62);
     printf("Tabla de páginas local\n");
-    print_rule('=', 62);
     printf("  Páginas totales          : %u\n", total);
-    printf("  Estado M (modificada)    : %u\n", counts[DSM_PAGE_M]);
-    printf("  Estado S (compartida)    : %u\n", counts[DSM_PAGE_S]);
-    printf("  Estado I (inválida)      : %u\n", counts[DSM_PAGE_I]);
+    printf("  Modificadas              : %u\n", counts[DSM_PAGE_M]);
+    printf("  Compartidas              : %u\n", counts[DSM_PAGE_S]);
+    printf("  Inválidas                : %u\n", counts[DSM_PAGE_I]);
     printf("  Transiciones pendientes  : %u\n",
            counts[DSM_PAGE_IS_PEND] + counts[DSM_PAGE_IM_PEND] +
            counts[DSM_PAGE_SM_PEND]);
@@ -419,12 +424,11 @@ static int cmd_pages(query_conn_t *c, const cli_opts_t *opts)
     if (!opts->limit) return DSM_OK;
 
     printf("\n");
-    print_rule('=', 62);
     printf("Detalle de páginas [%u, %u)\n", opts->first, opts->first + opts->limit);
-    print_rule('=', 62);
-    printf("%-10s  %-6s  %-10s  %-8s  %s\n",
-           "Página", "Estado", "Home", "Versión", "Pendientes");
-    print_rule('-', 62);
+    printf("%-10s  %-6s  %-10s  %-9s  %-7s  %-8s  %s\n",
+           "Página", "Estado", "Custodio", "Proceso", "Orden", "Versión",
+           "Pendientes");
+    print_rule('-', 82);
 
     for (;;) {
         uint32_t rx_len = sizeof(rx);
@@ -449,20 +453,20 @@ static int cmd_pages(query_conn_t *c, const cli_opts_t *opts)
             dsm_unpack_page_rec(rx + DSM_QUERY_RESP_HDR_LEN + i * DSM_PAGE_REC_LEN,
                                 &rec);
 
-            char pend[24];
+            char pend[32];
             if (rec.pend_inval && rec.pend_down) {
-                snprintf(pend, sizeof(pend), "inv+deg");
+                snprintf(pend, sizeof(pend), "invalidación y degradación");
             } else if (rec.pend_inval) {
-                snprintf(pend, sizeof(pend), "inval");
+                snprintf(pend, sizeof(pend), "invalidación");
             } else if (rec.pend_down) {
-                snprintf(pend, sizeof(pend), "degrad");
+                snprintf(pend, sizeof(pend), "degradación");
             } else {
                 snprintf(pend, sizeof(pend), "-");
             }
 
-            printf("%-10u  %-6s  %-10u  %-8u  %s\n",
+            printf("%-10u  %-6s  %-10u  %-9u  %-7u  %-8u  %s\n",
                    rec.page_id, page_state_name(rec.state), rec.home,
-                   rec.version, pend);
+                   rec.pid, rec.order, rec.version, pend);
             printed++;
         }
 
@@ -470,7 +474,7 @@ static int cmd_pages(query_conn_t *c, const cli_opts_t *opts)
         first += count;
     }
 
-    print_rule('-', 62);
+    print_rule('-', 82);
     printf("Páginas mostradas: %u\n", printed);
     return DSM_OK;
 }
@@ -481,41 +485,41 @@ static int cmd_config(const cli_opts_t *opts, const dsm_config_t *cfg)
     format_bytes(cfg->view_size, view, sizeof(view));
     format_bytes(cfg->node_mem, node_mem, sizeof(node_mem));
 
-    print_rule('=', 62);
     printf("Configuración cargada: %s\n",
            opts->conf_path ? opts->conf_path : DEFAULT_CONF);
-    print_rule('=', 62);
-    printf("  CLUSTER_ID          : 0x%08X\n", cfg->cluster_id);
-    printf("  PAGE_SIZE           : %u bytes\n", cfg->page_size);
-    printf("  BASE_ADDR           : 0x%lX\n", (unsigned long)cfg->base_addr);
-    printf("  VIEW_SIZE           : %lu (%s)\n",
+    printf("  Identificador de clúster           : 0x%08X\n", cfg->cluster_id);
+    printf("  Tamaño de página                   : %u bytes\n", cfg->page_size);
+    printf("  Dirección base                     : 0x%lX\n", (unsigned long)cfg->base_addr);
+    printf("  Tamaño de vista                    : %lu, equivalente a %s\n",
            (unsigned long)cfg->view_size, view);
-    printf("  NODE_MEM            : %lu (%s)\n",
+    printf("  Memoria por nodo                   : %lu, equivalente a %s\n",
            (unsigned long)cfg->node_mem, node_mem);
-    printf("  MAX_RUNTIME_NODES   : %u\n", cfg->max_runtime_nodes);
-    printf("  VNODES_PER_MB       : %u\n", cfg->vnodes_per_mb);
-    printf("  REDUNDANCY          : %s\n",
+    printf("  Nodos máximos en ejecución         : %u\n", cfg->max_runtime_nodes);
+    printf("  Nodos virtuales por MiB            : %u\n", cfg->vnodes_per_mb);
+    printf("  Redundancia                        : %s\n",
            cfg->redundancy_raid5 ? "RAID5" : "NONE");
-    printf("  PORT_RANGE          : %u - %u\n", cfg->port_min, cfg->port_max);
-    printf("  PEER_HOSTS          : %u\n", cfg->peer_host_count);
+    printf("  Rango de puertos                   : %u - %u\n", cfg->port_min, cfg->port_max);
+    printf("  Equipos vecinos                    : %u\n", cfg->peer_host_count);
     for (uint32_t i = 0; i < cfg->peer_host_count; i++) {
         printf("    [%u] %s\n", i, cfg->peer_hosts[i]);
     }
-    printf("  TIMEOUTS            : connect=%u ms discovery=%u ms "
-           "send=%u ms request=%u ms retries=%u\n",
-           cfg->connect_timeout_ms, cfg->discovery_timeout_ms,
-           cfg->send_timeout_ms, cfg->request_timeout_ms, cfg->request_retries);
-    printf("  HEARTBEAT           : %u ms (suspect=%u, dead=%u)\n",
-           cfg->hb_interval_ms, cfg->hb_suspect, cfg->hb_dead);
-    printf("  THREADS             : workers=%u dispatchers=%u\n",
+    printf("  Conexión                           : %u ms\n", cfg->connect_timeout_ms);
+    printf("  Descubrimiento                     : %u ms\n", cfg->discovery_timeout_ms);
+    printf("  Envío                              : %u ms\n", cfg->send_timeout_ms);
+    printf("  Solicitud                          : %u ms\n", cfg->request_timeout_ms);
+    printf("  Reintentos                         : %u\n", cfg->request_retries);
+    printf("  Latidos                            : %u ms\n", cfg->hb_interval_ms);
+    printf("  Sospecha                           : %u\n", cfg->hb_suspect);
+    printf("  Caído                              : %u\n", cfg->hb_dead);
+    printf("  Hilos                              : %u trabajadores y %u despachadores\n",
            cfg->worker_threads, cfg->dispatcher_threads);
-    printf("  PAGE_LOCK_STRIPES   : %u\n", cfg->page_lock_stripes);
-    printf("  HOME_SLACK          : %u.%03u\n",
+    printf("  Franjas de cerrojo de página       : %u\n", cfg->page_lock_stripes);
+    printf("  Margen de custodio                 : %u.%03u\n",
            cfg->home_slack_permille / 1000, cfg->home_slack_permille % 1000);
-    printf("  LOCK_TIMEOUT_MS     : %u\n", cfg->lock_timeout_ms);
-    printf("  WORKER_QUEUE_CAP    : %u\n", cfg->worker_queue_cap);
-    printf("  DSM_LOG_LEVEL       : %s\n", cfg->log_level);
-    printf("  RAW_HASH            : 0x%08X\n", cfg->raw_hash);
+    printf("  Plazo de cerrojo                   : %u ms\n", cfg->lock_timeout_ms);
+    printf("  Capacidad de cola de trabajadores  : %u\n", cfg->worker_queue_cap);
+    printf("  Nivel de registro DSM              : %s\n", cfg->log_level);
+    printf("  Hash bruto                         : 0x%08X\n", cfg->raw_hash);
 
     if (opts->port_set && opts->port != cfg->port_min) {
         printf("\nAviso: se consulta el puerto %u, fuera del rango %u-%u "
@@ -527,25 +531,28 @@ static int cmd_config(const cli_opts_t *opts, const dsm_config_t *cfg)
 
 static void print_usage(const char *prog)
 {
-    printf("Uso: %s <comando> [opciones]\n", prog);
+    printf("Uso: %s [opciones] <comando> [opciones]\n", prog);
     printf("\n");
     printf("Comandos:\n");
     printf("  stats              Estadísticas del nodo consultado: fallos de\n");
-    printf("                     lectura y escritura, mensajes y bytes.\n");
-    printf("  nodes              Tabla de membresía del clúster: slot, UUID,\n");
-    printf("                     IP, puerto, estado y páginas aportadas.\n");
+    printf("                     lectura y escritura, mensajes, bytes, tareas\n");
+    printf("                     distribuidas, paridad y latidos perdidos.\n");
+    printf("  nodes              Tabla de membresía del clúster: ranura, UUID,\n");
+    printf("                     IP, puerto, rol, estado y páginas aportadas.\n");
     printf("  pages [inicio] [n] Resumen de la tabla de páginas local; con\n");
     printf("                     inicio y n imprime el detalle de ese rango.\n");
     printf("  config             Configuración cargada desde dsm.conf.\n");
     printf("  help               Muestra esta ayuda.\n");
     printf("\n");
     printf("Opciones:\n");
-    printf("  -c, --conf <ruta>  Archivo de configuración (por defecto %s).\n",
+    printf("  -c, --conf <ruta>  Archivo de configuración; por defecto %s.\n",
            DEFAULT_CONF);
-    printf("  -H, --host <host>  Nodo a consultar (por defecto %s).\n", DEFAULT_HOST);
-    printf("  -p, --port <puerto> Puerto de escucha del nodo (por defecto %u).\n",
+    printf("  -H, --host <host>  Nodo a consultar; por defecto %s.\n", DEFAULT_HOST);
+    printf("  -p, --port <puerto> Puerto de escucha del nodo; por defecto %u.\n",
            DEFAULT_PORT);
     printf("  -h, --help         Muestra esta ayuda.\n");
+    printf("\n");
+    printf("  Las opciones se aceptan antes o después del comando.\n");
     printf("\n");
     printf("Funcionamiento:\n");
     printf("  dsmctl no se une al clúster. Abre una conexión TCP efímera al\n");
@@ -558,8 +565,9 @@ static void print_usage(const char *prog)
     printf("Limitaciones:\n");
     printf("  - stats y pages reflejan la vista del nodo contactado, no una\n");
     printf("    agregación de todo el clúster.\n");
-    printf("  - pages enumera la vista completa (VIEW_SIZE / PAGE_SIZE); en la\n");
-    printf("    configuración por defecto son más de un millón de páginas.\n");
+    printf("  - pages enumera la vista completa: el tamaño de la vista entre el\n");
+    printf("    tamaño de página; en la configuración por defecto son más de un\n");
+    printf("    millón de páginas.\n");
     printf("  - nodes solo muestra los nodos presentes en la membresía del\n");
     printf("    nodo contactado; un nodo caído desaparece de esa tabla.\n");
 }
@@ -587,14 +595,17 @@ static bool parse_port_arg(const char *text, uint16_t *out)
     return true;
 }
 
-/* Devuelve el número de posicionales consumidos o -1 ante error. */
+/* Devuelve el número de posicionales consumidos o -1 ante error. El primer
+ * argumento que no sea opción es el comando; el resto son posicionales. Las
+ * opciones se aceptan antes o después del comando. */
 static int parse_args(int argc, char **argv, cli_opts_t *opts,
                       const char **command, const char **positional,
                       int max_positional)
 {
     int npos = 0;
+    *command = NULL;
 
-    for (int i = 2; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
 
         if (strcmp(arg, "-c") == 0 || strcmp(arg, "--conf") == 0) {
@@ -621,6 +632,8 @@ static int parse_args(int argc, char **argv, cli_opts_t *opts,
         } else if (arg[0] == '-' && arg[1] != '\0') {
             fprintf(stderr, "dsmctl: opción desconocida '%s'\n", arg);
             return -1;
+        } else if (*command == NULL) {
+            *command = arg;
         } else {
             if (npos >= max_positional) {
                 fprintf(stderr, "dsmctl: argumento sobrante '%s'\n", arg);
@@ -629,6 +642,8 @@ static int parse_args(int argc, char **argv, cli_opts_t *opts,
             positional[npos++] = arg;
         }
     }
+
+    if (*command == NULL) *command = "help";
     return npos;
 }
 
@@ -644,7 +659,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    const char *command = argv[1];
+    const char *command = NULL;
     const char *positional[2] = { NULL, NULL };
 
     int npos = parse_args(argc, argv, &opts, &command, positional, 2);

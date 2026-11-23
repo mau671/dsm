@@ -126,7 +126,10 @@ int main(void)
 
     void *buf = NULL;
     if (dsm_alloc(64 * 1024 * 1024, &buf) == DSM_OK) {
-        /* Los fallos de página se resuelven de forma transparente. */
+        /* Los fallos de página se resuelven de forma transparente. El mapa
+         * global entrega un rango distinto a cada reserva: para compartir el
+         * mismo bloque, los demás procesos deben usar la dirección virtual
+         * que devolvió el creador, no una reserva propia. */
         memset(buf, 0, 64 * 1024 * 1024);
         dsm_barrier(0, 2);   /* sincroniza con el otro nodo */
         dsm_free(buf, 64 * 1024 * 1024);
