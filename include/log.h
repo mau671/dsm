@@ -12,7 +12,6 @@ enum {
 };
 
 void dsm_log_set_level(int level);
-int  dsm_log_get_level(void);
 int  dsm_log_level_from_str(const char *str);
 void dsm_log_init_from_env(void);
 #if defined(__GNUC__) || defined(__clang__)

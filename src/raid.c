@@ -323,45 +323,54 @@ static uint32_t rebuild_qlen;
 
 /* --- Ciclo de vida ------------------------------------------------------- */
 
-void raid_init(dsm_ctx_t *ctx)
+int raid_init(dsm_ctx_t *ctx)
 {
-    if (!ctx) return;
+    if (!ctx) return DSM_ERR_INVALID;
     dsm_raid_t *r = &ctx->raid;
     memset(r, 0, sizeof(*r));
-    pthread_mutex_init(&r->mu, NULL);
-    pthread_cond_init(&r->cond, NULL);
-    pthread_mutex_init(&r->rebuild_mu, NULL);
+    if (pthread_mutex_init(&r->mu, NULL) != 0) {
+        return DSM_ERR_MEM;
+    }
+    if (pthread_cond_init(&r->cond, NULL) != 0) {
+        pthread_mutex_destroy(&r->mu);
+        return DSM_ERR_MEM;
+    }
+    if (pthread_mutex_init(&r->rebuild_mu, NULL) != 0) {
+        pthread_cond_destroy(&r->cond);
+        pthread_mutex_destroy(&r->mu);
+        return DSM_ERR_MEM;
+    }
     rebuild_qhead = 0;
     rebuild_qtail = 0;
     rebuild_qlen = 0;
 
-    if (!ctx->cfg.redundancy_raid5) return;
+    if (!ctx->cfg.redundancy_raid5) return DSM_OK;
 
     uint32_t k = ctx->cfg.raid_k;
     uint32_t ps = (uint32_t)ctx->mem.page_size;
     uint32_t npages = ctx->mem.npages;
     if (k < 2 || k > DSM_RAID_MAX_K || ps == 0 || npages == 0) {
         DSM_LOG_WARN("RAID5: configuracion insuficiente; paridad desactivada");
-        return;
+        return DSM_OK;
     }
 
     uint32_t nstripes = npages / k + ((npages % k) != 0 ? 1u : 0u);
     if ((size_t)nstripes > SIZE_MAX / ps) {
         DSM_LOG_WARN("RAID5: tamano de paridad fuera de rango");
-        return;
+        return DSM_OK;
     }
 
     r->stripes = calloc(nstripes, sizeof(*r->stripes));
     if (!r->stripes) {
         DSM_LOG_WARN("RAID5: sin memoria para la tabla de franjas");
-        return;
+        return DSM_OK;
     }
     r->parity = calloc((size_t)nstripes * ps, 1u);
     if (!r->parity) {
         free(r->stripes);
         r->stripes = NULL;
         DSM_LOG_WARN("RAID5: sin memoria para los marcos de paridad");
-        return;
+        return DSM_OK;
     }
 
     r->nstripes = nstripes;
@@ -384,6 +393,7 @@ void raid_init(dsm_ctx_t *ctx)
     }
     DSM_LOG_INFO("RAID5: %u franjas de K=%u, %u bytes por marco de paridad",
                  nstripes, k, ps);
+    return DSM_OK;
 }
 
 void raid_shutdown(dsm_ctx_t *ctx)
@@ -396,10 +406,18 @@ void raid_shutdown(dsm_ctx_t *ctx)
     rebuild_qtail = 0;
     rebuild_qlen = 0;
     r->rebuild_pending = false;
-    bool active = r->rebuild_active;
+    pthread_t th = r->rebuild_thread;
     pthread_mutex_unlock(&r->rebuild_mu);
-    if (active) {
-        pthread_join(r->rebuild_thread, NULL);
+
+    /* El hilo de reconstrucción se auto-termina al vaciarse la cola y su
+     * handle quedaba sin unir. Se recoge siempre que exista uno, esté en
+     * ejecución o ya haya declarado su salida, y así ningún hilo joinable
+     * sobrevive al apagado. */
+    if (th) {
+        pthread_join(th, NULL);
+        pthread_mutex_lock(&r->rebuild_mu);
+        r->rebuild_thread = 0;
+        pthread_mutex_unlock(&r->rebuild_mu);
     }
     pthread_mutex_destroy(&r->rebuild_mu);
 
@@ -1263,12 +1281,23 @@ void raid_on_node_down(dsm_ctx_t *ctx, uint32_t slot)
         pthread_mutex_unlock(&r->rebuild_mu);
         return;
     }
+    /* El hilo anterior ya declaró su inactividad al vaciarse la cola, pero su
+     * handle quedó sin unir. Se recoge antes de crear el nuevo, porque
+     * sobrescribirlo filtraría un hilo joinable. Tras su última liberación del
+     * mutex el hilo solo ejecuta su epílogo, de modo que unirlo aquí, con
+     * rebuild_mu tomada, no puede bloquear. */
+    if (r->rebuild_thread) {
+        pthread_join(r->rebuild_thread, NULL);
+        r->rebuild_thread = 0;
+    }
     r->rebuild_active = true;
     r->rebuild_pending = true;
     int rc = pthread_create(&r->rebuild_thread, NULL, raid_rebuild_thread, ctx);
     if (rc != 0) {
         /* La baja mas reciente no se proceso: se retira de la cola por el
-         * final, sin descartar las anteriores que siguen pendientes. */
+         * final, sin descartar las anteriores que siguen pendientes.
+         * pthread_create no define el handle en fallo, así que se anula. */
+        r->rebuild_thread = 0;
         rebuild_qtail = (rebuild_qtail + DSM_RAID_REBUILD_QUEUE_CAP - 1u) %
                         DSM_RAID_REBUILD_QUEUE_CAP;
         rebuild_qlen--;

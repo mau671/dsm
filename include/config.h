@@ -88,7 +88,8 @@ int config_load(dsm_config_t *cfg, const char *path);
 int config_validate(dsm_config_t *cfg);
 
 /**
- * Libera cualquier recurso dinámico asociado (si aplica).
+ * No hay recursos dinámicos asociados a la configuración. La función existe
+ * por simetría con config_load y no realiza ninguna operación.
  */
 void config_free(dsm_config_t *cfg);
 

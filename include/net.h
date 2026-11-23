@@ -75,7 +75,6 @@ int  dsm_net_rpc_ex(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_i
                     uint16_t *out_status, void *rx_payload, uint32_t *rx_len,
                     uint32_t req_id, uint32_t *out_tseq);
 
-int  dsm_net_read_one(int fd, uint32_t cluster_id, dsm_msg_t *out, uint8_t **owned);
 int  peer_ensure_connected(dsm_ctx_t *ctx, uint32_t slot);
 void peer_mark_down(dsm_ctx_t *ctx, uint32_t slot);
 

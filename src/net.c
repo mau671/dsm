@@ -23,6 +23,21 @@ static void fd_close_quiet(int *fd)
     }
 }
 
+/* IP IPv4 de un extremo del socket, en orden de red; cero si no se puede
+ * observar. */
+static uint32_t socket_endpoint_ip(int fd, bool peer)
+{
+    struct sockaddr_in sa;
+    socklen_t len = sizeof(sa);
+
+    int rc = peer ? getpeername(fd, (struct sockaddr *)&sa, &len)
+                  : getsockname(fd, (struct sockaddr *)&sa, &len);
+    if (rc != 0 || sa.sin_family != AF_INET) {
+        return 0;
+    }
+    return sa.sin_addr.s_addr;
+}
+
 int net_init(dsm_ctx_t *ctx)
 {
     dsm_net_t *n = &ctx->net;
@@ -88,10 +103,13 @@ static void pending_remove(dsm_ctx_t *ctx, pending_req_t *pending)
 static int pending_complete(dsm_ctx_t *ctx, const msg_header_t *hdr,
                             const uint8_t *payload)
 {
-    /* Una respuesta de pagina repetida o antigua no despierta al emisor: se
-     * deja caer al worker, que la descarta sin tocar la tabla de paginas. */
+    /* Una respuesta de pagina repetida o antigua no despierta al emisor: el
+     * listener la descarta sin tocar la tabla de paginas. */
     if ((hdr->type == MSG_PAGE_DATA || hdr->type == MSG_GRANT) &&
         msi_tseq_stale(ctx, hdr->page_id, hdr->tseq)) {
+        return DSM_ERR_NOT_FOUND;
+    }
+    if (hdr->type == MSG_LOCK_GRANT && sync_epoch_stale(ctx, hdr->epoch)) {
         return DSM_ERR_NOT_FOUND;
     }
 
@@ -221,6 +239,13 @@ static void *listener_thread_main(void *arg)
                 memcpy(&peer_hash, hello_payload + 16, 4);
                 peer_hash = ntohl(peer_hash);
 
+                /* El HELLO identifica al par y trae su hash de configuracion.
+                 * La IP que se publica en el WELCOME es la observada en este
+                 * socket, no una direccion inventada. */
+                membership_observe_self_ip(ctx, socket_endpoint_ip(cfd, false));
+                membership_observe_peer_ip(ctx, hello_payload,
+                                           socket_endpoint_ip(cfd, true));
+
                 welcome_t w;
                 memset(&w, 0, sizeof(w));
                 w.epoch = ctx->memb.epoch;
@@ -243,6 +268,12 @@ static void *listener_thread_main(void *arg)
                 }
                 pthread_rwlock_unlock(&ctx->memb.rw);
                 w.count = count;
+
+                /* La instantánea del mapa global viaja con la membresía: un
+                 * nodo que entrega WELCOME replica la marca de agua y los
+                 * huecos que conoce, de modo que el relevo del coordinador no
+                 * empiece con un mapa vacío. */
+                w.alloc_count = dsm_alloc_export(ctx, w.allocs, 64u);
 
                 uint8_t welcome_buf[DSM_WELCOME_WIRE_MAX];
                 size_t wlen = dsm_pack_welcome(&w, welcome_buf, sizeof(welcome_buf));
@@ -358,6 +389,11 @@ static void *listener_thread_main(void *arg)
                 membership_on_leave(ctx, &msg);
             } else if (hdr.type == MSG_NODE_DOWN) {
                 membership_on_node_down(ctx, &msg);
+            } else if (hdr.type == MSG_ALLOC_STATE) {
+                /* Respuesta de sincronización del mapa: se atiende en el
+                 * listener para que el worker que espera la marca de agua no
+                 * dependa de otro worker libre. */
+                dsm_alloc_on_sync_state(ctx, &msg);
             } else if (hdr.type == MSG_QUERY_REQ) {
                 membership_handle_query_fd(ctx, &msg, cfd);
             } else {
@@ -417,6 +453,46 @@ int net_stop_listener(dsm_ctx_t *ctx)
     return rc;
 }
 
+/* Un descriptor conectado que solo espera escritura esta sano; si el par ya
+ * cerro su extremo, poll lo reporta como colgado y la conexion se descarta. */
+static bool peer_socket_alive(int fd)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    int pr;
+
+    do {
+        pr = poll(&pfd, 1, 0);
+    } while (pr < 0 && errno == EINTR);
+
+    if (pr == 0) {
+        return true;
+    }
+    if (pr < 0) {
+        return false;
+    }
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+        return false;
+    }
+#ifdef POLLRDHUP
+    if (pfd.revents & POLLRDHUP) {
+        return false;
+    }
+#endif
+    if (pfd.revents & POLLIN) {
+        /* Un cierre ordenado del par se anuncia como legible con EOF. */
+        uint8_t byte;
+        ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n == 0) {
+            return false;
+        }
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+            errno != EINTR) {
+            return false;
+        }
+    }
+    return true;
+}
+
 int peer_ensure_connected(dsm_ctx_t *ctx, uint32_t slot)
 {
     if (slot >= MAX_NODES) return DSM_ERR_INVALID;
@@ -424,8 +500,15 @@ int peer_ensure_connected(dsm_ctx_t *ctx, uint32_t slot)
 
     pthread_mutex_lock(&p->send_mu);
     if (atomic_load(&p->connected) && p->out_fd >= 0) {
-        pthread_mutex_unlock(&p->send_mu);
-        return DSM_OK;
+        if (peer_socket_alive(p->out_fd)) {
+            pthread_mutex_unlock(&p->send_mu);
+            return DSM_OK;
+        }
+        /* El par cerro el enlace mientras estaba inactivo: se descarta para
+         * que la escritura abra uno nuevo. */
+        shutdown(p->out_fd, SHUT_RDWR);
+        fd_close_quiet(&p->out_fd);
+        atomic_store(&p->connected, false);
     }
 
     /* Obtener IP y puerto desde la tabla de membresía */
@@ -485,48 +568,56 @@ int dsm_net_send(dsm_ctx_t *ctx, uint32_t dst, const msg_header_t *hdr, const vo
     if (dst >= MAX_NODES) return DSM_ERR_INVALID;
     if (hdr->payload_len > 0 && !payload) return DSM_ERR_INVALID;
 
-    int conn_rc = peer_ensure_connected(ctx, dst);
-    if (conn_rc != DSM_OK) {
-        return conn_rc;
-    }
+    /* Un enlace puede morir entre la conexion y la escritura. Se reintenta una
+     * sola vez con un descriptor nuevo: escribir a un socket ya cerrado no se
+     * reporta como exito silencioso. */
+    for (uint32_t attempt = 0; attempt < 2u; attempt++) {
+        int conn_rc = peer_ensure_connected(ctx, dst);
+        if (conn_rc != DSM_OK) {
+            return conn_rc;
+        }
 
-    dsm_peer_t *p = &ctx->net.peers[dst];
-    pthread_mutex_lock(&p->send_mu);
-    if (p->out_fd < 0) {
-        pthread_mutex_unlock(&p->send_mu);
-        return DSM_ERR_NET;
-    }
+        dsm_peer_t *p = &ctx->net.peers[dst];
+        pthread_mutex_lock(&p->send_mu);
+        if (p->out_fd < 0) {
+            /* Otro emisor cerro el descriptor entre ambas secciones. */
+            pthread_mutex_unlock(&p->send_mu);
+            continue;
+        }
 
-    msg_header_t h = *hdr;
-    uint8_t raw_hdr[DSM_HDR_LEN];
-    dsm_wire_finish(&h, raw_hdr, payload, hdr->payload_len);
+        msg_header_t h = *hdr;
+        uint8_t raw_hdr[DSM_HDR_LEN];
+        dsm_wire_finish(&h, raw_hdr, payload, hdr->payload_len);
 
-    /* La escritura hereda el plazo de envio: un par que deja de leer no
-     * puede retener send_mu ni el hilo emisor de forma indefinida. */
-    uint32_t send_ms = ctx->cfg.send_timeout_ms ? ctx->cfg.send_timeout_ms : 2000u;
-    if (dsm_send_full_deadline(p->out_fd, raw_hdr, DSM_HDR_LEN, send_ms) != 0 ||
-        (payload && hdr->payload_len > 0 &&
-         dsm_send_full_deadline(p->out_fd, payload, hdr->payload_len, send_ms) != 0)) {
+        /* La escritura hereda el plazo de envio: un par que deja de leer no
+         * puede retener send_mu ni el hilo emisor de forma indefinida. */
+        uint32_t send_ms = ctx->cfg.send_timeout_ms ? ctx->cfg.send_timeout_ms : 2000u;
+        if (dsm_send_full_deadline(p->out_fd, raw_hdr, DSM_HDR_LEN, send_ms) != 0 ||
+            (payload && hdr->payload_len > 0 &&
+             dsm_send_full_deadline(p->out_fd, payload, hdr->payload_len, send_ms) != 0)) {
+            shutdown(p->out_fd, SHUT_RDWR);
+            fd_close_quiet(&p->out_fd);
+            atomic_store(&p->connected, false);
+            pthread_mutex_unlock(&p->send_mu);
+            continue;
+        }
+
+        atomic_fetch_add_explicit(&ctx->ctr.msgs_sent, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ctx->ctr.bytes_sent, DSM_HDR_LEN + hdr->payload_len, memory_order_relaxed);
+
+        /*
+         * El listener procesa una trama y cierra su conexión. Mantener el
+         * descriptor como persistente haría que la siguiente trama viajara por
+         * un socket que el receptor ya cerró.
+         */
         shutdown(p->out_fd, SHUT_RDWR);
         fd_close_quiet(&p->out_fd);
         atomic_store(&p->connected, false);
         pthread_mutex_unlock(&p->send_mu);
-        return DSM_ERR_NET;
+        return DSM_OK;
     }
 
-    atomic_fetch_add_explicit(&ctx->ctr.msgs_sent, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&ctx->ctr.bytes_sent, DSM_HDR_LEN + hdr->payload_len, memory_order_relaxed);
-
-    /*
-     * El listener procesa una trama y cierra su conexión. Mantener el
-     * descriptor como persistente haría que la siguiente trama viajara por
-     * un socket que el receptor ya cerró.
-     */
-    shutdown(p->out_fd, SHUT_RDWR);
-    fd_close_quiet(&p->out_fd);
-    atomic_store(&p->connected, false);
-    pthread_mutex_unlock(&p->send_mu);
-    return DSM_OK;
+    return DSM_ERR_NET;
 }
 
 int net_send_heartbeat(dsm_ctx_t *ctx, uint32_t dst, uint32_t free_pages)
@@ -730,42 +821,3 @@ int dsm_net_rpc(dsm_ctx_t *ctx, uint32_t dst, uint16_t type, uint32_t page_id,
                           0, NULL);
 }
 
-/* Plazo de lectura de una trama cuando el llamador no aporta configuración. */
-#define NET_READ_ONE_TIMEOUT_MS 3000u
-
-int dsm_net_read_one(int fd, uint32_t cluster_id, dsm_msg_t *out, uint8_t **owned)
-{
-    if (fd < 0 || !out || !owned) return DSM_ERR_INVALID;
-    /* El llamador libera *owned solo si esta ruta lo asigna. */
-    *owned = NULL;
-
-    uint8_t raw_hdr[DSM_HDR_LEN];
-    int rc = dsm_read_full_deadline(fd, raw_hdr, DSM_HDR_LEN, NET_READ_ONE_TIMEOUT_MS);
-    if (rc != DSM_OK) return rc;
-
-    msg_header_t hdr;
-    rc = dsm_wire_unpack(raw_hdr, &hdr);
-    if (rc != DSM_OK) return rc;
-
-    uint8_t *payload = NULL;
-    if (hdr.payload_len > 0) {
-        if (hdr.payload_len > DSM_MAX_PAYLOAD) return DSM_ERR_PROTO;
-        payload = malloc(hdr.payload_len);
-        if (!payload) return DSM_ERR_MEM;
-        rc = dsm_read_full_deadline(fd, payload, hdr.payload_len, NET_READ_ONE_TIMEOUT_MS);
-        if (rc != DSM_OK) {
-            free(payload);
-            return rc;
-        }
-    }
-
-    if (dsm_wire_validate(&hdr, raw_hdr, payload, cluster_id) != DSM_OK) {
-        free(payload);
-        return DSM_ERR_PROTO;
-    }
-
-    out->hdr = hdr;
-    out->payload = payload;
-    *owned = payload;
-    return DSM_OK;
-}

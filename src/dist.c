@@ -91,6 +91,23 @@ static void dist_wake_all(dsm_dist_t *d)
 
 /* --- Ciclo de vida ------------------------------------------------------- */
 
+/* Kernel de demostración compilado en todos los nodos. Copia el rango de
+ * entrada a la salida; un src_va cero indica relleno con ceros. */
+static void dist_kernel_demo(void *arg, const dsm_dist_part_t *part,
+                             dsm_dist_result_t *out)
+{
+    (void)arg;
+
+    uint8_t *dst = (uint8_t *)(uintptr_t)part->dst_va;
+    if (part->src_va != 0) {
+        const uint8_t *src = (const uint8_t *)(uintptr_t)part->src_va;
+        memmove(dst, src, (size_t)part->nbytes);
+    } else {
+        memset(dst, 0, (size_t)part->nbytes);
+    }
+    out->items = part->nbytes;
+}
+
 int dist_init(dsm_ctx_t *ctx)
 {
     dsm_dist_t *d = &ctx->dist;
@@ -103,6 +120,15 @@ int dist_init(dsm_ctx_t *ctx)
         pthread_mutex_destroy(&d->mu);
         return DSM_ERR_MEM;
     }
+
+    /* El registro es por proceso y no viaja por el cable. El kernel de
+     * demostración queda disponible en cada nodo para que un DIST_RUN a un
+     * daemon sin kernels de aplicación no se rechace por falta de registro. */
+    d->kernels[0].used      = true;
+    d->kernels[0].kernel_id = DSM_DIST_KERNEL_DEMO;
+    d->kernels[0].fn        = dist_kernel_demo;
+    d->kernels[0].arg       = NULL;
+
     return DSM_OK;
 }
 
@@ -395,6 +421,9 @@ void dist_on_run(dsm_ctx_t *ctx, const dsm_msg_t *m)
     bool dst_ok = dist_range_inside(ctx, rw.dst_va, rw.nbytes);
 
     if (!fn) {
+        /* El registro de kernels es por proceso: el coordinador no transporta
+         * codigo. Un daemon solo ejecuta kernels compilados o registrados en
+         * su propio arranque; DSM_DIST_KERNEL_DEMO esta siempre disponible. */
         res.status = (uint32_t)DSM_ERR_INVALID;
     } else if (!src_ok || !dst_ok) {
         DSM_LOG_WARN("DIST_RUN del trabajo %u con direcciones fuera de la "

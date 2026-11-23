@@ -77,7 +77,7 @@ typedef struct {
 struct dsm_ctx;
 typedef struct dsm_ctx dsm_ctx_t;
 
-void raid_init(dsm_ctx_t *ctx);
+int  raid_init(dsm_ctx_t *ctx);
 void raid_shutdown(dsm_ctx_t *ctx);
 
 int  raid_on_write(dsm_ctx_t *ctx, uint32_t page,

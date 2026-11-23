@@ -12,11 +12,6 @@ void dsm_log_set_level(int level)
     g_log_level = level;
 }
 
-int dsm_log_get_level(void)
-{
-    return g_log_level;
-}
-
 int dsm_log_level_from_str(const char *str)
 {
     if (!str) return DSM_LOG_LVL_INFO;
@@ -43,7 +38,7 @@ void dsm_log_write(int level, const char *file, int line, const char *fmt, ...)
     }
 
     static const char *level_names[] = {
-        "ERROR", "WARN ", "INFO ", "DEBUG", "TRACE"
+        "error", "aviso", "info", "depuración", "traza"
     };
 
     struct timeval tv;
@@ -59,7 +54,7 @@ void dsm_log_write(int level, const char *file, int line, const char *fmt, ...)
 
     flockfile(stderr);
 
-    fprintf(stderr, "[%s.%03ld] [%s] [%s:%d] ",
+    fprintf(stderr, "[%s.%03ld] [%-10s] [%s:%d] ",
             time_str, (long)(tv.tv_usec / 1000),
             (level >= 0 && level <= 4) ? level_names[level] : "?????",
             base_file, line);

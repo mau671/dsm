@@ -236,7 +236,7 @@ int config_load(dsm_config_t *cfg, const char *path)
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        DSM_LOG_ERR("No se pudo abrir el archivo de configuracion '%s': %s", path, strerror(errno));
+        DSM_LOG_ERR("No se pudo abrir el archivo de configuración '%s': %s", path, strerror(errno));
         return DSM_ERR_CONFIG;
     }
 
@@ -246,13 +246,13 @@ int config_load(dsm_config_t *cfg, const char *path)
     struct stat st;
     if (fstat(fileno(f), &st) != 0 || !S_ISREG(st.st_mode)) {
         fclose(f);
-        DSM_LOG_ERR("La ruta de configuracion '%s' no es un archivo regular", path);
+        DSM_LOG_ERR("La ruta de configuración '%s' no es un archivo regular", path);
         return DSM_ERR_CONFIG;
     }
 
     if (st.st_size < 0 || (uint64_t)st.st_size > 1024ULL * 1024ULL) {
         fclose(f);
-        DSM_LOG_ERR("Archivo de configuracion invalido o demasiado grande");
+        DSM_LOG_ERR("Archivo de configuración inválido o demasiado grande");
         return DSM_ERR_CONFIG;
     }
 
@@ -300,7 +300,7 @@ int config_load(dsm_config_t *cfg, const char *path)
 
         char *eq = strchr(trimmed, '=');
         if (!eq) {
-            DSM_LOG_ERR("Error en %s:%d: linea sin separador '=': '%s'", path, line_num, trimmed);
+            DSM_LOG_ERR("Error en %s:%d: línea sin separador '=': '%s'", path, line_num, trimmed);
             free(raw_buf);
             return DSM_ERR_CONFIG;
         }
@@ -426,13 +426,13 @@ int config_load(dsm_config_t *cfg, const char *path)
             strncpy(cfg->log_level, val, sizeof(cfg->log_level) - 1);
             dsm_log_set_level(dsm_log_level_from_str(val));
         } else {
-            DSM_LOG_ERR("Clave de configuracion desconocida en %s:%d: '%s'", path, line_num, key);
+            DSM_LOG_ERR("Clave de configuración desconocida en %s:%d: '%s'", path, line_num, key);
             free(raw_buf);
             return DSM_ERR_CONFIG;
         }
 
         if (parse_err != 0) {
-            DSM_LOG_ERR("Valor invalido para clave '%s' en %s:%d: '%s'", key, path, line_num, val);
+            DSM_LOG_ERR("Valor inválido para clave '%s' en %s:%d: '%s'", key, path, line_num, val);
             free(raw_buf);
             return DSM_ERR_CONFIG;
         }
@@ -483,7 +483,7 @@ static int config_load_mode(dsm_config_t *cfg)
         return DSM_OK;
     }
 
-    DSM_LOG_ERR("DSM_NODE_MODE invalido: '%s' (valores admitidos: node, client)", mode);
+    DSM_LOG_ERR("DSM_NODE_MODE inválido: '%s'; valores admitidos: node, client", mode);
     return DSM_ERR_CONFIG;
 }
 
@@ -513,7 +513,7 @@ int config_validate(dsm_config_t *cfg)
     long sc_page = sysconf(_SC_PAGESIZE);
     if (sc_page <= 0) sc_page = 4096;
     if (cfg->page_size % (uint32_t)sc_page != 0 || (cfg->page_size & (cfg->page_size - 1)) != 0) {
-        DSM_LOG_ERR("PAGE_SIZE debe ser multiplo de %ld y potencia de dos", sc_page);
+        DSM_LOG_ERR("PAGE_SIZE debe ser múltiplo de %ld y potencia de dos", sc_page);
         return DSM_ERR_CONFIG;
     }
 
@@ -525,7 +525,7 @@ int config_validate(dsm_config_t *cfg)
     }
 
     if (cfg->view_size % cfg->page_size != 0) {
-        DSM_LOG_ERR("VIEW_SIZE debe ser multiplo de PAGE_SIZE");
+        DSM_LOG_ERR("VIEW_SIZE debe ser múltiplo de PAGE_SIZE");
         return DSM_ERR_CONFIG;
     }
 
@@ -557,7 +557,7 @@ int config_validate(dsm_config_t *cfg)
     }
 
     if (cfg->port_min > cfg->port_max || (cfg->port_max - cfg->port_min + 1) < 1) {
-        DSM_LOG_ERR("Rango de puertos invalido: %u - %u", cfg->port_min, cfg->port_max);
+        DSM_LOG_ERR("Rango de puertos inválido: %u - %u", cfg->port_min, cfg->port_max);
         return DSM_ERR_CONFIG;
     }
 
@@ -586,7 +586,7 @@ int config_validate(dsm_config_t *cfg)
 
     if (cfg->worker_threads < 1 || cfg->worker_threads > 64 ||
         cfg->dispatcher_threads < 1 || cfg->dispatcher_threads > 64) {
-        DSM_LOG_ERR("Numero de hilos worker/dispatcher fuera de rango [1, 64]");
+        DSM_LOG_ERR("Número de trabajadores y despachadores fuera de rango [1, 64]");
         return DSM_ERR_CONFIG;
     }
 
@@ -596,7 +596,7 @@ int config_validate(dsm_config_t *cfg)
     }
 
     if (cfg->node_mem % cfg->page_size != 0 || cfg->node_mem < cfg->page_size) {
-        DSM_LOG_ERR("NODE_MEM debe ser multiplo de PAGE_SIZE y >= PAGE_SIZE");
+        DSM_LOG_ERR("NODE_MEM debe ser múltiplo de PAGE_SIZE y >= PAGE_SIZE");
         return DSM_ERR_CONFIG;
     }
 
@@ -608,7 +608,7 @@ int config_validate(dsm_config_t *cfg)
     /* RAID5 necesita K custodios de datos y al menos una ranura mas para la
      * paridad; con menos nodos la franja no puede formarse. */
     if (cfg->redundancy_raid5 && cfg->max_runtime_nodes < cfg->raid_k + 1u) {
-        DSM_LOG_ERR("RAID5 requiere MAX_RUNTIME_NODES >= RAID_K + 1 (%u)",
+        DSM_LOG_ERR("RAID5 requiere MAX_RUNTIME_NODES >= RAID_K + 1: %u",
                     cfg->raid_k + 1u);
         return DSM_ERR_CONFIG;
     }
@@ -629,7 +629,7 @@ int config_validate(dsm_config_t *cfg)
     }
 
     if (cfg->home_slack_permille < 1000) {
-        DSM_LOG_ERR("HOME_SLACK no puede ser menor que 1.0 (1000 por mil)");
+        DSM_LOG_ERR("HOME_SLACK no puede ser menor que 1.0, equivalente a 1000 por mil");
         return DSM_ERR_CONFIG;
     }
 
@@ -670,28 +670,29 @@ void config_free(dsm_config_t *cfg)
 
 void config_dump(const dsm_config_t *cfg)
 {
-    DSM_LOG_INFO("Configuracion cargada:");
-    DSM_LOG_INFO("  CLUSTER_ID        = 0x%08X", cfg->cluster_id);
-    DSM_LOG_INFO("  PAGE_SIZE         = %u", cfg->page_size);
-    DSM_LOG_INFO("  BASE_ADDR         = 0x%lX", (unsigned long)cfg->base_addr);
-    DSM_LOG_INFO("  VIEW_SIZE         = %lu (%lu MB)", (unsigned long)cfg->view_size, (unsigned long)(cfg->view_size >> 20));
-    DSM_LOG_INFO("  NODE_MEM          = %lu (%lu MB)", (unsigned long)cfg->node_mem, (unsigned long)(cfg->node_mem >> 20));
-    DSM_LOG_INFO("  PORT_RANGE        = %u - %u", cfg->port_min, cfg->port_max);
-    DSM_LOG_INFO("  PEER_HOSTS_COUNT  = %u", cfg->peer_host_count);
+    DSM_LOG_INFO("Configuración cargada:");
+    DSM_LOG_INFO("  Identificador de clúster           : 0x%08X", cfg->cluster_id);
+    DSM_LOG_INFO("  Tamaño de página                   : %u bytes", cfg->page_size);
+    DSM_LOG_INFO("  Dirección base                     : 0x%lX", (unsigned long)cfg->base_addr);
+    DSM_LOG_INFO("  Tamaño de vista                    : %lu bytes", (unsigned long)cfg->view_size);
+    DSM_LOG_INFO("  Memoria por nodo                   : %lu bytes", (unsigned long)cfg->node_mem);
+    DSM_LOG_INFO("  Rango de puertos                   : %u - %u", cfg->port_min, cfg->port_max);
+    DSM_LOG_INFO("  Equipos vecinos                    : %u", cfg->peer_host_count);
     for (uint32_t i = 0; i < cfg->peer_host_count; i++) {
-        DSM_LOG_INFO("    Host[%u]         = %s", i, cfg->peer_hosts[i]);
+        DSM_LOG_INFO("    Equipo %u : %s", i, cfg->peer_hosts[i]);
     }
-    DSM_LOG_INFO("  HEARTBEAT         = %u ms (suspect=%u, dead=%u)",
-                 cfg->hb_interval_ms, cfg->hb_suspect, cfg->hb_dead);
-    DSM_LOG_INFO("  THREADS           = workers:%u, dispatchers:%u",
+    DSM_LOG_INFO("  Latidos                            : %u ms", cfg->hb_interval_ms);
+    DSM_LOG_INFO("  Sospecha                           : %u", cfg->hb_suspect);
+    DSM_LOG_INFO("  Caído                              : %u", cfg->hb_dead);
+    DSM_LOG_INFO("  Hilos                              : %u trabajadores y %u despachadores",
                  cfg->worker_threads, cfg->dispatcher_threads);
-    DSM_LOG_INFO("  HOME_SLACK        = %u.%03u",
+    DSM_LOG_INFO("  Margen de custodio                 : %u.%03u",
                  cfg->home_slack_permille / 1000, cfg->home_slack_permille % 1000);
-    DSM_LOG_INFO("  RAID_K            = %u", cfg->raid_k);
-    DSM_LOG_INFO("  CHUNK_PAGES       = %u", cfg->chunk_pages);
-    DSM_LOG_INFO("  WAIT_POOL_ENTRIES = %u", cfg->wait_pool_entries);
-    DSM_LOG_INFO("  OUTPUT_DIR        = %s", cfg->output_dir);
-    DSM_LOG_INFO("  DIST_TIMEOUT_MS   = %u", cfg->dist_timeout_ms);
-    DSM_LOG_INFO("  MODO_PROCESO      = %s", cfg->client_mode ? "cliente" : "nodo");
-    DSM_LOG_INFO("  RAW_HASH          = 0x%08X", cfg->raw_hash);
+    DSM_LOG_INFO("  Páginas de datos por franja        : %u", cfg->raid_k);
+    DSM_LOG_INFO("  Páginas por fragmento              : %u", cfg->chunk_pages);
+    DSM_LOG_INFO("  Capacidad del conjunto de espera   : %u", cfg->wait_pool_entries);
+    DSM_LOG_INFO("  Directorio de salida               : %s", cfg->output_dir);
+    DSM_LOG_INFO("  Plazo de ejecución distribuida     : %u ms", cfg->dist_timeout_ms);
+    DSM_LOG_INFO("  Modo de proceso                    : %s", cfg->client_mode ? "cliente" : "nodo");
+    DSM_LOG_INFO("  Hash bruto                         : 0x%08X", cfg->raw_hash);
 }
