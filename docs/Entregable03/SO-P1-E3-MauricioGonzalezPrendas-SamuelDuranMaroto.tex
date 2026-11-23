@@ -255,7 +255,7 @@ Samuel Durán Maroto & 2023072368 \\
 
 El Prototipo 2 conserva la organización del Prototipo 1, con la misma vista proyectada sobre \texttt{memfd}, el mismo directorio MSI en el nodo custodio y el mismo anillo de dispersión consistente, y agrega los mecanismos que faltaban para que la coherencia sobreviva a respuestas repetidas, a transacciones que invalidan varias copias, a la caída de un custodio y a la pérdida de un nodo con datos. También incorpora dos servicios que no existían en la entrega anterior: la ejecución distribuida de particiones de trabajo y la generación de consultas globales y reportes HTML.
 
-La afirmación anterior conviene precisarla porque el árbol de trabajo contiene piezas con distinto grado de madurez. La comparación de secuencias, el conteo de acuses, la recuperación de custodia, la paridad RAID5, la serialización por página y los reportes están implementados y compilan en los cuatro perfiles. La ejecución distribuida tiene API, mensajes y una demostración de extremo a extremo entre dos máquinas, con una aplicación que usa la memoria distribuida. Las limitaciones se detallan en la sección~\ref{sec:pendientes} y no se ocultan en el resto del documento.
+La afirmación anterior conviene precisarla porque el árbol de trabajo contiene piezas con distinto grado de madurez. La comparación de secuencias, el conteo de acuses, la recuperación de custodia, la paridad RAID5, la serialización por página y los reportes están implementados y compilan en los cuatro perfiles. La ejecución distribuida tiene API, mensajes y una aplicación de demostración, \texttt{apps/dsm\_dist\_demo.c}, que coordina un trabajo entre dos procesos reales sobre la misma máquina y ejecuta particiones en ambos. Las limitaciones se detallan en la sección~\ref{sec:pendientes} y no se ocultan en el resto del documento.
 
 \subsection{Implementado}
 
@@ -269,14 +269,14 @@ La afirmación anterior conviene precisarla porque el árbol de trabajo contiene
     \item \textbf{Respuestas huérfanas.} El listener descarta \texttt{PAGE\_DATA} y \texttt{GRANT} que no encuentran una solicitud pendiente, y \texttt{page\_accept\_pending} impide aplicar una respuesta a una página que ya salió de un estado pendiente.
     \item \textbf{Cerrojos y barreras.} \texttt{sync\_on\_node\_down} recalcula el custodio al cambiar la membresía. \texttt{LOCK\_GRANT} y \texttt{BARRIER\_GO} se confirman con un acuse y se retransmiten hasta \texttt{REQUEST\_RETRIES} veces dentro de \texttt{LOCK\_TIMEOUT\_MS}. La barrera compara el umbral anunciado por cada participante y la concesión duplicada se reconoce por \texttt{req\_id}.
     \item \textbf{Ejecución distribuida.} \texttt{dsm\_dist\_register}, \texttt{dsm\_dist\_launch}, \texttt{dsm\_dist\_collect} y \texttt{dsm\_dist\_verify}, con los mensajes \texttt{DIST\_RUN} y \texttt{DIST\_DONE}. El coordinador reparte las particiones por turno entre los trabajadores, ejecuta localmente las que le corresponden, recoge los resultados y verifica el CRC32 agregado.
-    \item \textbf{Consultas globales y HTML.} \texttt{dsm\_pages\_global} recorre las tablas de páginas de todos los nodos y arma la tabla con propietario, orden, copyset y franja. \texttt{dsm\_html\_report} escribe un archivo por nodo y un archivo global en \texttt{OUTPUT\_DIR}.
+    \item \textbf{Consultas globales y HTML.} \texttt{dsm\_pages\_global} recorre las tablas de páginas de todos los miembros vivos, incluidos los clientes, y arma la tabla con propietario, PID, orden, copyset y franja. \texttt{dsm\_html\_report} escribe un archivo por nodo y un archivo global en \texttt{OUTPUT\_DIR}.
     \item \textbf{Asignador global.} \texttt{dsm\_alloc} pide el rango al coordinador vivo de menor ranura, que mantiene la marca de agua y los huecos de toda la vista. El mapa se replica en \texttt{WELCOME} y en cada cambio, y el relevo rechaza peticiones hasta reconstruirlo. Compartir memoria entre procesos requiere intercambiar la dirección virtual asignada.
     \item \textbf{Configuración.} \texttt{RAID\_K}, \texttt{CHUNK\_PAGES}, \texttt{WAIT\_POOL\_ENTRIES}, \texttt{OUTPUT\_DIR} y \texttt{DIST\_TIMEOUT\_MS} tienen lector real.
 \end{itemize}
 
 \subsection{Pendiente y límites de la entrega}
 
-La ejecución distribuida y los reportes HTML están implementados. Los cerrojos y las barreras están implementados, con migración de la cola al cambiar el custodio y validación del umbral en el custodio. El asignador global reparte rangos desde el nodo vivo de menor ranura, replica su mapa en \texttt{WELCOME} y se niega a servir si un relevo no reconstruyó la marca de agua. Compartir un bloque exige intercambiar la dirección virtual: dos llamadas a \texttt{dsm\_alloc} en nodos distintos no devuelven el mismo rango. Los metadatos por proceso, sin una tabla global de PID y orden, siguen pendientes.
+La ejecución distribuida y los reportes HTML están implementados. Los cerrojos y las barreras están implementados, con migración de la cola al cambiar el custodio y validación del umbral en el custodio. El asignador global reparte rangos desde el nodo vivo de menor ranura, replica su mapa en \texttt{WELCOME} y se niega a servir si un relevo no reconstruyó la marca de agua. Compartir un bloque exige intercambiar la dirección virtual: dos llamadas a \texttt{dsm\_alloc} en nodos distintos no devuelven el mismo rango. Los metadatos por proceso se consultan en la tabla global, que incluye a los clientes para mostrar el PID y el orden reales de cada reserva.
 
 % =========================================================
 \section{Cambios respecto al Prototipo 1}\label{sec:cambios}
@@ -312,7 +312,7 @@ La concesión duplicada tuvo un efecto secundario que el Prototipo 1 no distingu
 
 \subsection{Servicios nuevos y parámetros con uso real}
 
-La ejecución distribuida y los reportes HTML no existían como código en el Prototipo 1. El Prototipo 2 agrega ambos servicios, con sus mensajes y sus funciones públicas. También da uso a cinco claves que el archivo de configuración declaraba sin lector: \texttt{RAID\_K} en la formación de franjas, \texttt{CHUNK\_PAGES} en el orden y la franja del reporte, \texttt{WAIT\_POOL\_ENTRIES} en la capacidad de particiones de un trabajo, \texttt{OUTPUT\_DIR} en el destino de los HTML y \texttt{DIST\_TIMEOUT\_MS} en la espera de \texttt{dsm\_dist\_verify}.
+La ejecución distribuida y los reportes HTML no existían como código en el Prototipo 1. El Prototipo 2 agrega ambos servicios, con sus mensajes y sus funciones públicas. También da uso a cinco claves que el archivo de configuración declaraba sin lector: \texttt{RAID\_K} en la formación de franjas, \texttt{CHUNK\_PAGES} en la franja del reporte, \texttt{WAIT\_POOL\_ENTRIES} en la capacidad de particiones de un trabajo, \texttt{OUTPUT\_DIR} en el destino de los HTML y \texttt{DIST\_TIMEOUT\_MS} en la espera de \texttt{dsm\_dist\_verify}.
 
 En el directorio, el Prototipo 2 agrega la bandera \texttt{busy} por página, de modo que una segunda solicitud recibe \texttt{BUSY} en lugar de leer un estado a medio modificar. La secuencia \texttt{tseq} deja de ser un campo decorativo: cada respuesta que transporta contenido avanza el contador y el receptor descarta la que no supera el último valor aplicado. Las invalidaciones dejan de depender de una RPC por copia y pasan a un mapa de acuses por transacción que espera a todos los destinatarios. Cuando cae el custodio de una página, el nuevo home se calcula con el anillo, se busca una copia en el copyset o en el respaldo y el contenido se transfiere con \texttt{PAGE\_MOVE}. La redundancia deja de estar diferida: RAID5 se acepta con $K$ páginas de datos y una de paridad. Los cerrojos y las barreras incorporan acuse y retransmisión acotada, y la barrera compara el umbral anunciado por cada participante. Las respuestas de página que llegan sin una solicitud pendiente se descartan en la capa de red. La persistencia deja de ser una promesa del diseño: \texttt{dsm\_sync} emite \texttt{WRITEBACK} y el custodio lo aplica. Por último, aparecen la ejecución distribuida y los reportes HTML como servicios con API pública.
 
@@ -455,9 +455,25 @@ void raid_xor_rebuild(const uint8_t **parts, uint32_t n, uint32_t ps,
 
 El costo de una reconstrucción también se puede calcular. Para $K$ piezas, la recolección usa $K$ \texttt{STRIPE\_READ} de 64 bytes y $K$ \texttt{STRIPE\_DATA} de 4152 bytes, es decir $2K$ mensajes y $4216K$ bytes, más el \texttt{PAGE\_MOVE} y su acuse cuando el nuevo custodio es remoto. Con $K=2$ son 4 mensajes de recolección y unos 12.6 KB por franja; con $K=4$ son 8 mensajes y unos 21.1 KB. La reconstrucción se ejecuta en un hilo separado para que el listener siga atendiendo las respuestas que esa misma reconstrucción espera, un detalle que no es opcional: si el hilo que recibe la baja se bloqueara esperando \texttt{STRIPE\_DATA}, las respuestas no tendrían quién las leyera.
 
+\subsection{Espacio de paridad y overhead de memoria}
+
+La tabla de franjas se reserva completa al arrancar, porque el número de franjas depende del tamaño de la vista y de $K$, pero los marcos de paridad no. Con \texttt{VIEW\_SIZE} de 4 GiB, página de 4096 bytes y $K=2$, la vista tiene $2^{20}$ páginas y $2^{19}$ franjas. Un arreglo denso de marcos de paridad ocuparía
+\begin{equation}
+2^{19} \times 4096 = 2\ \text{GiB}
+\end{equation}
+por nodo, una reserva que ningún equipo del laboratorio sostiene para tres procesos. La implementación guarda un arreglo de $2^{19}$ punteros, 4 MiB por nodo, y reserva cada marco de 4 KiB cuando ese nodo pasa a custodiar la franja, recibe su primer \texttt{PARITY\_DELTA} o instala una franja con \texttt{STRIPE\_PUT}. El costo efectivo es
+\begin{equation}
+4\ \text{MiB} + 4\ \text{KiB} \times N_{\text{franjas locales}},
+\end{equation}
+donde $N_{\text{franjas locales}}$ son las franjas materializadas cuyo custodio de paridad es el nodo. La tabla \texttt{stripe\_rt\_t} sí es densa: 84 bytes por franja, unos 42 MiB por nodo con la vista de 4 GiB. El índice de punteros y la tabla de franjas suman unos 46 MiB por nodo, frente a los 2 GiB del arreglo denso. En una ejecución real con esa vista, un nodo con RAID5 ocupó alrededor de 200 MiB de RSS, que incluyen la tabla de páginas local, el directorio MSI, el respaldo y esos 46 MiB de estructuras de paridad; el arreglo denso habría añadido 2 GiB solo para los marcos.
+
+\subsection{Corrida de validación de la redundancia}
+
+La reconstrucción se comprobó con tres nodos, $K=2$, \texttt{REDUNDANCY=RAID5} y la vista de 4 GiB. Un proceso cliente reservó 24 páginas, escribió un patrón verificable y ejecutó \texttt{dsm\_sync}; el cliente terminó y sus copias locales desaparecieron. Los tres nodos registraron 30 deltas de paridad, un promedio de 1.25 por página persistida, por los reintentos de versión de las franjas. Después se derribó uno de los nodos custodios. La reconstrucción por XOR completó las franjas recuperables, entre cinco y ocho en las corridas observadas, y el nodo superviviente leyó y verificó cinco páginas cuyo dato custodiaba el nodo caído y cuya franja conservaba la compañera y la paridad. Las franjas con dos páginas de datos en el mismo nodo no se pudieron reconstruir, como se explica en la sección~\ref{sec:custodia_raid}. La corrida se hizo con tres procesos en la misma máquina; la validación en computadoras físicas del laboratorio sigue pendiente.
+
 \subsection{Límites de la redundancia}
 
-La paridad vive en memoria, en \texttt{ctx->raid.parity}, y la tabla de franjas se reconstruye al arrancar. No hay un archivo de paridad persistente ni una versión de franja en disco: la versión es un contador de la tabla en memoria y se pierde si el proceso reinicia. Esto es suficiente para tolerar la caída de un nodo mientras el clúster sigue vivo, pero no para recuperar el estado después de reiniciar a todos los nodos. La reconstrucción combina la paridad con los datos supervivientes para recuperar la página perdida.
+La paridad vive en memoria, en los marcos que indexa \texttt{ctx->raid.parity}, y la tabla de franjas se reconstruye al arrancar. No hay un archivo de paridad persistente ni una versión de franja en disco: la versión es un contador de la tabla en memoria y se pierde si el proceso reinicia. Esto es suficiente para tolerar la caída de un nodo mientras el clúster sigue vivo, pero no para recuperar el estado después de reiniciar a todos los nodos. La reconstrucción combina la paridad con los datos supervivientes para recuperar la página perdida.
 
 El custodio de paridad es, además, un punto único para las escrituras de su franja. Si cae, \texttt{raid\_on\_write} devuelve \texttt{DSM\_ERR\_NODE\_DOWN} y la escritura pierde la actualización de paridad hasta que la reconstrucción designe otro custodio. La operación de datos no se pierde, pero la franja queda degradada y el siguiente fallo puede ser irreversible. Es una consecuencia del diseño de una sola paridad por franja y no se corrige con los mecanismos actuales.
 
@@ -614,7 +630,7 @@ for (uint32_t i = 0; i < nparts; i++) {
 }
 \end{lstlisting}
 
-La relación con la configuración es directa. \texttt{WAIT\_POOL\_ENTRIES} limita la cantidad de particiones de un trabajo, con un tope duro de 4096; un trabajo con más particiones que la capacidad configurada devuelve \texttt{DSM\_ERR\_NO\_SPACE}. \texttt{DIST\_TIMEOUT\_MS} es el plazo por defecto de \texttt{dsm\_dist\_verify} cuando el trabajo aún no terminó. \texttt{CHUNK\_PAGES} no interviene en el reparto: las particiones se describen explícitamente y el tamaño de cada rango lo decide la aplicación. La clave se usa en el reporte para mostrar el orden de página y la franja, no para dividir trabajo.
+La relación con la configuración es directa. \texttt{WAIT\_POOL\_ENTRIES} limita la cantidad de particiones de un trabajo, con un tope duro de 4096; un trabajo con más particiones que la capacidad configurada devuelve \texttt{DSM\_ERR\_NO\_SPACE}. \texttt{DIST\_TIMEOUT\_MS} es el plazo por defecto de \texttt{dsm\_dist\_verify} cuando el trabajo aún no terminó. \texttt{CHUNK\_PAGES} no interviene en el reparto: las particiones se describen explícitamente y el tamaño de cada rango lo decide la aplicación. La clave se usa en el reporte para agrupar páginas en franjas, no para dividir trabajo ni para fijar el orden de las reservas.
 
 La implementación tiene límites que conviene conocer. El kernel se ejecuta en el hilo worker, así que un kernel largo bloquea el despacho de mensajes de página de ese nodo. No hay cancelación ni plazo por partición: \texttt{deadline\_ms} viaja en \texttt{DIST\_RUN} pero \texttt{dist\_on\_run} no lo aplica. El lanzamiento devuelve éxito después de enviar las órdenes, no después de que terminen; la espera real ocurre en \texttt{collect} o \texttt{verify}. Cada nodo ejecuta su partición, el coordinador recoge los resultados y el CRC agregado permite comprobar la salida.
 
@@ -622,7 +638,7 @@ La implementación tiene límites que conviene conocer. El kernel se ejecuta en 
 \section{Consultas globales y reportes HTML}\label{sec:reportes}
 % =========================================================
 
-\texttt{dsm\_pages\_global} recibe un rango de páginas y un búfer de texto, y arma una tabla con las columnas página, propietario, orden, copyset y franja. El propietario se calcula con \texttt{ring\_home\_of} sobre la membresía vigente; el orden es \texttt{page} $\bmod$ \texttt{CHUNK\_PAGES}; la franja es \texttt{page / RAID\_K} cuando la redundancia está activa y \texttt{page / CHUNK\_PAGES} cuando no lo está. Para construir el copyset, la función consulta la tabla local de cada nodo presente con \texttt{QUERY\_REQ} de tipo \texttt{DSM\_QUERY\_PAGES} y ámbito local, y marca un bit por cada nodo que reporta la página en \texttt{S} o \texttt{M}. La consulta se hace por bloques de 4096 páginas para no reservar una entrada por página de la vista.
+\texttt{dsm\_pages\_global} recibe un rango de páginas y un búfer de texto, y arma una tabla con las columnas página, propietario, PID, orden, copyset y franja. El propietario se calcula con \texttt{ring\_home\_of} sobre la membresía vigente; el PID y el orden son los que \texttt{dsm\_alloc} anotó en \texttt{page\_local\_t} al reservar el bloque, es decir el proceso que lo pidió y el índice de la página dentro de esa reserva, no un valor derivado de la dirección; la franja es \texttt{page / RAID\_K} cuando la redundancia está activa y \texttt{page / CHUNK\_PAGES} cuando no lo está. Para construir el copyset y recuperar esos metadatos, la función consulta la tabla local de todos los miembros vivos, incluidos los clientes, con \texttt{QUERY\_REQ} de tipo \texttt{DSM\_QUERY\_PAGES} y ámbito local, y marca un bit por cada miembro que reporta la página en \texttt{S} o \texttt{M}. La consulta se hace por bloques de 4096 páginas para no reservar una entrada por página de la vista.
 
 \texttt{dsm\_html\_report} usa la misma información y escribe en \texttt{OUTPUT\_DIR} un archivo \texttt{global.html} y un archivo \texttt{nodo-<slot>.html} por cada nodo que aporta memoria. El archivo global muestra la cantidad de nodos, la cantidad de clientes, la época, el tamaño de página, las páginas de la vista y las particiones distribuidas ejecutadas y fallidas; después lista los nodos y los clientes con su rol, estado, memoria y dirección, y una tabla de páginas materializadas. Cada archivo por nodo repite los datos del nodo y, si es el nodo local, agrega sus estadísticas. Los clientes aparecen en la lista global con el rol \texttt{cliente}, no generan archivo propio porque no aportan memoria ni custodian páginas, y no se cuentan como nodos.
 
@@ -634,7 +650,7 @@ La implementación tiene límites que conviene conocer. El kernel se ejecuta en 
 \textbf{Clave} & \textbf{Valor} & \textbf{Uso real} \\
 \midrule
 \texttt{RAID\_K} & 2 & Número de datos por franja; validado en $[2,8]$ y usado por \texttt{raid\_init} y \texttt{raid\_stripe\_refresh}. \\
-\texttt{CHUNK\_PAGES} & 4 & Orden de página y agrupación de franja en \texttt{report.c}. \\
+\texttt{CHUNK\_PAGES} & 4 & Agrupación de franjas en \texttt{report.c}; el orden de página lo anota \texttt{dsm\_alloc}. \\
 \texttt{WAIT\_POOL\_ENTRIES} & 64 & Capacidad de particiones de un trabajo distribuido, con tope de 4096. \\
 \texttt{OUTPUT\_DIR} & \texttt{reports} & Destino por defecto de \texttt{dsm\_html\_report}. \\
 \texttt{DIST\_TIMEOUT\_MS} & 5000 & Plazo por defecto de \texttt{dsm\_dist\_verify}. \\
@@ -644,9 +660,103 @@ La implementación tiene límites que conviene conocer. El kernel se ejecuta en 
 \label{tab:config_p2}
 \end{table}
 
-El contraste entre cliente y nodo se mantiene en todas las consultas. Un proceso arranca con \texttt{DSM\_NODE\_MODE=client}, publica \texttt{mem\_pages} en cero y \texttt{is\_client} en uno, y el anillo lo excluye porque \texttt{ring\_build} solo incorpora nodos con memoria. \texttt{dsm\_node\_count} y \texttt{dsm\_global\_size} lo omiten, de modo que lanzar una aplicación cliente no cambia el tamaño del clúster ni el conteo de nodos. \texttt{report\_collect\_nodes} aplica el mismo filtro, así que un cliente no aparece como propietario ni genera un archivo de reporte; \texttt{report\_collect\_clients} lo separa para listarlo con su rol en el archivo global.
+El contraste entre cliente y nodo se mantiene en todas las consultas. Un proceso arranca con \texttt{DSM\_NODE\_MODE=client}, publica \texttt{mem\_pages} en cero y \texttt{is\_client} en uno, y el anillo lo excluye porque \texttt{ring\_build} solo incorpora nodos con memoria. \texttt{dsm\_node\_count} y \texttt{dsm\_global\_size} lo omiten, de modo que lanzar una aplicación cliente no cambia el tamaño del clúster ni el conteo de nodos. \texttt{report\_collect\_nodes} aplica el mismo filtro, así que un cliente no genera un archivo de reporte ni cuenta como nodo; \texttt{report\_collect\_clients} lo separa para listarlo con su rol en el archivo global. Para la tabla global de páginas, \texttt{report\_collect\_sources} reúne a nodos y clientes: el PID y el orden viven en la tabla local de quien tiene la copia, y consultar también al cliente evita propagarlos por la red al custodio.
 
-La implementación de los reportes tiene tres límites. El primero es que \texttt{dsmctl} no expone un comando \texttt{html}: la función existe en la biblioteca y se puede llamar desde una aplicación, pero no desde la herramienta de diagnóstico. El segundo es que la consulta remota de páginas devuelve las tablas de ambos nodos con el copyset. El tercero es una discrepancia menor de contrato: la referencia de la API indica que \texttt{out\_dir} no puede ser una cadena vacía, mientras que \texttt{dsm\_html\_report} interpreta la cadena vacía como \texttt{OUTPUT\_DIR}.
+La implementación de los reportes tiene dos límites. El primero es que \texttt{dsmctl html} ejecuta la generación en el nodo consultado, de modo que los archivos quedan en su sistema de archivos y no en el de la máquina que lanza la herramienta. El segundo es que la tabla global solo muestra las páginas materializadas de cada nodo y el archivo por nodo omite las páginas en \texttt{I}; esa decisión reduce el tamaño del HTML, pero no documenta las páginas ausentes.
+
+% =========================================================
+\section{Manual de usuario}\label{sec:manual}
+% =========================================================
+
+\subsection{Requisitos e instalación}
+
+El sistema se compila en Linux con un compilador C11, \texttt{make} y la biblioteca de hilos POSIX. No requiere dependencias externas: la vista compartida se apoya en \texttt{mmap}, \texttt{mprotect}, \texttt{memfd} y sockets TCP. Para construir los binarios de uso general se ejecuta
+\begin{lstlisting}[language=bash]
+make release
+\end{lstlisting}
+y los ejecutables quedan en \texttt{build/bin/release}. El perfil \texttt{debug} conserva símbolos y añade la aplicación \texttt{test\_basico}; \texttt{make clean} elimina ambos perfiles. La identidad de cada nodo se guarda en \texttt{\$HOME/.dsm} y se crea en el primer arranque.
+
+\subsection{Configuración}
+
+Todos los procesos leen el mismo archivo, por defecto \texttt{dsm.conf} en el directorio actual. Las claves que más afectan la operación son \texttt{CLUSTER\_ID}, que debe coincidir en todos los nodos; \texttt{PAGE\_SIZE} y \texttt{VIEW\_SIZE}, que definen la vista y el tamaño de página; \texttt{NODE\_MEM}, que es la memoria que aporta cada nodo; \texttt{PORT\_MIN} y \texttt{PORT\_MAX}, que acotan los puertos del grupo de trabajo; \texttt{PEER\_HOSTS}, con las direcciones o nombres de los equipos; \texttt{REDUNDANCY} y \texttt{RAID\_K}, para la paridad; \texttt{OUTPUT\_DIR}, para los informes HTML; y los plazos \texttt{CONNECT\_TIMEOUT\_MS}, \texttt{DISCOVERY\_TIMEOUT\_MS}, \texttt{REQUEST\_TIMEOUT\_MS}, \texttt{HB\_INTERVAL\_MS}, \texttt{HB\_SUSPECT} y \texttt{HB\_DEAD}. La configuración se valida al cargarla y se puede revisar con
+\begin{lstlisting}[language=bash]
+./build/bin/release/dsmctl --conf dsm.conf config
+\end{lstlisting}
+Un valor fuera de rango o una combinación incoherente, como \texttt{HB\_SUSPECT} mayor o igual que \texttt{HB\_DEAD}, impide el arranque.
+
+Cada proceso necesita una identidad distinta. Si se ejecutan varios nodos en la misma máquina, se asigna una etiqueta diferente a cada uno con \texttt{DSM\_NODE\_TAG}. Sin esa separación los procesos comparten el archivo de identidad y el descubrimiento los rechaza. El rol se elige con \texttt{DSM\_NODE\_MODE}: \texttt{node} aporta memoria y custodia páginas; \texttt{client} usa la vista pero no aporta páginas y queda fuera del anillo.
+
+\subsection{Arranque de los nodos}
+
+El nodo completo se inicia con el archivo de configuración como único argumento:
+\begin{lstlisting}[language=bash]
+DSM_NODE_TAG=nodo0 ./build/bin/release/dsm dsm.conf
+\end{lstlisting}
+El primer proceso reclama la ranura 0 y espera brevemente a que aparezcan pares; los siguientes se unen al clúster y reciben la primera ranura libre. El programa muestra la ranura asignada al terminar la unión. Para detenerlo se pulsa \texttt{Ctrl+C} o se envía \texttt{SIGTERM}; el nodo anuncia su salida y cierra el listener. Un cliente se inicia igual, con \texttt{DSM\_NODE\_MODE=client}:
+\begin{lstlisting}[language=bash]
+DSM_NODE_TAG=cliente0 DSM_NODE_MODE=client ./build/bin/release/dsm dsm.conf
+\end{lstlisting}
+El archivo de configuración debe ser idéntico en todos los equipos. El rango \texttt{PORT\_MIN}--\texttt{PORT\_MAX} debe estar libre y el cortafuegos debe permitir las conexiones TCP entre los nodos.
+
+\subsection{Aplicaciones de demostración}
+
+\paragraph{Filtro de video.} Convierte un archivo RGB24 a escala de grises usando la memoria compartida para la entrada y la salida. Primero se genera un archivo sintético y después se procesa con uno o más hilos:
+\begin{lstlisting}[language=bash]
+./build/bin/release/filtro_video --generar /tmp/video.rgb 640 480 300
+./build/bin/release/filtro_video --conf dsm.conf /tmp/video.rgb /tmp/gris.rgb 4
+\end{lstlisting}
+El tiempo de filtrado, el rendimiento y el número de fallos atendidos se imprimen al terminar. La entrada y la salida viven en la vista DSM, de modo que el tamaño del archivo puede superar la memoria local de un nodo si el clúster aporta páginas suficientes.
+
+\paragraph{Juego de la vida.} Reserva dos tableros en la vista compartida y aplica el autómata de Conway con doble búfer. Acepta un patrón clásico, una imagen en escala de grises o un tablero vacío, y puede comparar el resultado con una simulación secuencial:
+\begin{lstlisting}[language=bash]
+./build/bin/release/juego_vida --conf dsm.conf --patron glider 4096 4096 50 4
+./build/bin/release/juego_vida --conf dsm.conf --verificar 2048 2048 100 4
+\end{lstlisting}
+
+\paragraph{Ejecución distribuida.} El coordinador y al menos un trabajador se inician como nodos con etiquetas distintas; ambos registran el mismo kernel. El trabajador imprime \texttt{WORKER\_READY} con su ranura y el coordinador imprime \texttt{COORD\_READY} con la dirección virtual de su bloque. En la entrada del coordinador se escribe \texttt{LAUNCH <ranura>} y el coordinador reparte las particiones, ejecuta las locales, recoge los resultados y verifica el CRC32 agregado:
+\begin{lstlisting}[language=bash]
+DSM_NODE_TAG=dist_coord  ./build/bin/release/dsm_dist_demo coord  dsm.conf
+DSM_NODE_TAG=dist_worker ./build/bin/release/dsm_dist_demo worker dsm.conf
+\end{lstlisting}
+La dirección virtual impresa por el coordinador pertenece a la vista común; no se debe confundir con una dirección del montón del proceso.
+
+\paragraph{Redundancia RAID5.} Con \texttt{REDUNDANCY=RAID5} y al menos $K+1$ nodos, los procesos \texttt{hold} aportan memoria y el proceso \texttt{produce} se ejecuta como cliente. El productor espera a que haya tantos nodos como se indiquen, reserva el bloque, escribe un patrón, ejecuta \texttt{dsm\_sync} y termina; los nodos \texttt{hold} pueden leer el bloque con \texttt{READ} o \texttt{READPAGE} desde su entrada estándar:
+\begin{lstlisting}[language=bash]
+DSM_NODE_TAG=raid0 ./build/bin/release/dsm_raid_demo hold dsm.conf
+DSM_NODE_TAG=raid1 ./build/bin/release/dsm_raid_demo hold dsm.conf
+DSM_NODE_TAG=raid2 ./build/bin/release/dsm_raid_demo hold dsm.conf
+DSM_NODE_MODE=client ./build/bin/release/dsm_raid_demo produce dsm.conf 24 3
+\end{lstlisting}
+El productor imprime \texttt{RAID\_READY} con la dirección virtual y el número de páginas. La paridad se actualiza al persistir, no en cada almacenamiento, de modo que \texttt{dsm\_sync} es obligatorio antes de considerar durable el contenido.
+
+\subsection{Herramienta dsmctl}
+
+\texttt{dsmctl} abre una conexión efímera al puerto de un nodo y no se une al clúster. Las opciones \texttt{--conf}, \texttt{--host} y \texttt{--port} se aceptan antes o después del comando; sin \texttt{--port} se usa el \texttt{PORT\_MIN} de la configuración.
+\begin{lstlisting}[language=bash]
+./build/bin/release/dsmctl --conf dsm.conf stats
+./build/bin/release/dsmctl --conf dsm.conf nodes
+./build/bin/release/dsmctl --conf dsm.conf pages 0 8
+./build/bin/release/dsmctl --conf dsm.conf dir 0 8
+./build/bin/release/dsmctl --conf dsm.conf alloc
+./build/bin/release/dsmctl --conf dsm.conf html /tmp/informes
+./build/bin/release/dsmctl --conf dsm.conf --port 27601 nodes
+\end{lstlisting}
+\texttt{stats} suma los contadores de todos los nodos y muestra una fila por nodo y los totales. \texttt{nodes} lista ranura, UUID, dirección, puerto, rol, estado, páginas aportadas, páginas libres del clúster y latidos perdidos. \texttt{pages} resume la tabla local del nodo consultado y, con un rango, imprime el directorio global con propietario, proceso, orden, copyset y franja. \texttt{dir} muestra ese mismo directorio global sin el resumen. \texttt{alloc} lista los bloques reservados del espacio global. \texttt{html} genera en el nodo consultado un archivo \texttt{global.html} y un archivo \texttt{nodo-<ranura>.html} por nodo; el directorio se crea si no existe y los archivos quedan en el sistema de archivos de ese nodo. \texttt{config} muestra los valores cargados y \texttt{help} la ayuda.
+
+\subsection{Resolución de problemas}
+
+\begin{itemize}[leftmargin=1.5em, itemsep=0.3em]
+    \item \textbf{No hay un nodo escuchando en el puerto.} El nodo aún no terminó de unirse o el puerto no coincide. Se comprueba el rango \texttt{PORT\_MIN}--\texttt{PORT\_MAX}, que ningún otro proceso lo ocupe y que \texttt{dsmctl} apunte al puerto correcto con \texttt{--port}.
+    \item \textbf{Dos procesos con el mismo UUID.} El descubrimiento los rechaza con un mensaje explícito. Se asigna un \texttt{DSM\_NODE\_TAG} distinto a cada proceso.
+    \item \textbf{Un nodo aparece como DEAD al arrancar.} La unión puede tardar más que \texttt{HB\_DEAD} si los nombres de \texttt{PEER\_HOSTS} no resuelven. El detector concede un plazo de unión mientras el nodo no haya enviado su primer latido; si el problema persiste, se revisan los nombres, el cortafuegos y \texttt{HB\_INTERVAL\_MS}.
+    \item \textbf{No hay ranuras libres.} Se alcanzó \texttt{MAX\_RUNTIME\_NODES} o el rango de puertos está agotado. Se detienen nodos innecesarios o se amplía el rango.
+    \item \textbf{Error de configuración al cargar.} \texttt{dsmctl config} muestra los valores efectivos y el cargador rechaza las combinaciones incoherentes. Hay que corregir el archivo, no el binario.
+    \item \textbf{Sin espacio para un bloque.} La suma de páginas aportadas por los nodos vivos es la capacidad real; \texttt{VIEW\_SIZE} solo acota el espacio de direcciones. Se aumenta \texttt{NODE\_MEM}, se agregan nodos o se reduce el bloque.
+    \item \textbf{Una página queda inválida tras una baja.} Si el custodio cayó y no había copia ni paridad recuperable, el sistema no publica datos antiguos. Se revisa el estado de la franja en \texttt{dsmctl stats} y la tabla con \texttt{dsmctl dir}.
+    \item \textbf{RAID5 no tolera la baja.} La tolerancia es de una pieza por franja. Si dos páginas de datos de la misma franja caen en el mismo nodo, esa franja no se recupera; \texttt{dsmctl dir} muestra el custodio de cada página. Se necesitan más nodos o una colocación que reparta los datos.
+    \item \textbf{El trabajo distribuido falla en el trabajador.} El kernel debe estar registrado en cada proceso que lo ejecute; el coordinador no transporta código. Los trabajadores deben ser nodos con memoria, no clientes.
+    \item \textbf{El informe HTML no aparece.} \texttt{dsmctl html} escribe en el sistema de archivos del nodo consultado, no en el de la máquina desde la que se ejecuta la herramienta. Se comprueba la ruta y los permisos de \texttt{OUTPUT\_DIR}.
+\end{itemize}
 
 % =========================================================
 \section{Protocolo: mensajes nuevos y validación}\label{sec:protocolo}
@@ -683,12 +793,20 @@ La cabecera sigue midiendo 56 bytes en el cable y 64 en memoria, con los mismos 
 \texttt{BARRIER\_ARRIVE} & $0\text{x}33$ & Participante a custodio & 8 & Umbral y generación; longitud exacta. \\
 \texttt{BARRIER\_GO} & $0\text{x}34$ & Custodio a participantes & 4 & Generación; acuse con \texttt{PROBE}. \\
 \texttt{DIST\_RUN} & $0\text{x}50$ & Coordinador a trabajador & 48 & Rango, trabajo, kernel y plazo; longitud exacta. \\
-\texttt{DIST\_DONE} & $0\text{x}51$ & Trabajador a coordinador & 40 & Estado, CRC, tiempo y fallos; longitud exacta. \\
+\texttt{DIST\_DONE} & $0\text{x}51$ & Trabajador a coordinador & 44 & Estado, CRC, tiempo y fallos; longitud exacta. \\
+\texttt{ALLOC\_REQ} & $0\text{x}60$ & Nodo a coordinador & 16 & Petición de rango; páginas, primera página, estado y PID; longitud exacta. \\
+\texttt{ALLOC\_RESP} & $0\text{x}61$ & Coordinador a nodo & 16 & Rango concedido o rechazo; la ranura vigente del coordinador puede viajar en \texttt{first\_page}. \\
+\texttt{FREE\_REQ} & $0\text{x}62$ & Nodo a coordinador & 16 & Devolución de un rango reservado; longitud exacta. \\
+\texttt{FREE\_RESP} & $0\text{x}63$ & Coordinador a nodo & 16 & Confirmación o rechazo de la devolución; longitud exacta. \\
+\texttt{ALLOC\_SYNC} & $0\text{x}64$ & Coordinador a pares & $\leq 1$ MiB & Sondeo del mapa global al asumir la coordinación; el emisor no envía carga. \\
+\texttt{ALLOC\_STATE} & $0\text{x}65$ & Par a coordinador & $\leq 1$ MiB & Marca de agua y huecos conocidos, serializados como \texttt{welcome\_t}. \\
 \bottomrule
 \end{xltabular}
 }
 
-El catálogo completo enumera 44 códigos, desde \texttt{HELLO} en $0\text{x}01$ hasta \texttt{NACK} en $0\text{x}7F$. Los mensajes de membresía, descubrimiento y consulta conservan sus reglas. \texttt{WELCOME} y \texttt{MEMBERSHIP\_RESP} se validan como rangos con aritmética modular; \texttt{HELLO} exige 20 bytes; \texttt{JOIN} exige los 36 de \texttt{membership\_wire\_t}; \texttt{HEARTBEAT} exige 12. Las cargas de página, paridad y movimiento exigen exactamente \texttt{page\_size} o la suma de la cabecera de paridad más \texttt{page\_size}, de modo que un mensaje truncado no llega a \texttt{msi.c} ni a \texttt{raid.c}.
+\texttt{wire\_payload\_ok} exige 16 bytes para las cuatro cargas de \texttt{ALLOC/FREE} y aplica el límite general de 1 MiB a \texttt{ALLOC\_SYNC} y \texttt{ALLOC\_STATE}.
+
+El catálogo completo enumera 44 códigos, desde \texttt{HELLO} en $0\text{x}01$ hasta \texttt{NACK} en $0\text{x}7F$. Los mensajes de membresía, descubrimiento y consulta conservan sus reglas. \texttt{WELCOME} se valida como rango con aritmética modular; \texttt{HELLO} exige 20 bytes; \texttt{JOIN} exige los 36 de \texttt{membership\_wire\_t}; \texttt{HEARTBEAT} exige 12. Las cargas de página, paridad y movimiento exigen exactamente \texttt{page\_size} o la suma de la cabecera de paridad más \texttt{page\_size}, de modo que un mensaje truncado no llega a \texttt{msi.c} ni a \texttt{raid.c}.
 
 La clasificación de respuestas también cambió de efecto. \texttt{dsm\_msg\_is\_response} sigue incluyendo \texttt{NACK} y \texttt{DIST\_DONE}. Un \texttt{NACK} sin solicitud pendiente no desaparece: el listener no lo descarta porque solo descarta \texttt{PAGE\_DATA} y \texttt{GRANT} huérfanos, así que llega al worker y este incrementa \texttt{nacks\_received} y registra el diagnóstico. Un \texttt{DIST\_DONE} sin solicitud pendiente sigue el mismo camino y llega a \texttt{dist\_on\_done}, que lo rechaza si el trabajo o la partición no existen. Esa caída al worker es la que permite que la ejecución distribuida use mensajes clasificados como respuesta sin una RPC que los espere.
 
@@ -697,13 +815,13 @@ La clasificación de respuestas también cambió de efecto. \texttt{dsm\_msg\_is
 \section{Limitaciones y trabajo pendiente}\label{sec:pendientes}
 % =========================================================
 
-La recuperación de custodia, la paridad RAID5, la serialización por página, la compuerta de \texttt{tseq}, los acuses múltiples, los cerrojos y las barreras están implementados. Quedan limitaciones de diseño que conviene conocer: la recuperación actúa sobre las páginas que el nodo conoce; la paridad se calcula sobre la versión persistida; la serialización por página rechaza la segunda solicitud con \texttt{BUSY} en lugar de encolarla; y la migración de cerrojos reinicia la cola. El mapa global se replica por \texttt{WELCOME}, de modo que el relevo del coordinador conserva la marca de agua, pero no hay una transacción distribuida que impida que una reserva en vuelo se pierda con el coordinador. La referencia de la API necesita una actualización aparte.
+La recuperación de custodia, la paridad RAID5, la serialización por página, la compuerta de \texttt{tseq}, los acuses múltiples, los cerrojos y las barreras están implementados. Quedan limitaciones de diseño que conviene conocer: la recuperación actúa sobre las páginas que el nodo conoce; la paridad se calcula sobre la versión persistida; la serialización por página rechaza la segunda solicitud con \texttt{BUSY} en lugar de encolarla; y la migración de cerrojos reinicia la cola. El mapa global se replica por \texttt{WELCOME}, de modo que el relevo del coordinador conserva la marca de agua, pero no hay una transacción distribuida que impida que una reserva en vuelo se pierda con el coordinador.
 
 \subsection{Recuperación y redundancia}
 
 La recuperación de custodia funciona para las páginas que el nodo conoce, pero no es una garantía global. \texttt{home\_map} se llena cuando el nodo resuelve el custodio de una página; un nodo que nunca tocó esa página no tiene una entrada que corregir y no participa. Si el custodio cae y ningún nodo conserva copia, \texttt{home\_page\_content} termina sirviendo ceros después de que \texttt{page\_pull} no encuentra nada. No se entrega una versión anterior, pero tampoco se devuelve un error explícito a la aplicación: la pérdida se detecta en el registro y en el estado \texttt{UNCACHED}, no en el valor leído. Para una aplicación que necesita distinguir ``cero'' de ``dato perdido'', esa diferencia importa.
 
-La paridad RAID5 se calcula sobre la versión persistida, no sobre cada almacenamiento. Una página escrita y no sincronizada no está reflejada en la paridad; si el dueño en \texttt{M} cae antes de un \texttt{dsm\_sync}, la reconstrucción puede recuperar una versión anterior. La ventana es la misma que existe sin RAID5, pero conviene decirla. La paridad tampoco sobrevive al reinicio de todos los procesos porque vive en \texttt{calloc}, y la versión de franja es un contador en memoria. La reconstrucción se apoya en el hilo propio para no bloquear al listener, pero no tiene un plazo global ni cancelación; una franja con un par que no responde se queda en \texttt{DEGRADED} y las páginas afectadas se invalidan cuando la recolección falla.
+La paridad RAID5 se calcula sobre la versión persistida, no sobre cada almacenamiento. Una página escrita y no sincronizada no está reflejada en la paridad; si el dueño en \texttt{M} cae antes de un \texttt{dsm\_sync}, la reconstrucción puede recuperar una versión anterior. La ventana es la misma que existe sin RAID5, pero conviene decirla. La paridad tampoco sobrevive al reinicio de todos los procesos porque los marcos viven en memoria dinámica, y la versión de franja es un contador en memoria. La reconstrucción se apoya en el hilo propio para no bloquear al listener, pero no tiene un plazo global ni cancelación; una franja con un par que no responde se queda en \texttt{DEGRADED} y las páginas afectadas se invalidan cuando la recolección falla.
 
 \subsection{Concurrencia y sincronización}
 
@@ -713,18 +831,18 @@ La migración de cerrojos es la parte más conservadora. \texttt{sync\_on\_node\
 
 \subsection{Ejecución distribuida y reportes}
 
-La ejecución distribuida tiene API, mensajes, validación y una aplicación de demostración que la usa entre dos máquinas. El registro del kernel es local a cada proceso, de modo que una aplicación que lance trabajo a otro nodo debe registrar el mismo \texttt{kernel\_id} en ambos; si no, el trabajador responde con \texttt{DSM\_ERR\_INVALID}. El kernel se ejecuta en el hilo worker y no hay un hilo dedicado por partición, así que un kernel intensivo compite con la atención de páginas. \texttt{deadline\_ms} viaja en \texttt{DIST\_RUN} pero no se aplica. La partición se describe con direcciones de la vista, y el coordinador no valida que el rango pertenezca a la vista ni que \texttt{src\_va} y \texttt{dst\_va} no se solapen.
+La ejecución distribuida tiene API, mensajes, validación y una aplicación de demostración, \texttt{apps/dsm\_dist\_demo.c}, que coordina un trabajo entre dos procesos reales y ejecuta particiones en ambos. El registro del kernel es local a cada proceso, de modo que una aplicación que lance trabajo a otro nodo debe registrar el mismo \texttt{kernel\_id} en ambos; si no, el trabajador responde con \texttt{DSM\_ERR\_INVALID}. El kernel se ejecuta en el hilo worker y no hay un hilo dedicado por partición, así que un kernel intensivo compite con la atención de páginas. \texttt{deadline\_ms} viaja en \texttt{DIST\_RUN} pero no se aplica. La partición se describe con direcciones de la vista, y el coordinador no valida que el rango pertenezca a la vista ni que \texttt{src\_va} y \texttt{dst\_va} no se solapen.
 
-Los reportes HTML existen y producen el archivo global y el archivo por nodo, pero no hay un comando \texttt{dsmctl html}. La generación se invoca desde la API y usa \texttt{OUTPUT\_DIR}. La consulta remota de páginas devuelve las tablas de ambos nodos con sus direcciones. La tabla global solo muestra páginas materializadas, y el archivo por nodo omite las páginas en \texttt{I}; esa decisión reduce el tamaño del HTML, pero no documenta las páginas ausentes.
+Los reportes HTML existen y producen el archivo global y el archivo por nodo. \texttt{dsmctl html} ejecuta la generación en el nodo consultado y usa \texttt{OUTPUT\_DIR} si no se indica otro directorio. La consulta remota de páginas devuelve las tablas de los nodos con sus direcciones. La tabla global solo muestra páginas materializadas, y el archivo por nodo omite las páginas en \texttt{I}; esa decisión reduce el tamaño del HTML, pero no documenta las páginas ausentes.
 
 \subsection{Asignación y documentación}
 
-\texttt{dsm\_alloc} y \texttt{dsm\_free} consultan el mapa global del coordinador, el nodo vivo de menor ranura que aporta memoria. El coordinador busca primero en los huecos que dejaron las liberaciones y después avanza la marca de agua; la instantánea del mapa viaja en \texttt{WELCOME} y se replica tras cada cambio, de modo que un relevo conserva los rangos vivos. Si un nodo asume la coordinación sin esa instantánea, rechaza las peticiones con \texttt{BUSY} en lugar de repartir a ciegas. Todos los nodos mapean la vista en la misma \texttt{BASE\_ADDR}, pero cada reserva recibe un rango distinto: para compartir un bloque, el creador debe comunicar la dirección virtual devuelta y el otro proceso la usa dentro de su propia vista. Cada reserva anota el PID y el orden de sus páginas, aunque no existe una tabla global que los consulte. La referencia de la API aún conserva el título del Prototipo 1, no incluye las funciones de ejecución distribuida ni las de reporte, y omite campos nuevos de las estadísticas. Este informe describe el comportamiento actual, pero el documento de referencia de la API necesita una actualización aparte.
+\texttt{dsm\_alloc} y \texttt{dsm\_free} consultan el mapa global del coordinador, el nodo vivo de menor ranura que aporta memoria. El coordinador busca primero en los huecos que dejaron las liberaciones y después avanza la marca de agua; la instantánea del mapa viaja en \texttt{WELCOME} y se replica tras cada cambio, de modo que un relevo conserva los rangos vivos. Si un nodo asume la coordinación sin esa instantánea, rechaza las peticiones con \texttt{BUSY} en lugar de repartir a ciegas. Todos los nodos mapean la vista en la misma \texttt{BASE\_ADDR}, pero cada reserva recibe un rango distinto: para compartir un bloque, el creador debe comunicar la dirección virtual devuelta y el otro proceso la usa dentro de su propia vista. Cada reserva anota el PID y el orden de sus páginas, y la tabla global los consulta en todos los miembros vivos, incluidos los clientes, para mostrarlos en el texto y en el HTML. La referencia de la API ya usa el título del Prototipo 2 y documenta la coordinación global, la ejecución distribuida, los reportes y los campos nuevos de las estadísticas.
 
 \subsection{Cierre}
 
-El Prototipo 2 convierte varias promesas del diseño en mecanismos verificables: una respuesta repetida ya no reescribe la página, una escritura espera todos los acuses de invalidación, un custodio caído se reemplaza y una franja RAID5 se reconstruye por XOR. La compilación de los cuatro perfiles sostiene esa afirmación para el código que existe. La ejecución distribuida y los reportes tienen API, implementación y una demostración entre dos máquinas que cumple el extra del enunciado. La recuperación de custodia se apoya en el traspaso y la paridad en la reconstrucción por XOR.
+El Prototipo 2 convierte varias promesas del diseño en mecanismos verificables: una respuesta repetida ya no reescribe la página, una escritura espera todos los acuses de invalidación, un custodio caído se reemplaza y una franja RAID5 se reconstruye por XOR. La compilación de los cuatro perfiles sostiene esa afirmación para el código que existe. La ejecución distribuida y los reportes tienen API, implementación y una aplicación de demostración entre dos procesos que cubre el extra del enunciado. La recuperación de custodia se apoya en el traspaso y la paridad en la reconstrucción por XOR.
 
-El trabajo siguiente se ordena por riesgo. Primero, la demostración con dos nodos que mate al custodio de una página y confirme la recuperación, y la reconstrucción de una franja RAID5 tras la caída de un nodo. Segundo, la comprobación del descarte por secuencia repetida y de la concesión tras dos acuses de invalidación incompletos. Tercero, una aplicación de ejecución distribuida que use al menos dos nodos y registre el kernel en ambos. Cuarto, el comando \texttt{dsmctl html} y una corrida con varios nodos en las máquinas del laboratorio. Mientras esas piezas no existan, el sistema es un prototipo sólido en el camino de una página y en la API, pero no una demostración completa de tolerancia a fallos en un clúster físico.
+El trabajo siguiente se ordena por riesgo. Primero, repetir la demostración con computadoras físicas del laboratorio y confirmar que el descubrimiento y los puertos se comportan igual que en localhost. Segundo, ampliar la colocación de las franjas para que las páginas de datos de una misma franja no compartan nodo, de modo que la tolerancia de una pieza por franja se acerque a la tolerancia de un nodo. Tercero, completar la verificación de versión en las respuestas de reconstrucción, que hoy transportan la versión solicitada. Mientras esas piezas no existan, el sistema es un prototipo sólido en el camino de una página, en la API y en la reconstrucción de una franja recuperable, pero no una garantía completa de tolerancia a fallos en un clúster físico.
 
 \end{document}
