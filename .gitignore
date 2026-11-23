@@ -18,6 +18,7 @@ TODO.md
 SO-P1-E3-*.pdf
 docs/Entregable03/*.pdf
 dsm-repo.zip
+peda-session-*.txt
 
 # Cerrojo de compilación de invocaciones concurrentes.
 /.build.lock
