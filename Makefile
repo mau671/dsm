@@ -2,6 +2,29 @@ CC      ?= cc
 AR      ?= ar
 BUILD   ?= build
 
+# Serializa las invocaciones concurrentes sobre el mismo árbol de compilación.
+# Dos `make` a la vez escriben los mismos objetos, la misma biblioteca y los
+# mismos ejecutables, y cualquiera de los dos puede encontrar un archivo a
+# medio escribir. El cerrojo cubre la invocación completa, incluidos clean y
+# las pruebas, y se libera solo al terminar el proceso que lo tomó.
+BUILD_LOCK := $(CURDIR)/.build.lock
+
+ifeq ($(DSM_BUILD_LOCKED),)
+.PHONY: all release debug asan tsan test test-unit test-e2e clean
+all release debug asan tsan test test-unit test-e2e clean:
+	@DSM_BUILD_LOCKED=1 flock $(BUILD_LOCK) $(MAKE) --no-print-directory $@
+
+# Los artefactos concretos también se construyen bajo el cerrojo.
+.PHONY: build_lock_force
+build_lock_force:
+$(BUILD)/bin/%: build_lock_force
+	@DSM_BUILD_LOCKED=1 flock $(BUILD_LOCK) $(MAKE) --no-print-directory $@
+$(BUILD)/lib/%: build_lock_force
+	@DSM_BUILD_LOCKED=1 flock $(BUILD_LOCK) $(MAKE) --no-print-directory $@
+$(BUILD)/obj/%: build_lock_force
+	@DSM_BUILD_LOCKED=1 flock $(BUILD_LOCK) $(MAKE) --no-print-directory $@
+else
+
 CFLAGS_COMMON := -std=c11 -Wall -Wextra -Wpedantic -Wshadow \
                  -Wstrict-prototypes -Wmissing-prototypes -Wcast-align \
                  -Wpointer-arith -Wvla -Wformat=2 -Werror -D_GNU_SOURCE \
@@ -59,6 +82,14 @@ $$(BUILD)/bin/$(1)/dsmctl: tools/dsmctl.c $$(BUILD)/lib/$(1)/libdsm.a | $$(BUILD
 $$(BUILD)/bin/$(1)/video_pack: tools/video_pack.c | $$(BUILD)/bin/$(1)
 	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< \
 	      $$(LDFLAGS_COMMON) $$(LDFLAGS_$(2)) -o $$@
+
+$$(BUILD)/bin/$(1)/dsm_dist_demo: apps/dsm_dist_demo.c $$(BUILD)/lib/$(1)/libdsm.a | $$(BUILD)/bin/$(1)
+	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< -L$$(BUILD)/lib/$(1) -ldsm \
+	      $$(LDFLAGS_COMMON) $$(LDFLAGS_$(2)) -o $$@
+
+$$(BUILD)/bin/$(1)/dsm_raid_demo: apps/dsm_raid_demo.c $$(BUILD)/lib/$(1)/libdsm.a | $$(BUILD)/bin/$(1)
+	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< -L$$(BUILD)/lib/$(1) -ldsm \
+	      $$(LDFLAGS_COMMON) $$(LDFLAGS_$(2)) -o $$@
 endef
 
 profile_release := OPT
@@ -71,11 +102,13 @@ $(foreach p,$(PROFILES),$(eval $(call build_profile,$(p),$(profile_$(p)))))
 release: $(BUILD)/lib/release/libdsm.a \
          $(BUILD)/bin/release/dsm $(BUILD)/bin/release/dsmctl \
          $(BUILD)/bin/release/filtro_video $(BUILD)/bin/release/juego_vida \
+         $(BUILD)/bin/release/dsm_dist_demo $(BUILD)/bin/release/dsm_raid_demo \
          $(BUILD)/bin/release/video_pack
 debug:   $(BUILD)/lib/debug/libdsm.a \
          $(BUILD)/bin/debug/dsm $(BUILD)/bin/debug/dsmctl \
          $(BUILD)/bin/debug/test_basico $(BUILD)/bin/debug/filtro_video \
-         $(BUILD)/bin/debug/juego_vida $(BUILD)/bin/debug/video_pack
+         $(BUILD)/bin/debug/juego_vida $(BUILD)/bin/debug/dsm_dist_demo \
+         $(BUILD)/bin/debug/dsm_raid_demo $(BUILD)/bin/debug/video_pack
 asan:    $(BUILD)/lib/asan/libdsm.a \
          $(BUILD)/bin/asan/dsm $(BUILD)/bin/asan/dsmctl
 tsan:    $(BUILD)/lib/tsan/libdsm.a \
@@ -101,11 +134,16 @@ test-unit: asan $(TEST_BINS)
 $(BUILD)/bin/e2e:
 	mkdir -p $@
 
-$(BUILD)/bin/e2e/test_two_nodes: tests/e2e/test_two_nodes.c | $(BUILD)/bin/e2e
+E2E_SRCS := $(wildcard tests/e2e/test_*.c)
+E2E_BINS := $(patsubst tests/e2e/%.c,$(BUILD)/bin/e2e/%,$(E2E_SRCS))
+E2E_DEPS := tests/e2e/e2e_harness.h
+
+$(BUILD)/bin/e2e/%: tests/e2e/%.c $(E2E_DEPS) | $(BUILD)/bin/e2e
 	$(CC) $(CFLAGS_COMMON) $< $(LDFLAGS_COMMON) -o $@
 
-test-e2e: debug $(BUILD)/bin/e2e/test_two_nodes
-	$(BUILD)/bin/e2e/test_two_nodes
+test-e2e: debug $(E2E_BINS)
+	@set -e; for t in $(E2E_BINS); do echo ">> Ejecutando $$t"; ./$$t; echo ""; done
+	@echo "Todas las pruebas de extremo a extremo pasaron exitosamente."
 
 test: test-unit
 
@@ -113,3 +151,5 @@ clean:
 	rm -rf $(BUILD)
 
 -include $(wildcard $(BUILD)/obj/*/*.d)
+
+endif

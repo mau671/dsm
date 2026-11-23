@@ -210,7 +210,6 @@ static void raid_stripe_sync(dsm_ctx_t *ctx, uint32_t sid, stripe_rt_t *out)
     tmp = r->stripes[sid];
     pthread_mutex_unlock(&r->mu);
 
-    uint32_t previous_parity = tmp.parity_slot;
     raid_stripe_refresh(ctx, &tmp);
 
     pthread_mutex_lock(&r->mu);
@@ -218,11 +217,9 @@ static void raid_stripe_sync(dsm_ctx_t *ctx, uint32_t sid, stripe_rt_t *out)
     memcpy(r->stripes[sid].data_slot, tmp.data_slot,
            sizeof(r->stripes[sid].data_slot));
     r->stripes[sid].parity_slot = tmp.parity_slot;
-    /* Un custodio nuevo no recibio el marco del anterior: hasta que la
-     * reconstruccion lo instale, la franja se trata como sin paridad. */
-    if (previous_parity != tmp.parity_slot) {
-        r->stripes[sid].parity_frame_valid = 0u;
-    }
+    /* El marco local no se descarta al cambiar el custodio: mientras su
+     * version coincida sigue siendo una fuente valida para reconstruir una
+     * baja. El custodio nuevo recibe su copia con STRIPE_PUT. */
     if (out) *out = r->stripes[sid];
     pthread_mutex_unlock(&r->mu);
 }
@@ -256,7 +253,7 @@ static void raid_send_word(dsm_ctx_t *ctx, uint32_t dst, uint16_t type,
     hdr.cluster_id    = ctx->cfg.cluster_id;
     hdr.proto_version = DSM_PROTO_VERSION;
     hdr.type          = type;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.src_slot      = ctx->memb.self_slot;
     hdr.dst_slot      = dst;
     hdr.req_id        = req_id;
@@ -323,6 +320,22 @@ static uint32_t rebuild_qlen;
 
 /* --- Ciclo de vida ------------------------------------------------------- */
 
+/* Marco de paridad de una franja. El llamador debe tener r->mu tomado. El
+ * marco se reserva cuando este nodo pasa a custodiar la franja o cuando llega
+ * su primer delta; las franjas sin datos no consumen memoria. */
+static uint8_t *raid_parity_frame_locked(dsm_raid_t *r, uint32_t sid,
+                                         bool create)
+{
+    if (!r->parity || sid >= r->nstripes) return NULL;
+
+    uint8_t *frame = r->parity[sid];
+    if (!frame && create) {
+        frame = calloc(1, r->page_size);
+        if (frame) r->parity[sid] = frame;
+    }
+    return frame;
+}
+
 int raid_init(dsm_ctx_t *ctx)
 {
     if (!ctx) return DSM_ERR_INVALID;
@@ -365,11 +378,11 @@ int raid_init(dsm_ctx_t *ctx)
         DSM_LOG_WARN("RAID5: sin memoria para la tabla de franjas");
         return DSM_OK;
     }
-    r->parity = calloc((size_t)nstripes * ps, 1u);
+    r->parity = calloc(nstripes, sizeof(*r->parity));
     if (!r->parity) {
         free(r->stripes);
         r->stripes = NULL;
-        DSM_LOG_WARN("RAID5: sin memoria para los marcos de paridad");
+        DSM_LOG_WARN("RAID5: sin memoria para el indice de marcos de paridad");
         return DSM_OK;
     }
 
@@ -387,12 +400,18 @@ int raid_init(dsm_ctx_t *ctx)
             uint32_t page = (j < k) ? (sid * k + j) : DSM_PAGE_ID_NONE;
             if (page >= npages) page = DSM_PAGE_ID_NONE;
             s->data_page[j] = page;
-            s->data_slot[j] = (page != DSM_PAGE_ID_NONE)
-                                  ? ring_home_of(ctx, page) : DSM_SLOT_NONE;
+            /* raid_init corre antes de discovery_join: todavía no hay
+             * membresía con la que repartir custodios. Resolver el home aquí
+             * recorre la vista completa sin anillo construible, falla en cada
+             * página y llena el log. raid_stripe_refresh resuelve custodios y
+             * paridad bajo demanda, ya con la tabla de membresía vigente. */
+            s->data_slot[j] = DSM_SLOT_NONE;
         }
     }
-    DSM_LOG_INFO("RAID5: %u franjas de K=%u, %u bytes por marco de paridad",
-                 nstripes, k, ps);
+    DSM_LOG_INFO("RAID5: %u franjas de K=%u, indice de %u KiB y marcos de %u "
+                 "bytes bajo demanda",
+                 nstripes, k, (nstripes * (uint32_t)sizeof(uint8_t *)) / 1024u,
+                 ps);
     return DSM_OK;
 }
 
@@ -421,6 +440,11 @@ void raid_shutdown(dsm_ctx_t *ctx)
     }
     pthread_mutex_destroy(&r->rebuild_mu);
 
+    if (r->parity) {
+        for (uint32_t sid = 0; sid < r->nstripes; sid++) {
+            free(r->parity[sid]);
+        }
+    }
     free(r->parity);
     free(r->stripes);
     r->parity = NULL;
@@ -504,7 +528,7 @@ int raid_on_write(dsm_ctx_t *ctx, uint32_t page,
         hdr.cluster_id    = ctx->cfg.cluster_id;
         hdr.proto_version = DSM_PROTO_VERSION;
         hdr.type          = MSG_PARITY_DELTA;
-        hdr.epoch         = ctx->memb.epoch;
+        hdr.epoch         = atomic_load(&ctx->memb.epoch);
         hdr.src_slot      = ctx->memb.self_slot;
         hdr.dst_slot      = s.parity_slot;
         hdr.req_id        = req;
@@ -622,16 +646,20 @@ void raid_on_parity_delta(dsm_ctx_t *ctx, const dsm_msg_t *m)
                 DSM_LOG_WARN("RAID5: delta de la franja %u con version %u, esperada %u",
                              sid, m->hdr.data_version, expected);
             } else {
-                uint8_t *frame = ctx->raid.parity + (size_t)sid * ps;
-                for (uint32_t i = 0; i < ps; i++) {
-                    frame[i] = (uint8_t)(frame[i] ^ delta[i]);
+                uint8_t *frame = raid_parity_frame_locked(&ctx->raid, sid, true);
+                if (!frame) {
+                    status = DSM_ST_NO_SPACE;
+                } else {
+                    for (uint32_t i = 0; i < ps; i++) {
+                        frame[i] = (uint8_t)(frame[i] ^ delta[i]);
+                    }
+                    live->parity_frame_valid = 1u;
+                    live->version = expected;
+                    if (live->state == DSM_STRIPE_INSTALL) {
+                        live->state = DSM_STRIPE_ACTIVE;
+                    }
+                    version = expected;
                 }
-                live->parity_frame_valid = 1u;
-                live->version = expected;
-                if (live->state == DSM_STRIPE_INSTALL) {
-                    live->state = DSM_STRIPE_ACTIVE;
-                }
-                version = expected;
             }
             pthread_mutex_unlock(&ctx->raid.mu);
         }
@@ -702,8 +730,10 @@ void raid_on_stripe_read(dsm_ctx_t *ctx, const dsm_msg_t *m)
     } else if (req.kind == DSM_STRIPE_READ_PARITY) {
         pthread_mutex_lock(&ctx->raid.mu);
         stripe_rt_t *s = &ctx->raid.stripes[req.stripe_id];
-        if (s->parity_frame_valid) {
-            memcpy(buf, ctx->raid.parity + (size_t)req.stripe_id * ps, ps);
+        uint8_t *frame = raid_parity_frame_locked(&ctx->raid, req.stripe_id,
+                                                  false);
+        if (s->parity_frame_valid && frame) {
+            memcpy(buf, frame, ps);
         } else {
             status = DSM_ST_NO_SPACE;
         }
@@ -720,7 +750,7 @@ void raid_on_stripe_read(dsm_ctx_t *ctx, const dsm_msg_t *m)
     hdr.cluster_id    = ctx->cfg.cluster_id;
     hdr.proto_version = DSM_PROTO_VERSION;
     hdr.type          = MSG_STRIPE_DATA;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.src_slot      = ctx->memb.self_slot;
     hdr.dst_slot      = m->hdr.src_slot;
     hdr.req_id        = m->hdr.req_id;
@@ -757,21 +787,28 @@ void raid_on_stripe_put(dsm_ctx_t *ctx, const dsm_msg_t *m)
     if (sw.stripe_id >= ctx->raid.nstripes ||
         sw.k < 2u || sw.k > DSM_RAID_MAX_K) {
         status = DSM_ST_BAD_STATE;
+    } else if (sw.parity_slot != ctx->memb.self_slot) {
+        status = DSM_ST_NOT_HOME;
     } else {
         pthread_mutex_lock(&ctx->raid.mu);
         stripe_rt_t *s = &ctx->raid.stripes[sw.stripe_id];
-        s->k = sw.k;
-        memcpy(s->data_page, sw.data_page, sizeof(s->data_page));
-        memcpy(s->data_slot, sw.data_slot, sizeof(s->data_slot));
-        s->parity_slot = sw.parity_slot;
-        s->version = m->hdr.data_version;
-        /* El marco de paridad llega despues, como delta completo: hasta
-         * confirmarlo la franja no esta operativa y su respaldo local parte
-         * de ceros para que el delta la reconstruya tal cual. */
-        memset(ctx->raid.parity + (size_t)sw.stripe_id * ctx->raid.page_size,
-               0, ctx->raid.page_size);
-        s->parity_frame_valid = 0u;
-        s->state = DSM_STRIPE_INSTALL;
+        uint8_t *frame = raid_parity_frame_locked(&ctx->raid, sw.stripe_id,
+                                                  true);
+        if (!frame) {
+            status = DSM_ST_NO_SPACE;
+        } else {
+            s->k = sw.k;
+            memcpy(s->data_page, sw.data_page, sizeof(s->data_page));
+            memcpy(s->data_slot, sw.data_slot, sizeof(s->data_slot));
+            s->parity_slot = sw.parity_slot;
+            s->version = m->hdr.data_version;
+            /* El marco de paridad llega despues, como delta completo: hasta
+             * confirmarlo la franja no esta operativa y su respaldo local parte
+             * de ceros para que el delta la reconstruya tal cual. */
+            memset(frame, 0, ctx->raid.page_size);
+            s->parity_frame_valid = 0u;
+            s->state = DSM_STRIPE_INSTALL;
+        }
         pthread_mutex_unlock(&ctx->raid.mu);
     }
 
@@ -839,7 +876,7 @@ static bool raid_send_stripe_read(dsm_ctx_t *ctx, uint32_t dst, uint32_t sid,
     hdr.cluster_id    = ctx->cfg.cluster_id;
     hdr.proto_version = DSM_PROTO_VERSION;
     hdr.type          = MSG_STRIPE_READ;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.src_slot      = ctx->memb.self_slot;
     hdr.dst_slot      = dst;
     hdr.req_id        = *req;
@@ -881,7 +918,7 @@ static bool raid_install_parity(dsm_ctx_t *ctx, uint32_t sid, uint32_t dst,
     hdr.cluster_id    = ctx->cfg.cluster_id;
     hdr.proto_version = DSM_PROTO_VERSION;
     hdr.type          = MSG_STRIPE_PUT;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.src_slot      = ctx->memb.self_slot;
     hdr.dst_slot      = dst;
     hdr.req_id        = req;
@@ -916,7 +953,7 @@ static bool raid_install_parity(dsm_ctx_t *ctx, uint32_t sid, uint32_t dst,
     hdr.cluster_id    = ctx->cfg.cluster_id;
     hdr.proto_version = DSM_PROTO_VERSION;
     hdr.type          = MSG_PARITY_DELTA;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.src_slot      = ctx->memb.self_slot;
     hdr.dst_slot      = dst;
     hdr.req_id        = dreq;
@@ -1059,15 +1096,16 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
         }
 
         bool parity_loss = (lost == DSM_RAID_MAX_K);
-        bool parity_gone = (old_s.parity_slot == slot);
-        if (!parity_loss && (parity_gone || s.parity_slot == DSM_SLOT_NONE ||
-                             !membership_is_alive(ctx, s.parity_slot))) {
-            /* La franja perdio su copia y no queda paridad utilizable: solo
+        bool old_parity_alive = (old_s.parity_slot != DSM_SLOT_NONE &&
+                                 old_s.parity_slot != slot &&
+                                 membership_is_alive(ctx, old_s.parity_slot));
+        if (!parity_loss && !old_parity_alive) {
+            /* La franja perdio su dato y la paridad anterior ya no esta: solo
              * la pagina del nodo caido se perdio de verdad, el resto sigue
              * vivo en sus homes. */
             DSM_LOG_WARN("RAID5: franja %u sin paridad ni copia del nodo caido", sid);
-            if (s.data_page[lost] != DSM_PAGE_ID_NONE) {
-                raid_invalidate_page(ctx, s.data_page[lost]);
+            if (old_s.data_page[lost] != DSM_PAGE_ID_NONE) {
+                raid_invalidate_page(ctx, old_s.data_page[lost]);
             }
             pthread_mutex_lock(&ctx->raid.mu);
             ctx->raid.stripes[sid].state = DSM_STRIPE_DEGRADED;
@@ -1081,9 +1119,9 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
             continue;
         }
 
-        /* Se reune la paridad y los datos supervivientes. Las paginas que
-         * no existen en la franja (final truncado) no aportan pieza: el
-         * XOR las excluye de entrada en lugar de pedir un marco inexistente. */
+        /* Se reune la paridad y los datos supervivientes en sus custodios
+         * anteriores a la baja. La reconstruccion no puede apoyarse en los
+         * nuevos homes: el anillo se recalculo y aun no recibieron el dato. */
         uint8_t *gather = calloc(DSM_RAID_MAX_GATHER, ps);
         if (!gather) continue;
         int pidx[DSM_RAID_MAX_GATHER];
@@ -1096,18 +1134,19 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
 
         for (uint32_t j = 0; j < k && sent; j++) {
             if (!parity_loss && j == lost) continue;
-            if (s.data_page[j] == DSM_PAGE_ID_NONE) continue;
+            if (old_s.data_page[j] == DSM_PAGE_ID_NONE) continue;
 
             pidx[ngather] = -1;
             reqs[ngather] = 0;
-            srcs[ngather] = s.data_slot[j];
-            pages[ngather] = s.data_page[j];
+            srcs[ngather] = old_s.data_slot[j];
+            pages[ngather] = old_s.data_page[j];
             kinds[ngather] = (uint8_t)DSM_STRIPE_READ_DATA;
             if (srcs[ngather] == DSM_SLOT_NONE ||
+                srcs[ngather] == slot ||
                 !membership_is_alive(ctx, srcs[ngather]) ||
                 !raid_send_stripe_read(ctx, srcs[ngather], sid,
                                        pages[ngather], kinds[ngather],
-                                       s.version,
+                                       old_s.version,
                                        gather + (size_t)ngather * ps,
                                        &pidx[ngather], &reqs[ngather])) {
                 sent = false;
@@ -1119,14 +1158,15 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
         if (sent && !parity_loss) {
             pidx[ngather] = -1;
             reqs[ngather] = 0;
-            srcs[ngather] = s.parity_slot;
-            pages[ngather] = s.data_page[0];
+            srcs[ngather] = old_s.parity_slot;
+            pages[ngather] = old_s.data_page[0];
             kinds[ngather] = (uint8_t)DSM_STRIPE_READ_PARITY;
             if (srcs[ngather] == DSM_SLOT_NONE ||
+                srcs[ngather] == slot ||
                 !membership_is_alive(ctx, srcs[ngather]) ||
                 !raid_send_stripe_read(ctx, srcs[ngather], sid,
                                        pages[ngather], kinds[ngather],
-                                       s.version,
+                                       old_s.version,
                                        gather + (size_t)ngather * ps,
                                        &pidx[ngather], &reqs[ngather])) {
                 sent = false;
@@ -1147,10 +1187,10 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
                     have = false;
                     break;
                 }
-                if (rx_version != s.version) {
+                if (rx_version != old_s.version) {
                     DSM_LOG_WARN("RAID5: franja %u, copia del slot %u con version %u "
                                  "en lugar de %u; descartada",
-                                 sid, srcs[i], rx_version, s.version);
+                                 sid, srcs[i], rx_version, old_s.version);
                     have = false;
                     break;
                 }
@@ -1171,16 +1211,21 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
                          * reconstruido se instala directo en el respaldo
                          * local, sin ida y vuelta por la red. */
                         pthread_mutex_lock(&ctx->raid.mu);
-                        memcpy(ctx->raid.parity + (size_t)sid * ps, xor, ps);
-                        ctx->raid.stripes[sid].parity_frame_valid = 1u;
+                        uint8_t *frame = raid_parity_frame_locked(&ctx->raid,
+                                                                  sid, true);
+                        if (frame) {
+                            memcpy(frame, xor, ps);
+                            ctx->raid.stripes[sid].parity_frame_valid = 1u;
+                        } else {
+                            have = false;
+                        }
                         pthread_mutex_unlock(&ctx->raid.mu);
-                        have = true;
                     } else {
                         have = raid_install_parity(ctx, sid, s.parity_slot,
                                                    &s, xor, s.version);
                     }
                 } else {
-                    uint32_t page = s.data_page[lost];
+                    uint32_t page = old_s.data_page[lost];
                     if (page != DSM_PAGE_ID_NONE) {
                         raid_deliver_page(ctx, page, s.data_slot[lost],
                                           xor, sid);
@@ -1201,8 +1246,8 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
             /* Solo se invalida lo que de verdad se perdio: con perdida de
              * paridad las paginas siguen vivas en sus homes; con perdida
              * de dato, la unica perdida es la del nodo caido. */
-            if (!parity_loss && s.data_page[lost] != DSM_PAGE_ID_NONE) {
-                raid_invalidate_page(ctx, s.data_page[lost]);
+            if (!parity_loss && old_s.data_page[lost] != DSM_PAGE_ID_NONE) {
+                raid_invalidate_page(ctx, old_s.data_page[lost]);
             }
             DSM_LOG_WARN("RAID5: franja %u irrecuperable tras la baja del slot %u",
                          sid, slot);

@@ -61,7 +61,10 @@ typedef struct {
     pthread_mutex_t   mu;
     pthread_cond_t    cond;
     stripe_rt_t      *stripes;
-    uint8_t          *parity;       /* nstripes * page_size, en el orden de los marcos */
+    /* Un puntero por franja; el marco se reserva bajo demanda solo cuando este
+     * nodo es el custodio de paridad de esa franja. nstripes * page_size con
+     * VIEW_SIZE de 4 GiB y K=2 serian 2 GiB por nodo. */
+    uint8_t         **parity;
     uint32_t          nstripes;
     uint32_t          page_size;
     uint32_t          k;

@@ -229,6 +229,7 @@ int config_load(dsm_config_t *cfg, const char *path)
     cfg->home_slack_permille   = 1250;
     cfg->lock_timeout_ms      = 10000;
     cfg->worker_queue_cap     = 4096;
+    /* Capacidad de particiones de un trabajo distribuido, no conjunto de espera. */
     cfg->wait_pool_entries    = 64;
     cfg->dist_timeout_ms      = 5000;
     strncpy(cfg->log_level, "INFO", sizeof(cfg->log_level) - 1);
@@ -690,7 +691,7 @@ void config_dump(const dsm_config_t *cfg)
                  cfg->home_slack_permille / 1000, cfg->home_slack_permille % 1000);
     DSM_LOG_INFO("  Páginas de datos por franja        : %u", cfg->raid_k);
     DSM_LOG_INFO("  Páginas por fragmento              : %u", cfg->chunk_pages);
-    DSM_LOG_INFO("  Capacidad del conjunto de espera   : %u", cfg->wait_pool_entries);
+    DSM_LOG_INFO("  Capacidad de particiones distribuidas: %u", cfg->wait_pool_entries);
     DSM_LOG_INFO("  Directorio de salida               : %s", cfg->output_dir);
     DSM_LOG_INFO("  Plazo de ejecución distribuida     : %u ms", cfg->dist_timeout_ms);
     DSM_LOG_INFO("  Modo de proceso                    : %s", cfg->client_mode ? "cliente" : "nodo");

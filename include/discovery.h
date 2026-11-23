@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include "dsm_types.h"
 #include "wire.h"
@@ -12,6 +13,9 @@ typedef struct {
     uint8_t  uuid[16];
     uint64_t incarnation;
     uint64_t last_hb_ms;      /* Marca de tiempo monotónica del último latido */
+    /* Momento en que el nodo se incorporó o renovó su JOIN. Mientras no haya
+     * enviado un latido, el detector le concede el plazo de unión. */
+    uint64_t joined_ms;
     uint32_t slot;
     uint32_t ip;              /* Orden de red IPv4 */
     uint32_t mem_pages;
@@ -22,9 +26,12 @@ typedef struct {
     /* Un cliente se une para usar la memoria del cluster sin aportar páginas:
      * no proyecta vnodes en el anillo y nunca es custodio. */
     uint8_t  is_client;
+    /* Verdadero desde el primer latido recibido tras el JOIN. */
+    uint8_t  hb_seen;
+    uint8_t  reserved[2];
 } node_info_t;
 
-_Static_assert(sizeof(node_info_t) == 56, "node_info_t debe ocupar 56 bytes");
+_Static_assert(sizeof(node_info_t) == 64, "node_info_t debe ocupar 64 bytes");
 
 typedef struct {
     node_info_t      nodes[MAX_NODES];
@@ -35,7 +42,7 @@ typedef struct {
     /* IP de este nodo observada en una conexion entrante o saliente. Cero
      * mientras no se conozca una direccion alcanzable. */
     uint32_t         self_ip;
-    uint64_t         epoch;
+    _Atomic uint64_t epoch;
     uint64_t         election_tiebreak;
     /*
      * Una ranura reclamada mientras discovery_join no confirma el reparto es
@@ -46,6 +53,19 @@ typedef struct {
     atomic_bool      claim_pending;
     const struct dsm_config *cfg;   /* Página y vnodes por MiB del cluster */
     pthread_rwlock_t rw;
+    /*
+     * Aviso de progreso de la membresía. Cada publicación de ranura, unión,
+     * baja o recepción de JOIN_ACK incrementa progress_seq y despierta a quien
+     * espera una condición de membresía (asentamiento del descubrimiento,
+     * convergencia y reunión de nodos).
+     */
+    pthread_mutex_t  wait_mu;
+    pthread_cond_t   progress_cv;
+    uint64_t         progress_seq;
+    /* Aviso de parada del hilo de latidos: el periodo se espera sobre hb_cv
+     * y el apagado la señaliza para no retrasar la unión del hilo. */
+    pthread_mutex_t  hb_mu;
+    pthread_cond_t   hb_cv;
 } dsm_membership_t;
 
 /* Forward declaration del contexto global */
@@ -94,6 +114,18 @@ bool membership_is_alive(dsm_ctx_t *ctx, uint32_t slot);
 bool membership_slot_present(dsm_ctx_t *ctx, uint32_t slot);
 void membership_evaluate(dsm_ctx_t *ctx, uint64_t now_ms);
 uint32_t membership_total_pages(dsm_ctx_t *ctx);
+
+/* --- Esperas por condición sobre la membresía --------------------------- */
+
+/* Instantánea del contador de progreso, para no perder un aviso emitido entre
+ * la comprobación de la condición y la espera. */
+uint64_t membership_progress_mark(dsm_membership_t *m);
+/* Registra un avance de la membresía y despierta a todos los esperadores. */
+void     membership_progress_notify(dsm_membership_t *m);
+/* Espera a que el contador de progreso deje de valer 'mark' o a que venza el
+ * plazo absoluto en milisegundos monotónicos. */
+void     membership_progress_wait(dsm_membership_t *m, uint64_t mark,
+                                  uint64_t deadline_ms);
 
 /* --- Hilo de latidos (Heartbeat) --- */
 

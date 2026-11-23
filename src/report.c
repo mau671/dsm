@@ -105,6 +105,25 @@ static uint32_t report_collect_clients(dsm_ctx_t *ctx, report_node_t *out,
     return n;
 }
 
+/* Fuentes de la tabla global de paginas: todos los miembros vivos con ranura,
+ * incluidos los clientes. Cada miembro conserva en su tabla local el PID y el
+ * orden de las paginas que tiene en S o M, asi que consultar tambien a los
+ * clientes basta para que la tabla global y el HTML muestren los metadatos
+ * reales. Esta opcion evita propagar pid/order en PAGE_REQUEST y PAGE_MOVE y
+ * mantenerlos sincronizados en el custodio: el dueno de la copia sigue siendo
+ * la unica fuente autoritativa. Los nodos van primero y en el mismo orden que
+ * report_collect_nodes, de modo que el indice de las primeras nnodes entradas
+ * sigue correspondiendo al archivo nodo-<slot>.html. */
+static uint32_t report_collect_sources(dsm_ctx_t *ctx, report_node_t *out,
+                                       uint32_t cap)
+{
+    uint32_t n = report_collect_nodes(ctx, out, cap);
+    if (n < cap) {
+        n += report_collect_clients(ctx, out + n, cap - n);
+    }
+    return n;
+}
+
 static void report_count_roles(dsm_ctx_t *ctx, uint32_t *nodes,
                                uint32_t *clients, uint64_t *epoch)
 {
@@ -122,7 +141,7 @@ static void report_count_roles(dsm_ctx_t *ctx, uint32_t *nodes,
             nn++;
         }
     }
-    if (epoch) *epoch = ctx->memb.epoch;
+    if (epoch) *epoch = atomic_load(&ctx->memb.epoch);
     pthread_rwlock_unlock(&ctx->memb.rw);
 
     if (nodes) *nodes = nn;
@@ -382,7 +401,7 @@ dsm_status_t dsm_pages_global(uint32_t first, uint32_t max, char *out,
     if (rows > max) rows = max;
 
     report_node_t nodes[MAX_NODES];
-    uint32_t nnodes = report_collect_nodes(ctx, nodes, MAX_NODES);
+    uint32_t nnodes = report_collect_sources(ctx, nodes, MAX_NODES);
 
     uint32_t chunk = rows;
     if (chunk > REPORT_CHUNK_PAGES) chunk = REPORT_CHUNK_PAGES;
@@ -609,6 +628,12 @@ dsm_status_t dsm_html_report(const char *out_dir)
     report_node_t clients[MAX_NODES];
     uint32_t nclients = report_collect_clients(ctx, clients, MAX_NODES);
 
+    /* La tabla global consulta tambien a los clientes para mostrar el PID y
+     * el orden reales. La lista de nodos y los archivos por nodo se mantienen
+     * separados: los clientes no aportan memoria ni custodian paginas. */
+    report_node_t sources[MAX_NODES];
+    uint32_t nsources = report_collect_sources(ctx, sources, MAX_NODES);
+
     report_file_t files[MAX_NODES + 1];
     memset(files, 0, sizeof(files));
 
@@ -758,7 +783,7 @@ dsm_status_t dsm_html_report(const char *out_dir)
                                          REPORT_MAX_ROWS);
 
     uint32_t chunk = REPORT_CHUNK_PAGES;
-    size_t entries = (size_t)chunk * (nnodes ? nnodes : 1u);
+    size_t entries = (size_t)chunk * (nsources ? nsources : 1u);
     uint8_t *states = calloc(entries, 1u);
     uint32_t *pids = calloc(entries, sizeof(uint32_t));
     uint32_t *orders = calloc(entries, sizeof(uint32_t));
@@ -785,12 +810,12 @@ dsm_status_t dsm_html_report(const char *out_dir)
 
             uint32_t first = runs[r].first_page + run_done;
 
-            memset(states, 0, (size_t)n * (nnodes ? nnodes : 1u));
-            memset(pids, 0, (size_t)n * (nnodes ? nnodes : 1u) * sizeof(uint32_t));
-            memset(orders, 0, (size_t)n * (nnodes ? nnodes : 1u) * sizeof(uint32_t));
-            for (uint32_t k = 0; k < nnodes; k++) {
+            memset(states, 0, (size_t)n * (nsources ? nsources : 1u));
+            memset(pids, 0, (size_t)n * (nsources ? nsources : 1u) * sizeof(uint32_t));
+            memset(orders, 0, (size_t)n * (nsources ? nsources : 1u) * sizeof(uint32_t));
+            for (uint32_t k = 0; k < nsources; k++) {
                 uint32_t got = 0;
-                int frc = report_fetch_node(ctx, &nodes[k], first, n,
+                int frc = report_fetch_node(ctx, &sources[k], first, n,
                                             recs, &got);
                 if (frc != DSM_OK) {
                     free(runs);
@@ -816,11 +841,11 @@ dsm_status_t dsm_html_report(const char *out_dir)
 
                 uint32_t pid = 0;
                 uint32_t order = 0;
-                for (uint32_t k = 0; k < nnodes; k++) {
+                for (uint32_t k = 0; k < nsources; k++) {
                     size_t idx = (size_t)k * n + i;
                     uint8_t s = states[idx];
                     if (s == DSM_PAGE_S || s == DSM_PAGE_M) {
-                        uint32_t slot = nodes[k].slot;
+                        uint32_t slot = sources[k].slot;
                         copyset[slot / 8] |= (uint8_t)(1u << (slot % 8));
                         if (pid == 0 && pids[idx] != 0) {
                             pid   = pids[idx];

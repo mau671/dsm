@@ -2,6 +2,7 @@
 #define DSM_SYNC_H
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include "dsm_types.h"
@@ -88,8 +89,9 @@ typedef struct dsm_sync {
     dsm_sync_remote_wait_t remote_wait[DSM_SYNC_REMOTE_WAIT];
     /* Época de sincronización: crece con cada baja. Las concesiones con época
      * anterior se descartan para que un grant del custodio caído no reescriba
-     * el estado reconstruido por el nuevo. */
-    uint64_t            epoch;
+     * el estado reconstruido por el nuevo. Se escribe bajo mu y se lee en las
+     * rutas de envío sin ese cerrojo, así que el acceso es atómico. */
+    _Atomic uint64_t    epoch;
     uint64_t            migrate_epoch;
     uint32_t            migrate_dead;
     uint64_t            migrate_deadline_ms;

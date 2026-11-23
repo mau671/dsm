@@ -272,8 +272,18 @@ typedef struct {
 enum dsm_query_kind {
     DSM_QUERY_NODES = 0,
     DSM_QUERY_STATS = 1,
-    DSM_QUERY_PAGES = 2
+    DSM_QUERY_PAGES = 2,
+    /* Tabla de directorio global en texto, generada con dsm_pages_global. */
+    DSM_QUERY_DIR   = 3,
+    /* Bloques reservados del mapa global. */
+    DSM_QUERY_ALLOC = 4,
+    /* Genera los informes HTML en el nodo consultado. La ruta viaja como
+     * carga adicional después de query_req_t. */
+    DSM_QUERY_HTML  = 5
 };
+
+/* Ruta máxima que acepta una petición DSM_QUERY_HTML. */
+#define DSM_QUERY_HTML_PATH_MAX 256u
 
 enum dsm_query_scope {
     DSM_QUERY_LOCAL  = 0,

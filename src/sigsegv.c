@@ -18,6 +18,15 @@
 static struct sigaction g_old_sa;
 static bool g_sig_installed = false;
 
+/* Con SIG_IGN como disposición anterior no se puede devolver el control ni
+ * reenviar la señal: el kernel reanuda la instrucción que falló y genera otro
+ * SIGSEGV indefinidamente. En ese caso el manejador termina el proceso. */
+static bool sigsegv_old_ignored(void)
+{
+    return (g_old_sa.sa_flags & SA_SIGINFO) == 0 &&
+           g_old_sa.sa_handler == SIG_IGN;
+}
+
 /* Ranura de fallo TLS usando initial-exec para evitar malloc en el handler */
 static __thread fault_slot_t g_thread_slot __attribute__((tls_model("initial-exec")));
 static __thread bool g_thread_attached = false;
@@ -151,15 +160,23 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext_raw)
     (void)sig;
     dsm_ctx_t *ctx = dsm_ctx_get();
     if (!ctx) {
-        /* Fuera de control de DSM: restaurar y abortar */
+        /* Fuera de control de DSM: restaurar y dejar actuar la disposición
+         * anterior. Con SIG_IGN el retorno repetiría el fallo sin fin. */
         sigaction(SIGSEGV, &g_old_sa, NULL);
+        g_sig_installed = false;
+        if (sigsegv_old_ignored()) _exit(128 + SIGSEGV);
         return;
     }
 
     uint8_t *addr = (uint8_t *)info->si_addr;
     if (addr < ctx->mem.view || addr >= ctx->mem.view + ctx->mem.view_size) {
-        /* Dirección fuera de la vista compartida DSM: fallo de aplicacion real */
+        /* Dirección fuera de la vista compartida DSM: fallo de aplicación real.
+         * Se restaura la disposición anterior y se devuelve el control para que
+         * actúe. Si era SIG_IGN, el retorno reanuda la instrucción culpable y
+         * el fallo se repite sin fin: se termina el proceso en ese caso. */
         sigaction(SIGSEGV, &g_old_sa, NULL);
+        g_sig_installed = false;
+        if (sigsegv_old_ignored()) _exit(128 + SIGSEGV);
         return;
     }
 
@@ -192,15 +209,20 @@ static void sigsegv_handler(int sig, siginfo_t *info, void *ucontext_raw)
     }
 
     /* Un fallo terminal no se puede reintentar: el despachador dejó el motivo
-     * en la ranura. Se restaura el manejador previo y se reenvía la señal para
+     * en la ranura. Se restaura la disposición previa y se reenvía SIGSEGV para
      * que el proceso termine en vez de repetir el acceso en un bucle de CPU.
-     * Quien maneje la señal recibe el mismo si_addr y el estado de la página. */
+     * raise() genera SI_TKILL, no conserva el si_addr original: un manejador de
+     * la aplicación debe leer el estado de la ranura, no fiarse de si_addr. */
     if (__atomic_load_n(&s->error, __ATOMIC_ACQUIRE) != 0) {
         /* El despachador agotó el único camino posible para este fallo. Se
-         * restaura el manejador anterior y se reenvía SIGSEGV; el abort queda
+         * restaura la disposición anterior y se reenvía SIGSEGV; el abort queda
          * como cierre si la acción anterior no termina el proceso. */
         sigaction(SIGSEGV, &g_old_sa, NULL);
         g_sig_installed = false;
+
+        /* Con SIG_IGN la señal reenviada se descarta y la instrucción se
+         * reejecutaría en bucle. Se termina con el código de SIGSEGV. */
+        if (sigsegv_old_ignored()) _exit(128 + SIGSEGV);
 
         /* SIGSEGV sigue bloqueado por estar dentro de su manejador: se
          * desbloquea para que la acción restaurada se ejecute en el acto. */

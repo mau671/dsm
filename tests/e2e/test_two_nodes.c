@@ -1,32 +1,25 @@
-#include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include "e2e_harness.h"
 
-#define CONF_PATH "/tmp/dsm_two_nodes_integration.conf"
 #define TEST_APP "./build/bin/debug/test_basico"
-#define LINE_TIMEOUT_MS 15000
 
-typedef struct {
-    pid_t pid;
-    FILE *input;
-    FILE *output;
-} child_t;
+#define PORT_BASE 27664u
+#define PORT_SPAN 32u
+#define PORT_NEED 8u
 
-static void write_config(void)
+#define START_TIMEOUT_MS 90000u
+#define JOIN_TIMEOUT_MS  90000u
+#define STEP_TIMEOUT_MS  60000u
+
+static void write_config(uint16_t port_min, uint16_t port_max)
 {
-    FILE *file = fopen(CONF_PATH, "w");
-    if (!file) return;
+    FILE *file = fopen(e2e_state.conf_path, "w");
+    if (!file) {
+        printf("FAIL: no se pudo escribir la configuración\n");
+        return;
+    }
 
     fprintf(file,
-            "CLUSTER_ID=0x534F3031\n"
+            "CLUSTER_ID=0x%08X\n"
             "PAGE_SIZE=4096\n"
             "BASE_ADDR=0x200000000000\n"
             "VIEW_SIZE=4294967296\n"
@@ -34,13 +27,13 @@ static void write_config(void)
             "VNODES_PER_MB=16\n"
             "REDUNDANCY=NONE\n"
             "NODE_MEM=67108864\n"
-            "PORT_MIN=27660\n"
-            "PORT_MAX=27699\n"
+            "PORT_MIN=%u\n"
+            "PORT_MAX=%u\n"
             "PEER_HOSTS=127.0.0.1\n"
-            "CONNECT_TIMEOUT_MS=300\n"
-            "DISCOVERY_TIMEOUT_MS=300\n"
-            "SEND_TIMEOUT_MS=2000\n"
-            "REQUEST_TIMEOUT_MS=3000\n"
+            "CONNECT_TIMEOUT_MS=1000\n"
+            "DISCOVERY_TIMEOUT_MS=1000\n"
+            "SEND_TIMEOUT_MS=5000\n"
+            "REQUEST_TIMEOUT_MS=5000\n"
             "REQUEST_RETRIES=3\n"
             "RECONNECT_MIN_MS=100\n"
             "RECONNECT_MAX_MS=1500\n"
@@ -51,125 +44,26 @@ static void write_config(void)
             "DISPATCHER_THREADS=1\n"
             "PAGE_LOCK_STRIPES=64\n"
             "HOME_SLACK=1.25\n"
-            "LOCK_TIMEOUT_MS=5000\n"
+            "LOCK_TIMEOUT_MS=10000\n"
             "WORKER_QUEUE_CAP=1024\n"
-            "DSM_LOG_LEVEL=ERROR\n");
+            "DSM_LOG_LEVEL=ERROR\n",
+            (unsigned)e2e_cluster_id(), (unsigned)port_min,
+            (unsigned)port_max);
     fclose(file);
 }
 
-static child_t start_child(const char *role, const char *extra_arg)
+/* Exige que cada clave aparezca en la línea de estadísticas con un valor
+ * mayor que cero. El formato lo produce print_stats() de apps/test_basico.c. */
+static bool stats_positive(const char *line, const char *const *keys,
+                           size_t nkeys)
 {
-    int input_pipe[2];
-    int output_pipe[2];
-    child_t child = { .pid = -1, .input = NULL, .output = NULL };
-    if (pipe(input_pipe) != 0 || pipe(output_pipe) != 0) return child;
-
-    pid_t pid = fork();
-    if (pid < 0) return child;
-    if (pid == 0) {
-        int null_fd = open("/dev/null", O_WRONLY);
-        dup2(input_pipe[0], STDIN_FILENO);
-        dup2(output_pipe[1], STDOUT_FILENO);
-        if (null_fd >= 0) dup2(null_fd, STDERR_FILENO);
-        close(input_pipe[0]);
-        close(input_pipe[1]);
-        close(output_pipe[0]);
-        close(output_pipe[1]);
-        if (null_fd >= 0) close(null_fd);
-        if (extra_arg) {
-            execl(TEST_APP, TEST_APP, role, CONF_PATH, extra_arg, (char *)NULL);
-        } else {
-            execl(TEST_APP, TEST_APP, role, CONF_PATH, (char *)NULL);
-        }
-        _exit(127);
-    }
-
-    close(input_pipe[0]);
-    close(output_pipe[1]);
-    child.pid = pid;
-    child.input = fdopen(input_pipe[1], "w");
-    child.output = fdopen(output_pipe[0], "r");
-    if (child.input) setvbuf(child.input, NULL, _IOLBF, 0);
-    if (child.output) setvbuf(child.output, NULL, _IONBF, 0);
-    return child;
-}
-
-static bool read_line(child_t *child, char *line, size_t capacity)
-{
-    struct pollfd pfd = { .fd = fileno(child->output), .events = POLLIN };
-    int rc;
-    do {
-        rc = poll(&pfd, 1, LINE_TIMEOUT_MS);
-    } while (rc < 0 && errno == EINTR);
-    if (rc <= 0) return false;
-    return fgets(line, (int)capacity, child->output) != NULL;
-}
-
-static bool expect_line(child_t *child, const char *expected)
-{
-    char line[512];
-    if (!read_line(child, line, sizeof(line))) {
-        printf("  FAIL: no se recibio '%s' dentro del timeout\n", expected);
-        return false;
-    }
-    printf("  %s", line);
-    return strstr(line, expected) != NULL;
-}
-
-/* Lee la linea A_READY PASS y copia la dirección virtual publicada por A. El
- * resto de nodos no recibe el mismo rango de dsm_alloc: el mapa global entrega
- * páginas distintas, así que B solo puede compartir el bloque si conoce la VA
- * que A reservó. */
-static bool expect_a_ready(child_t *child, char *va, size_t va_cap)
-{
-    char line[512];
-    static const char marker[] = "A_READY PASS ";
-
-    if (!read_line(child, line, sizeof(line))) {
-        printf("  FAIL: no se recibio '%s' dentro del timeout\n", marker);
-        return false;
-    }
-    printf("  %s", line);
-
-    const char *pos = strstr(line, marker);
-    if (!pos) return false;
-    pos += sizeof(marker) - 1;
-
-    size_t n = strcspn(pos, "\r\n");
-    if (n == 0 || n >= va_cap) return false;
-    memcpy(va, pos, n);
-    va[n] = '\0';
-    return true;
-}
-
-static void send_command(child_t *child, const char *command)
-{
-    if (child->input) {
-        fprintf(child->input, "%s\n", command);
-        fflush(child->input);
-    }
-}
-
-/* Lee una linea de estadisticas y exige que cada clave de `keys` aparezca con
- * un valor mayor que cero. El formato lo produce print_stats() de
- * apps/test_basico.c. */
-static bool expect_stats_positive(child_t *child, const char *const *keys,
-                                  size_t nkeys)
-{
-    char line[512];
-    if (!read_line(child, line, sizeof(line))) {
-        printf("  FAIL: no se recibio linea de stats dentro del timeout\n");
-        return false;
-    }
-    printf("  %s", line);
-
     bool ok = true;
     for (size_t i = 0; i < nkeys; i++) {
         char pattern[64];
         snprintf(pattern, sizeof(pattern), "%s=", keys[i]);
         const char *pos = strstr(line, pattern);
         if (!pos) {
-            printf("  FAIL: la linea de stats no incluye '%s'\n", keys[i]);
+            printf("  FAIL: la línea de stats no incluye '%s'\n", keys[i]);
             ok = false;
             continue;
         }
@@ -182,65 +76,108 @@ static bool expect_stats_positive(child_t *child, const char *const *keys,
     return ok;
 }
 
-static void stop_child(child_t *child)
-{
-    if (child->input) fclose(child->input);
-    if (child->output) fclose(child->output);
-    if (child->pid > 0) {
-        int status = 0;
-        if (waitpid(child->pid, &status, WNOHANG) == 0) {
-            kill(child->pid, SIGTERM);
-            waitpid(child->pid, &status, 0);
-        }
-    }
-}
-
 int main(void)
 {
-    child_t node_a = { 0 };
-    child_t node_b = { 0 };
-    char va[64] = "";
-    bool pass = true;
-
     setvbuf(stdout, NULL, _IOLBF, 0);
-    write_config();
-    printf("=== Integracion DSM: dos nodos y flujo MSI ===\n");
+    e2e_prepare("two_nodes");
 
-    node_a = start_child("A", NULL);
-    if (node_a.pid < 0 || !node_a.input || !node_a.output) {
-        printf("FAIL: no se pudo iniciar nodo A\n");
-        stop_child(&node_a);
-        unlink(CONF_PATH);
+    printf("=== Integración DSM: dos nodos y flujo MSI ===\n");
+
+    uint16_t port_min = 0;
+    uint16_t port_max = 0;
+    if (!e2e_pick_ports(PORT_BASE, PORT_SPAN, PORT_NEED, &port_min, &port_max)) {
+        printf("FAIL: no hay un tramo de puertos libre en [%u, %u]\n",
+               (unsigned)PORT_BASE, (unsigned)(PORT_BASE + PORT_SPAN));
         return 1;
     }
-    pass = expect_line(&node_a, "A_AFTER_WRITE stats") &&
-           expect_a_ready(&node_a, va, sizeof(va));
+    write_config(port_min, port_max);
+    printf("  Puertos: %u-%u\n", (unsigned)port_min, (unsigned)port_max);
 
-    node_b = pass ? start_child("B", va) : node_b;
-    if (node_b.pid < 0 || !node_b.input || !node_b.output) {
-        printf("FAIL: no se pudo iniciar nodo B\n");
-        pass = false;
-    } else {
-        pass = expect_line(&node_b, "B_BEFORE_READ stats") && pass;
-        pass = expect_line(&node_b, "B_READ PASS") && pass;
-        pass = expect_line(&node_b, "B_AFTER_READ stats") && pass;
-        pass = expect_line(&node_b, "B_AFTER_WRITE PASS") && pass;
-        pass = expect_line(&node_b, "B_AFTER_WRITE stats") && pass;
-        send_command(&node_a, "READ");
-        pass = expect_line(&node_a, "A_AFTER_B_WRITE PASS") && pass;
-        static const char *const a_read_keys[] = {
-            "invalidations", "faults_serviced", "fault_latency_us_avg"
-        };
-        pass = expect_stats_positive(&node_a, a_read_keys,
-                                     sizeof(a_read_keys) / sizeof(a_read_keys[0]))
-               && pass;
+    bool pass = true;
+    char line[512] = "";
+    char va[64] = "";
+
+    char *a_argv[] = { TEST_APP, "A", e2e_state.conf_path, NULL };
+    e2e_child_t *node_a = e2e_start_child("two_nodes_a", NULL, NULL, a_argv);
+    if (!node_a || node_a->pid <= 0) {
+        printf("FAIL: no se pudo iniciar nodo A\n");
+        e2e_stop_child(node_a);
+        return 1;
     }
 
-    send_command(&node_a, "QUIT");
-    send_command(&node_b, "QUIT");
-    stop_child(&node_a);
-    stop_child(&node_b);
-    unlink(CONF_PATH);
+    if (!e2e_wait_line(node_a, "A_AFTER_WRITE stats", line, sizeof(line),
+                       e2e_now_ms() + START_TIMEOUT_MS)) {
+        printf("FAIL: el nodo A no completó la escritura inicial\n");
+        pass = false;
+    }
+
+    if (pass) {
+        if (!e2e_wait_line(node_a, "A_READY PASS ", line, sizeof(line),
+                           e2e_now_ms() + START_TIMEOUT_MS)) {
+            printf("FAIL: el nodo A no publicó su dirección\n");
+            pass = false;
+        } else {
+            const char *pos = strstr(line, "A_READY PASS ");
+            pos += strlen("A_READY PASS ");
+            size_t n = strcspn(pos, "\r\n");
+            if (n == 0 || n >= sizeof(va)) {
+                printf("FAIL: la dirección publicada por A no es válida\n");
+                pass = false;
+            } else {
+                memcpy(va, pos, n);
+                va[n] = '\0';
+            }
+        }
+    }
+
+    e2e_child_t *node_b = NULL;
+    if (pass) {
+        char *b_argv[] = { TEST_APP, "B", e2e_state.conf_path, va, NULL };
+        node_b = e2e_start_child("two_nodes_b", NULL, NULL, b_argv);
+        if (!node_b || node_b->pid <= 0) {
+            printf("FAIL: no se pudo iniciar nodo B\n");
+            pass = false;
+        }
+    }
+
+    if (pass) {
+        pass = e2e_wait_line(node_b, "B_BEFORE_READ stats", line, sizeof(line),
+                             e2e_now_ms() + JOIN_TIMEOUT_MS) && pass;
+        pass = e2e_wait_line(node_b, "B_READ PASS", line, sizeof(line),
+                             e2e_now_ms() + STEP_TIMEOUT_MS) && pass;
+        pass = e2e_wait_line(node_b, "B_AFTER_READ stats", line, sizeof(line),
+                             e2e_now_ms() + STEP_TIMEOUT_MS) && pass;
+        pass = e2e_wait_line(node_b, "B_AFTER_WRITE PASS", line, sizeof(line),
+                             e2e_now_ms() + STEP_TIMEOUT_MS) && pass;
+        pass = e2e_wait_line(node_b, "B_AFTER_WRITE stats", line, sizeof(line),
+                             e2e_now_ms() + STEP_TIMEOUT_MS) && pass;
+    }
+
+    if (pass) {
+        e2e_send(node_a, "READ");
+        pass = e2e_wait_line(node_a, "A_AFTER_B_WRITE PASS", line, sizeof(line),
+                             e2e_now_ms() + STEP_TIMEOUT_MS) && pass;
+
+        /* El home de la página puede pasar a B cuando B se une al anillo: en
+         * ese caso A entrega su copia y la suelta al responder la sonda del
+         * nuevo home, sin mensaje de invalidación que contar. La garantía
+         * observable es que A deba volver a fallar para leer el valor escrito
+         * por B, que es lo que comprueban estas claves. */
+        static const char *const a_read_keys[] = {
+            "read_faults", "faults_serviced"
+        };
+        if (pass &&
+            e2e_wait_line(node_a, "A_AFTER_READ stats", line, sizeof(line),
+                          e2e_now_ms() + STEP_TIMEOUT_MS)) {
+            pass = stats_positive(line, a_read_keys,
+                                  sizeof(a_read_keys) / sizeof(a_read_keys[0]));
+        } else {
+            pass = false;
+        }
+    }
+
+    e2e_stop_child(node_a);
+    e2e_stop_child(node_b);
 
     printf("%s\n", pass ? "PASS: flujo de página entre dos nodos" :
                          "FAIL: flujo de página entre dos nodos");

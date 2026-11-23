@@ -120,6 +120,7 @@ typedef struct dsm_ctx {
     dsm_raid_t        raid;
     dsm_dist_t        dist;
     atomic_bool       running;
+    atomic_bool       hb_running;
     pthread_t         hb_thread;
 } dsm_ctx_t;
 
@@ -165,5 +166,11 @@ void dsm_alloc_on_welcome(dsm_ctx_t *ctx, const dsm_msg_t *m);
  * instantánea y el nuevo coordinador toma el máximo antes de repartir. */
 void dsm_alloc_on_sync_request(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void dsm_alloc_on_sync_state(dsm_ctx_t *ctx, const dsm_msg_t *m);
+
+/* Páginas de la vista que el mapa global tiene libres en este momento: las
+ * páginas totales menos los rangos reservados, contando de nuevo como libres
+ * los que la lista de huecos ya devolvió. Un cliente no aporta memoria y
+ * devuelve cero. */
+uint32_t dsm_alloc_free_pages(dsm_ctx_t *ctx);
 
 #endif /* DSM_INTERNAL_H */

@@ -22,6 +22,12 @@ uint64_t mono_ms(void)
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
+void mono_deadline_ts(uint64_t deadline_ms, struct timespec *ts)
+{
+    ts->tv_sec  = (time_t)(deadline_ms / 1000ULL);
+    ts->tv_nsec = (long)((deadline_ms % 1000ULL) * 1000000ULL);
+}
+
 void sleep_ms(uint32_t ms)
 {
     struct timespec ts;

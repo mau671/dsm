@@ -4,10 +4,15 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <time.h>
 #include <netinet/in.h>
 
 /* Tiempo monotónico en milisegundos */
 uint64_t mono_ms(void);
+
+/* Convierte un plazo absoluto en milisegundos monotónicos al timespec que
+ * consume pthread_cond_timedwait sobre una condvar con CLOCK_MONOTONIC. */
+void mono_deadline_ts(uint64_t deadline_ms, struct timespec *ts);
 
 /* Dormir durante una cantidad de milisegundos */
 void sleep_ms(uint32_t ms);

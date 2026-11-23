@@ -219,7 +219,11 @@ dsm_status_t dsm_free(void *ptr, uint64_t size);
  *
  * @return DSM_OK si todas las páginas se persistieron; el primer código de
  *         error encontrado si alguna falla. DSM_ERR_NOT_INIT si el subsistema no
- *         está inicializado.
+ *         está inicializado; DSM_ERR_NET si el enlace con un custodio falla o
+ *         este rechaza el WRITEBACK; DSM_ERR_TIMEOUT si expira el plazo de la
+ *         transacción local; DSM_ERR_MEM si no se puede reservar el búfer de
+ *         copia de la página; DSM_ERR_BUSY si la franja del custodio está
+ *         ocupada.
  */
 dsm_status_t dsm_sync(void);
 
@@ -386,7 +390,9 @@ dsm_status_t dsm_dist_register(uint32_t kernel_id, dsm_dist_kernel_fn fn,
  * @param kernel_id Identificador de un kernel registrado con
  *        dsm_dist_register().
  * @param parts Arreglo de particiones a ejecutar. No puede ser NULL si
- *        @p nparts es mayor que cero.
+ *        @p nparts es mayor que cero. Cada @c parts[].id debe ser único dentro
+ *        del arreglo y menor que @p nparts: identifica la ranura del resultado
+ *        y un id repetido o fuera de rango hace ambigua la correlación.
  * @param nparts Cantidad de particiones del arreglo @p parts.
  * @param workers Arreglo de ranuras de nodos trabajadores. No puede ser NULL
  *        si @p nworkers es mayor que cero.
@@ -400,8 +406,9 @@ dsm_status_t dsm_dist_register(uint32_t kernel_id, dsm_dist_kernel_fn fn,
  *         está registrado, @p job_id ya está en uso o alguna ranura de
  *         @p workers no pertenece a la membresía; DSM_ERR_NO_SPACE si no hay
  *         entradas libres para el trabajo o sus particiones; DSM_ERR_NET si
- *         falla el envío a un trabajador; DSM_ERR_TIMEOUT si no se puede
- *         arrancar el trabajo dentro del plazo.
+ *         falla el envío a un trabajador. El plazo @p timeout_ms acota la fase
+ *         de arranque en el trabajador, pero esta llamada no espera los
+ *         resultados y nunca devuelve DSM_ERR_TIMEOUT.
  */
 dsm_status_t dsm_dist_launch(uint32_t job_id, uint32_t kernel_id,
                              const dsm_dist_part_t *parts, uint32_t nparts,
@@ -482,6 +489,22 @@ dsm_status_t dsm_node_id(uint32_t *out);
  *         inicializado; DSM_ERR_INVALID si @p out es NULL.
  */
 dsm_status_t dsm_node_count(uint32_t *out);
+
+/**
+ * @brief Espera a que el cluster reúna una cantidad mínima de nodos vivos.
+ *
+ * Comprueba dsm_node_count() y, mientras no se alcance @p min_nodes, duerme
+ * en una condición de membresía que se señaliza al publicarse una ranura, al
+ * registrarse una unión, al recibirse un JOIN_ACK o al procesarse una baja.
+ * No hay sondeo periódico: cada aviso reevalúa el conteo y el plazo acota la
+ * espera total.
+ *
+ * @param min_nodes Cantidad mínima de nodos vivos que aportan memoria.
+ * @param timeout_ms Plazo máximo de espera en milisegundos.
+ * @return DSM_OK si el conteo alcanzó @p min_nodes; DSM_ERR_TIMEOUT si venció
+ *         el plazo; DSM_ERR_NOT_INIT si el subsistema no está inicializado.
+ */
+dsm_status_t dsm_wait_members(uint32_t min_nodes, uint32_t timeout_ms);
 
 /**
  * @brief Obtiene el tamaño agregado de la memoria compartida del cluster.

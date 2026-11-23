@@ -812,7 +812,7 @@ static int invalidate_remote_copies(dsm_ctx_t *ctx, uint32_t page,
         hdr.page_id       = page;
         hdr.tseq          = entry->tseq;
         hdr.access        = DSM_ACCESS_WRITE;
-        hdr.epoch         = ctx->memb.epoch;
+        hdr.epoch         = atomic_load(&ctx->memb.epoch);
 
         if (dsm_net_send(ctx, slot, &hdr, NULL) != DSM_OK) {
             msi_ack_wait_cancel(ctx, txn);

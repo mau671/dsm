@@ -10,6 +10,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -24,8 +25,20 @@
  */
 #define DISCOVERY_RESOLVE_ROUNDS 32u
 
-/* Pausa entre pasadas de la ventana de asentamiento del primer nodo. */
+/* Pausa máxima entre pasadas de la ventana de asentamiento del primer nodo.
+ * La espera real es por condición de progreso de la membresía; este plazo solo
+ * acota el reescaneo cuando el aviso proviene de un par que aún no publicó su
+ * ranura. */
 #define DISCOVERY_SETTLE_STEP_MS 20u
+
+/*
+ * Plazo mínimo que se concede a un nodo recién incorporado antes de evaluar sus
+ * latidos. Un JOIN puede recibirse mientras el nuevo nodo todavía recorre el
+ * rango de puertos y resuelve sus vecinos, de modo que su primer latido puede
+ * tardar más que HB_DEAD. El plazo se aplica solo mientras el nodo no haya
+ * enviado ningún latido; en cuanto llega el primero, rige la detección normal.
+ */
+#define DISCOVERY_JOIN_GRACE_MS 30000u
 
 /*
  * Cerrojo de descubrimiento del cluster.
@@ -621,7 +634,7 @@ static int discovery_send_join_all(dsm_ctx_t *ctx, const discovery_walk_t *walk,
         hdr.type          = MSG_JOIN;
         hdr.src_slot      = ctx->memb.self_slot;
         hdr.dst_slot      = ep->slot;
-        hdr.epoch         = ctx->memb.epoch;
+        hdr.epoch         = atomic_load(&ctx->memb.epoch);
         hdr.payload_len   = DSM_MEMBERSHIP_WIRE_LEN;
 
         uint8_t raw_hdr[DSM_HDR_LEN];
@@ -646,11 +659,21 @@ static int discovery_send_join_all(dsm_ctx_t *ctx, const discovery_walk_t *walk,
                     }
                 } else if (rx_hdr.type == MSG_JOIN_ACK) {
                     (*acked)++;
+                    /* El aviso despierta a las esperas por condición del
+                     * descubrimiento: la ranura propia ya quedó registrada en
+                     * el par y el reparto puede reevaluarse sin esperar el
+                     * plazo del paso. */
+                    membership_progress_notify(&ctx->memb);
                     pthread_rwlock_wrlock(&ctx->memb.rw);
-                    if (rx_hdr.epoch > ctx->memb.epoch) {
+                    if (rx_hdr.epoch > atomic_load(&ctx->memb.epoch)) {
                         ctx->memb.epoch = rx_hdr.epoch;
                     }
                     pthread_rwlock_unlock(&ctx->memb.rw);
+                    /* El par ya registró esta ranura: el latido inmediato
+                     * confirma que el nodo está vivo antes de que arranque
+                     * su hilo periódico. */
+                    (void)net_send_heartbeat(ctx, ep->slot,
+                                             dsm_alloc_free_pages(ctx));
                 }
             }
         }
@@ -782,6 +805,7 @@ static int discovery_settle(dsm_ctx_t *ctx, discovery_walk_t *walk,
     uint64_t deadline = mono_ms() + ctx->cfg.discovery_timeout_ms;
 
     for (;;) {
+        uint64_t mark = membership_progress_mark(&ctx->memb);
         int rc = discovery_pass(ctx, walk, max_epoch);
         if (rc != DSM_OK) {
             return rc;
@@ -794,10 +818,11 @@ static int discovery_settle(dsm_ctx_t *ctx, discovery_walk_t *walk,
         if (now >= deadline) {
             return DSM_OK;
         }
-        uint64_t remaining = deadline - now;
-        sleep_ms((uint32_t)(remaining < DISCOVERY_SETTLE_STEP_MS
-                                ? remaining
-                                : DISCOVERY_SETTLE_STEP_MS));
+        uint64_t wake = now + DISCOVERY_SETTLE_STEP_MS;
+        if (wake > deadline) {
+            wake = deadline;
+        }
+        membership_progress_wait(&ctx->memb, mark, wake);
     }
 }
 
@@ -834,6 +859,7 @@ static int discovery_converge(dsm_ctx_t *ctx, uint64_t *max_epoch)
     discovery_walk_t walk;
 
     for (;;) {
+        uint64_t mark = membership_progress_mark(&ctx->memb);
         int rc = discovery_pass(ctx, &walk, max_epoch);
         if (rc != DSM_OK) {
             return rc;
@@ -848,7 +874,11 @@ static int discovery_converge(dsm_ctx_t *ctx, uint64_t *max_epoch)
                          walk.nep, 2u * ctx->cfg.discovery_timeout_ms);
             return DSM_OK;
         }
-        sleep_ms(DISCOVERY_SETTLE_STEP_MS);
+        uint64_t wake = now + DISCOVERY_SETTLE_STEP_MS;
+        if (wake > deadline) {
+            wake = deadline;
+        }
+        membership_progress_wait(&ctx->memb, mark, wake);
     }
 }
 
@@ -922,8 +952,12 @@ static int discovery_resolve_slots(dsm_ctx_t *ctx, uint32_t *peers_out)
             }
             if (status == DSM_ST_BUSY) {
                 /* El titular de la ranura aun no confirmo su reparto y la cede
-                 * en su propia vuelta; se le da tiempo a completarla. */
-                sleep_ms(DISCOVERY_SETTLE_STEP_MS);
+                 * en su propia vuelta; se le da tiempo a completarla. La
+                 * espera termina antes si su JOIN o cualquier cambio de
+                 * membresía avisa del progreso. */
+                uint64_t mark = membership_progress_mark(&ctx->memb);
+                membership_progress_wait(&ctx->memb, mark,
+                                         mono_ms() + DISCOVERY_SETTLE_STEP_MS);
                 continue;
             }
             if (status == DSM_ST_NO_SPACE) {
@@ -1048,6 +1082,13 @@ static int discovery_join_locked(dsm_ctx_t *ctx)
         membership_claim_slot(ctx, slot);
     }
 
+    /* El hilo de latidos arranca antes de resolver el reparto: la ranura ya
+     * está reclamada y los pares que registraron al nodo reciben latidos
+     * mientras este termina de escanear y converger. */
+    if ((rc = hb_start(ctx)) != DSM_OK) {
+        return rc;
+    }
+
     rc = discovery_resolve_slots(ctx, &peers);
     if (rc != DSM_OK) {
         return rc;
@@ -1068,7 +1109,6 @@ static int discovery_join_locked(dsm_ctx_t *ctx)
                  "pares alcanzables = %u",
                  m->self_slot, (unsigned long)m->epoch, peers);
 
-    hb_start(ctx);
     return DSM_OK;
 }
 
@@ -1101,6 +1141,11 @@ int discovery_join(dsm_ctx_t *ctx)
     }
 
     rc = discovery_join_locked(ctx);
+
+    if (rc != DSM_OK) {
+        /* El hilo de latidos pudo arrancar antes de que el reparto fallara. */
+        hb_stop(ctx);
+    }
 
     discovery_lock_release(lock_fd);
     return rc;
@@ -1163,11 +1208,49 @@ void discovery_leave(dsm_ctx_t *ctx)
 
 /* --- Tabla de membresía local --- */
 
+/* Las esperas por condición usan CLOCK_MONOTONIC para comparar sus plazos
+ * contra mono_ms(). Un condvar con el reloj de tiempo real interpretaría el
+ * plazo monotónico como una fecha de calendario. */
+static int membership_wait_init(dsm_membership_t *m)
+{
+    pthread_condattr_t attr;
+    int rc = pthread_condattr_init(&attr);
+    if (rc != 0) {
+        return -1;
+    }
+
+    rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (rc == 0 && pthread_mutex_init(&m->wait_mu, NULL) != 0) {
+        rc = -1;
+    }
+    if (rc == 0 && pthread_cond_init(&m->progress_cv, &attr) != 0) {
+        pthread_mutex_destroy(&m->wait_mu);
+        rc = -1;
+    }
+    if (rc == 0 && pthread_mutex_init(&m->hb_mu, NULL) != 0) {
+        pthread_cond_destroy(&m->progress_cv);
+        pthread_mutex_destroy(&m->wait_mu);
+        rc = -1;
+    }
+    if (rc == 0 && pthread_cond_init(&m->hb_cv, &attr) != 0) {
+        pthread_mutex_destroy(&m->hb_mu);
+        pthread_cond_destroy(&m->progress_cv);
+        pthread_mutex_destroy(&m->wait_mu);
+        rc = -1;
+    }
+    pthread_condattr_destroy(&attr);
+    return rc;
+}
+
 int membership_init(dsm_ctx_t *ctx)
 {
     dsm_membership_t *m = &ctx->memb;
     memset(m, 0, sizeof(*m));
     pthread_rwlock_init(&m->rw, NULL);
+    if (membership_wait_init(m) != 0) {
+        pthread_rwlock_destroy(&m->rw);
+        return DSM_ERR_MEM;
+    }
     m->self_slot = DSM_SLOT_NONE;
     m->cfg       = &ctx->cfg;
     return DSM_OK;
@@ -1175,8 +1258,48 @@ int membership_init(dsm_ctx_t *ctx)
 
 void membership_destroy(dsm_ctx_t *ctx)
 {
+    pthread_cond_destroy(&ctx->memb.hb_cv);
+    pthread_mutex_destroy(&ctx->memb.hb_mu);
+    pthread_cond_destroy(&ctx->memb.progress_cv);
+    pthread_mutex_destroy(&ctx->memb.wait_mu);
     pthread_rwlock_destroy(&ctx->memb.rw);
 }
+
+uint64_t membership_progress_mark(dsm_membership_t *m)
+{
+    pthread_mutex_lock(&m->wait_mu);
+    uint64_t mark = m->progress_seq;
+    pthread_mutex_unlock(&m->wait_mu);
+    return mark;
+}
+
+void membership_progress_notify(dsm_membership_t *m)
+{
+    pthread_mutex_lock(&m->wait_mu);
+    m->progress_seq++;
+    pthread_cond_broadcast(&m->progress_cv);
+    pthread_mutex_unlock(&m->wait_mu);
+}
+
+void membership_progress_wait(dsm_membership_t *m, uint64_t mark,
+                              uint64_t deadline_ms)
+{
+    struct timespec ts;
+
+    pthread_mutex_lock(&m->wait_mu);
+    while (m->progress_seq == mark) {
+        uint64_t now = mono_ms();
+        if (now >= deadline_ms) {
+            break;
+        }
+        mono_deadline_ts(deadline_ms, &ts);
+        if (pthread_cond_timedwait(&m->progress_cv, &m->wait_mu, &ts) != 0) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(&m->wait_mu);
+}
+
 
 void membership_add_self(dsm_ctx_t *ctx)
 {
@@ -1201,12 +1324,15 @@ void membership_add_self(dsm_ctx_t *ctx)
         ni->free_pages  = ni->mem_pages;
         ni->is_client   = ctx->cfg.client_mode ? 1u : 0u;
         ni->last_hb_ms  = mono_ms();
+        ni->joined_ms   = ni->last_hb_ms;
         ni->missed_hb   = 0;
+        ni->hb_seen     = 1;
 
         m->present[s / 8] |= (uint8_t)(1u << (s % 8));
     }
 
     pthread_rwlock_unlock(&m->rw);
+    membership_progress_notify(m);
 }
 
 /* Registra la IP con la que este nodo alcanza a un par. La observacion sale
@@ -1404,7 +1530,9 @@ void membership_merge_wire(dsm_membership_t *m, const welcome_t *w)
          * cliente, que usa la memoria del cluster pero no la aporta. */
         ni->is_client   = (wire->mem_pages == 0) ? 1u : 0u;
         ni->last_hb_ms  = mono_ms();
+        ni->joined_ms   = ni->last_hb_ms;
         ni->missed_hb   = 0;
+        ni->hb_seen     = 0;
 
         m->present[s / 8] |= (uint8_t)(1u << (s % 8));
     }
@@ -1422,6 +1550,7 @@ void membership_on_heartbeat(dsm_ctx_t *ctx, const dsm_msg_t *m)
         node_info_t *ni = &ctx->memb.nodes[s];
         ni->last_hb_ms = mono_ms();
         ni->missed_hb  = 0;
+        ni->hb_seen    = 1;
         if (ni->state == DSM_NODE_SUSPECT) {
             ni->state = DSM_NODE_ALIVE;
             DSM_LOG_INFO("Nodo en slot %u recupero estado ALIVE", s);
@@ -1532,15 +1661,18 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
     /* Cero páginas publicadas identifica a un cliente en la membresía local. */
     ni->is_client   = (wire.mem_pages == 0) ? 1u : 0u;
     ni->last_hb_ms  = mono_ms();
+    ni->joined_ms   = ni->last_hb_ms;
     ni->missed_hb   = 0;
+    ni->hb_seen     = 0;
     ctx->memb.present[s / 8] |= (uint8_t)(1u << (s % 8));
 
     if (m->hdr.epoch >= ctx->memb.epoch) {
         ctx->memb.epoch = m->hdr.epoch + 1;
     }
-    uint64_t epoch = ctx->memb.epoch;
+    uint64_t epoch = atomic_load(&ctx->memb.epoch);
 
     pthread_rwlock_unlock(&ctx->memb.rw);
+    membership_progress_notify(&ctx->memb);
 
     /* Responder con JOIN_ACK directamente en el socket abierto si existe. No
      * se pre-abre un enlace de vuelta: cada envio posterior conecta bajo
@@ -1640,6 +1772,7 @@ void membership_on_node_down(dsm_ctx_t *ctx, const dsm_msg_t *m)
     /* Solo quien cierra la ranura recupera: los receptores del broadcast
      * ya la encuentran cerrada y su paso es un no-op. */
     if (changed) {
+        membership_progress_notify(&ctx->memb);
         node_down_recover_enqueue(ctx, s);
     }
 }
@@ -1661,6 +1794,7 @@ void membership_on_leave(dsm_ctx_t *ctx, const dsm_msg_t *m)
     pthread_rwlock_unlock(&ctx->memb.rw);
 
     if (changed) {
+        membership_progress_notify(&ctx->memb);
         node_down_recover_enqueue(ctx, s);
     }
 }
@@ -1820,6 +1954,117 @@ static uint16_t query_fill_global(dsm_ctx_t *ctx, query_builder_t *b)
     return DSM_ST_OK;
 }
 
+/* Tabla global de directorio: dsm_pages_global produce las filas con
+ * propietario, proceso, orden, copyset y franja para el rango pedido. */
+static uint16_t query_fill_dir(dsm_ctx_t *ctx, const query_req_t *q,
+                               query_builder_t *b, uint32_t *out_count,
+                               uint8_t *out_more)
+{
+    uint32_t total = ctx->mem.npages;
+    if (q->first >= total) {
+        *out_count = 0;
+        *out_more  = 0;
+        return DSM_ST_OK;
+    }
+
+    uint32_t max = q->max ? q->max : 1u;
+    if (max > 16u) max = 16u;
+    uint32_t rows = total - q->first;
+    if (rows > max) rows = max;
+
+    char *text = (char *)b->buf + b->len;
+    size_t cap = b->cap - b->len;
+    int rc = dsm_pages_global(q->first, rows, text, cap);
+    if (rc != DSM_OK) return (uint16_t)rc;
+
+    size_t len = strlen(text);
+    b->len += len;
+    *out_count = rows;
+    *out_more  = (q->first + rows < total) ? 1 : 0;
+    return DSM_ST_OK;
+}
+
+/* Bloques reservados del mapa global. Los huecos se recortan del intervalo
+ * [0, marca de agua) y el PID se toma de la tabla local del nodo consultado
+ * cuando conoce la reserva; el resto queda sin proceso. */
+static uint16_t query_fill_alloc(dsm_ctx_t *ctx, const query_req_t *q,
+                                 query_builder_t *b, uint32_t *out_count,
+                                 uint8_t *out_more)
+{
+    uint32_t max = q->max ? q->max : 1u;
+    if (max > QUERY_RESP_MAX_RECS) max = QUERY_RESP_MAX_RECS;
+
+    uint32_t emitted = 0;
+    uint32_t seen = 0;
+    uint8_t more = 0;
+
+    pthread_mutex_lock(&ctx->alloc.mu);
+
+    if (!ctx->alloc.map_valid) {
+        pthread_mutex_unlock(&ctx->alloc.mu);
+        *out_count = 0;
+        *out_more  = 0;
+        return DSM_ST_OK;
+    }
+
+    uint64_t cursor = 0;
+    uint32_t holes = ctx->alloc.nholes;
+    for (uint32_t i = 0; i <= holes; i++) {
+        uint64_t start;
+        uint64_t end;
+
+        if (i < holes) {
+            start = cursor;
+            end   = ctx->alloc.holes[i].first_page;
+            if (end < cursor) end = cursor;
+        } else {
+            start = cursor;
+            end   = ctx->alloc.next_page;
+            if (end < cursor) end = cursor;
+        }
+
+        if (end > start) {
+            if (seen++ >= q->first) {
+                if (emitted >= max) {
+                    more = 1;
+                    break;
+                }
+                alloc_rec_t rec;
+                memset(&rec, 0, sizeof(rec));
+                rec.first_page = (uint32_t)start;
+                rec.npages     = (uint32_t)(end - start);
+                rec.slot       = ctx->memb.self_slot;
+                rec.reserved   = DSM_ALLOC_REC_LIVE;
+                for (uint32_t k = 0; k < ctx->alloc.depth; k++) {
+                    alloc_block_t *blk = &ctx->alloc.stack[k];
+                    if (blk->npages == 0 || blk->retiring) continue;
+                    if (blk->first_page != rec.first_page ||
+                        blk->npages != rec.npages) continue;
+                    rec.pid      = blk->pid;
+                    rec.alloc_id = blk->alloc_id;
+                    break;
+                }
+                uint8_t raw[DSM_ALLOC_REC_LEN];
+                dsm_pack_alloc_rec(&rec, raw);
+                query_builder_put(b, raw, sizeof(raw));
+                emitted++;
+            }
+        }
+
+        if (i < holes) {
+            uint64_t h_end = (uint64_t)ctx->alloc.holes[i].first_page +
+                             ctx->alloc.holes[i].npages;
+            if (h_end > cursor) cursor = h_end;
+        }
+    }
+
+    pthread_mutex_unlock(&ctx->alloc.mu);
+
+    *out_count = emitted;
+    *out_more  = more;
+    return DSM_ST_OK;
+}
+
 static uint16_t query_build_resp(dsm_ctx_t *ctx, const query_req_t *q,
                                  query_builder_t *b, uint32_t *out_count,
                                  uint8_t *out_more)
@@ -1857,6 +2102,16 @@ static uint16_t query_build_resp(dsm_ctx_t *ctx, const query_req_t *q,
         count = query_collect_pages(ctx, q->first, max, b);
         more = (q->first + count < ctx->mem.npages) ? 1 : 0;
         break;
+    case DSM_QUERY_DIR: {
+        uint16_t st = query_fill_dir(ctx, q, b, &count, &more);
+        if (st != DSM_ST_OK) return st;
+        break;
+    }
+    case DSM_QUERY_ALLOC: {
+        uint16_t st = query_fill_alloc(ctx, q, b, &count, &more);
+        if (st != DSM_ST_OK) return st;
+        break;
+    }
     default:
         return DSM_ST_BAD_STATE;
     }
@@ -1884,37 +2139,54 @@ void membership_handle_query_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
     uint8_t payload[QUERY_RESP_MAX_BYTES];
     query_resp_t hdr;
     memset(&hdr, 0, sizeof(hdr));
+    size_t data_len = 0;
 
-    if (!m->payload || m->hdr.payload_len != DSM_QUERY_REQ_LEN) {
+    if (!m->payload || m->hdr.payload_len < DSM_QUERY_REQ_LEN ||
+        m->hdr.payload_len > DSM_QUERY_REQ_LEN + DSM_QUERY_HTML_PATH_MAX) {
         resp.status = DSM_ST_BAD_STATE;
     } else {
         query_req_t q;
         dsm_unpack_query_req(m->payload, &q);
 
-        query_builder_t b = {
-            .buf      = payload + DSM_QUERY_RESP_HDR_LEN,
-            .len      = 0,
-            .cap      = sizeof(payload) - DSM_QUERY_RESP_HDR_LEN,
-            .overflow = false
-        };
+        if (q.kind == DSM_QUERY_HTML) {
+            char path[DSM_QUERY_HTML_PATH_MAX + 1];
+            uint32_t plen = m->hdr.payload_len - DSM_QUERY_REQ_LEN;
+            memcpy(path, (const uint8_t *)m->payload + DSM_QUERY_REQ_LEN, plen);
+            path[plen] = '\0';
 
-        uint32_t count = 0;
-        uint8_t more = 0;
-        resp.status = query_build_resp(ctx, &q, &b, &count, &more);
-        if (resp.status == DSM_ST_OK) {
-            hdr.kind  = q.kind;
-            hdr.more  = more;
-            hdr.count = count;
+            int hr = dsm_html_report(plen ? path : NULL);
+            resp.status = (hr == DSM_OK) ? DSM_ST_OK : DSM_ST_NO_SPACE;
+            if (resp.status == DSM_ST_OK) {
+                hdr.kind  = q.kind;
+                hdr.count = 0;
+                hdr.more  = 0;
+            }
+        } else if (m->hdr.payload_len != DSM_QUERY_REQ_LEN) {
+            resp.status = DSM_ST_BAD_STATE;
+        } else {
+            query_builder_t b = {
+                .buf      = payload + DSM_QUERY_RESP_HDR_LEN,
+                .len      = 0,
+                .cap      = sizeof(payload) - DSM_QUERY_RESP_HDR_LEN,
+                .overflow = false
+            };
+
+            uint32_t count = 0;
+            uint8_t more = 0;
+            resp.status = query_build_resp(ctx, &q, &b, &count, &more);
+            if (resp.status == DSM_ST_OK) {
+                hdr.kind  = q.kind;
+                hdr.more  = more;
+                hdr.count = count;
+                data_len  = b.len;
+            }
         }
     }
 
     size_t total = DSM_QUERY_RESP_HDR_LEN;
     if (resp.status == DSM_ST_OK) {
         dsm_pack_query_resp(&hdr, payload);
-        total += (size_t)hdr.count *
-                 ((hdr.kind == DSM_QUERY_NODES) ? DSM_NODE_REC_LEN :
-                  (hdr.kind == DSM_QUERY_PAGES) ? DSM_PAGE_REC_LEN : 0u);
-        if (hdr.kind == DSM_QUERY_STATS) total += DSM_STATS_WIRE_LEN;
+        total += data_len;
     }
 
     uint8_t raw_hdr[DSM_HDR_LEN];
@@ -1958,6 +2230,27 @@ void membership_evaluate(dsm_ctx_t *ctx, uint64_t now_ms)
             continue;
         }
 
+        /* Un nodo incorporado por JOIN puede tardar en arrancar su hilo de
+         * latidos más que HB_DEAD: mientras no haya enviado ninguno, se le
+         * concede el plazo de unión y no se evalúa su silencio. */
+        if (!ni->hb_seen) {
+            uint64_t grace = (uint64_t)ctx->cfg.hb_dead *
+                             (uint64_t)ctx->cfg.hb_interval_ms;
+            if (grace < DISCOVERY_JOIN_GRACE_MS) {
+                grace = DISCOVERY_JOIN_GRACE_MS;
+            }
+            if (now_ms >= ni->joined_ms && now_ms - ni->joined_ms < grace) {
+                continue;
+            }
+            ni->state = DSM_NODE_DEAD;
+            m->present[s / 8] &= (uint8_t)~(1u << (s % 8));
+            m->reusable_after_ms[s] = now_ms + ctx->cfg.reconnect_max_ms;
+            dead_slots[dead_count++] = s;
+            DSM_LOG_WARN("Nodo en slot %u sin latidos desde su unión; "
+                         "se dictamina DEAD", s);
+            continue;
+        }
+
         uint64_t elapsed = now_ms - ni->last_hb_ms;
         uint32_t missed = (uint32_t)(elapsed / ctx->cfg.hb_interval_ms);
         /* Cada intervalo perdido se cuenta una sola vez: el acumulador
@@ -1981,6 +2274,10 @@ void membership_evaluate(dsm_ctx_t *ctx, uint64_t now_ms)
         }
     }
     pthread_rwlock_unlock(&m->rw);
+
+    if (dead_count > 0) {
+        membership_progress_notify(m);
+    }
 
     /* Quien detecta la muerte también recupera la coherencia de su lado:
      * confiar solo en el broadcast dejaría al detector con páginas huérfanas
@@ -2014,16 +2311,28 @@ void membership_evaluate(dsm_ctx_t *ctx, uint64_t now_ms)
 static void *hb_thread_main(void *arg)
 {
     dsm_ctx_t *ctx = (dsm_ctx_t *)arg;
+    dsm_membership_t *m = &ctx->memb;
 
-    while (atomic_load(&ctx->running)) {
-        /* Despertar en intervalos cortos (50ms) para respuesta rápida ante parada */
-        uint32_t slept = 0;
-        while (atomic_load(&ctx->running) && slept < ctx->cfg.hb_interval_ms) {
-            uint32_t step = (ctx->cfg.hb_interval_ms - slept > 50) ? 50 : (ctx->cfg.hb_interval_ms - slept);
-            sleep_ms(step);
-            slept += step;
+    while (atomic_load(&ctx->hb_running)) {
+        /* El periodo del latido se espera sobre hb_cv con plazo absoluto. El
+         * apagado señaliza la condvar y el hilo despierta en el acto, sin
+         * trocear la espera en pasos fijos. */
+        uint64_t period_end = mono_ms() + ctx->cfg.hb_interval_ms;
+        struct timespec ts;
+
+        pthread_mutex_lock(&m->hb_mu);
+        while (atomic_load(&ctx->hb_running)) {
+            uint64_t now = mono_ms();
+            if (now >= period_end) {
+                break;
+            }
+            mono_deadline_ts(period_end, &ts);
+            if (pthread_cond_timedwait(&m->hb_cv, &m->hb_mu, &ts) != 0) {
+                break;
+            }
         }
-        if (!atomic_load(&ctx->running)) break;
+        pthread_mutex_unlock(&m->hb_mu);
+        if (!atomic_load(&ctx->hb_running)) break;
 
         uint64_t now = mono_ms();
         membership_evaluate(ctx, now);
@@ -2040,8 +2349,14 @@ static void *hb_thread_main(void *arg)
         }
         pthread_rwlock_unlock(&ctx->memb.rw);
 
+        uint32_t free_pages = dsm_alloc_free_pages(ctx);
+        pthread_rwlock_wrlock(&ctx->memb.rw);
+        if (ctx->memb.self_slot < MAX_NODES) {
+            ctx->memb.nodes[ctx->memb.self_slot].free_pages = free_pages;
+        }
+        pthread_rwlock_unlock(&ctx->memb.rw);
         for (uint32_t i = 0; i < ndst; i++) {
-            net_send_heartbeat(ctx, dst[i], 0);
+            net_send_heartbeat(ctx, dst[i], free_pages);
         }
     }
 
@@ -2050,7 +2365,14 @@ static void *hb_thread_main(void *arg)
 
 int hb_start(dsm_ctx_t *ctx)
 {
+    if (ctx->hb_thread && atomic_load(&ctx->hb_running)) {
+        return DSM_OK;
+    }
+
+    atomic_store(&ctx->hb_running, true);
     if (pthread_create(&ctx->hb_thread, NULL, hb_thread_main, ctx) != 0) {
+        atomic_store(&ctx->hb_running, false);
+        ctx->hb_thread = 0;
         DSM_LOG_ERR("No se pudo iniciar hilo de heartbeat: %s", strerror(errno));
         return DSM_ERR_MEM;
     }
@@ -2059,6 +2381,10 @@ int hb_start(dsm_ctx_t *ctx)
 
 void hb_stop(dsm_ctx_t *ctx)
 {
+    atomic_store(&ctx->hb_running, false);
+    pthread_mutex_lock(&ctx->memb.hb_mu);
+    pthread_cond_broadcast(&ctx->memb.hb_cv);
+    pthread_mutex_unlock(&ctx->memb.hb_mu);
     if (ctx->hb_thread) {
         pthread_join(ctx->hb_thread, NULL);
         ctx->hb_thread = 0;

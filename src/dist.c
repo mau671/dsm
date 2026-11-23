@@ -315,7 +315,7 @@ dsm_status_t dsm_dist_launch(uint32_t job_id, uint32_t kernel_id,
             hdr.cluster_id    = ctx->cfg.cluster_id;
             hdr.proto_version = DSM_PROTO_VERSION;
             hdr.type          = MSG_DIST_RUN;
-            hdr.epoch         = ctx->memb.epoch;
+            hdr.epoch         = atomic_load(&ctx->memb.epoch);
             hdr.src_slot      = self;
             hdr.dst_slot      = dst;
             hdr.req_id        = dsm_net_next_req(ctx);
@@ -495,7 +495,7 @@ void dist_on_run(dsm_ctx_t *ctx, const dsm_msg_t *m)
     rh.cluster_id    = ctx->cfg.cluster_id;
     rh.proto_version = DSM_PROTO_VERSION;
     rh.type          = MSG_DIST_DONE;
-    rh.epoch         = ctx->memb.epoch;
+    rh.epoch         = atomic_load(&ctx->memb.epoch);
     rh.src_slot      = ctx->memb.self_slot;
     rh.dst_slot      = m->hdr.src_slot;
     rh.req_id        = m->hdr.req_id;

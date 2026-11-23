@@ -233,6 +233,17 @@ static void *listener_thread_main(void *arg)
         if (hdr.type == MSG_HELLO && hdr.payload_len == 20) {
             uint8_t hello_payload[20];
             if (dsm_read_full_deadline(cfd, hello_payload, 20, ctx->cfg.discovery_timeout_ms) == DSM_OK) {
+                /* El HELLO se atiende fuera de la ruta de los workers, pero
+                 * pasa por la misma validación que cualquier otra trama:
+                 * magic, versión, cluster_id, longitud y CRC. Un HELLO ajeno
+                 * o corrupto no puede registrar un par ni recibir WELCOME. */
+                if (dsm_wire_validate(&hdr, hdr_raw, hello_payload,
+                                      ctx->cfg.cluster_id) != DSM_OK ||
+                    !wire_payload_ok(hdr.type, hdr.flags, hdr.payload_len,
+                                     ctx->cfg.page_size)) {
+                    fd_close_quiet(&cfd);
+                    continue;
+                }
                 atomic_fetch_add_explicit(&ctx->ctr.msgs_recv, 1, memory_order_relaxed);
                 atomic_fetch_add_explicit(&ctx->ctr.bytes_recv, DSM_HDR_LEN + 20, memory_order_relaxed);
                 uint32_t peer_hash = 0;
@@ -248,7 +259,7 @@ static void *listener_thread_main(void *arg)
 
                 welcome_t w;
                 memset(&w, 0, sizeof(w));
-                w.epoch = ctx->memb.epoch;
+                w.epoch = atomic_load(&ctx->memb.epoch);
                 memcpy(w.origin_uuid, ctx->memb.self_uuid, 16);
 
                 uint32_t count = 0;
@@ -630,7 +641,7 @@ int net_send_heartbeat(dsm_ctx_t *ctx, uint32_t dst, uint32_t free_pages)
     hdr.type          = MSG_HEARTBEAT;
     hdr.src_slot      = ctx->memb.self_slot;
     hdr.dst_slot      = dst;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.payload_len   = 12;
 
     uint8_t payload[12];
@@ -705,7 +716,7 @@ static int net_rpc_attempt(dsm_ctx_t *ctx, uint32_t dst, uint16_t type,
     hdr.tseq          = tseq;
     hdr.access        = access;
     hdr.flags         = flags;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.payload_len   = tx_len;
 
     int send_rc = dsm_net_send(ctx, dst, &hdr, tx_payload);

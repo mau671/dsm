@@ -28,12 +28,32 @@ void dsm_ctx_reset(void)
     atomic_store(&g_ctxp, NULL);
 }
 
+/* El mapa global se espera con un plazo medido sobre CLOCK_MONOTONIC. El
+ * condvar debe usar el mismo reloj, de lo contrario el deadline monotónico se
+ * interpreta como tiempo real y la espera vence de inmediato. */
+static int alloc_sync_cv_init(dsm_ctx_t *ctx)
+{
+    pthread_condattr_t attr;
+    int rc = pthread_condattr_init(&attr);
+    if (rc != 0) return rc;
+
+    rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (rc == 0) {
+        rc = pthread_cond_init(&ctx->alloc.sync_cv, &attr);
+    }
+    pthread_condattr_destroy(&attr);
+    return rc;
+}
+
 #if defined(DSM_TEST_HOOKS)
 dsm_ctx_t *dsm_ctx_create_test(void)
 {
     dsm_ctx_t *ctx = calloc(1, sizeof(*ctx));
     if (ctx) {
-        membership_init(ctx);
+        if (membership_init(ctx) != DSM_OK) {
+            free(ctx);
+            return NULL;
+        }
         net_init(ctx);
         sync_init(ctx);
         if (dist_init(ctx) != DSM_OK) {
@@ -51,7 +71,7 @@ dsm_ctx_t *dsm_ctx_create_test(void)
             free(ctx);
             return NULL;
         }
-        if (pthread_cond_init(&ctx->alloc.sync_cv, NULL) != 0) {
+        if (alloc_sync_cv_init(ctx) != 0) {
             pthread_mutex_destroy(&ctx->alloc.mu);
             dist_destroy(ctx);
             sync_destroy(ctx);
@@ -126,7 +146,11 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
     }
 
     /* 5. Inicializar estructuras internas */
-    membership_init(ctx);
+    if (membership_init(ctx) != DSM_OK) {
+        faultq_destroy();
+        free(ctx);
+        return DSM_ERR_MEM;
+    }
     net_init(ctx);
     if (pthread_mutex_init(&ctx->alloc.mu, NULL) != 0) {
         net_destroy(ctx);
@@ -135,7 +159,7 @@ dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)
         free(ctx);
         return DSM_ERR_MEM;
     }
-    if (pthread_cond_init(&ctx->alloc.sync_cv, NULL) != 0) {
+    if (alloc_sync_cv_init(ctx) != 0) {
         pthread_mutex_destroy(&ctx->alloc.mu);
         net_destroy(ctx);
         membership_destroy(ctx);
@@ -346,6 +370,14 @@ dsm_status_t dsm_thread_detach(void)
 static uint32_t alloc_pages_for(uint64_t size, uint32_t page_size)
 {
     return (uint32_t)((size + page_size - 1) / page_size);
+}
+
+/* Capacidad real del espacio compartido: la suma de las paginas aportadas por
+ * los miembros vivos. VIEW_SIZE solo acota el espacio de direcciones de la
+ * vista; un rango mas alla de esta cota no tendria respaldo en ningun nodo. */
+static uint32_t alloc_capacity_pages(dsm_ctx_t *ctx)
+{
+    return membership_total_pages(ctx);
 }
 
 /* Deja una pagina en cero, inaccesible y sin copia valida antes de devolverla
@@ -601,7 +633,7 @@ static void alloc_broadcast_map(dsm_ctx_t *ctx)
 
     welcome_t w;
     memset(&w, 0, sizeof(w));
-    w.epoch = ctx->memb.epoch;
+    w.epoch = atomic_load(&ctx->memb.epoch);
     memcpy(w.origin_uuid, ctx->memb.self_uuid, 16);
     w.alloc_count = dsm_alloc_export(ctx, w.allocs, 64u);
     if (w.alloc_count == 0) return;
@@ -626,7 +658,7 @@ static void alloc_broadcast_map(dsm_ctx_t *ctx)
         hdr.type          = MSG_WELCOME;
         hdr.src_slot      = ctx->memb.self_slot;
         hdr.dst_slot      = s;
-        hdr.epoch         = ctx->memb.epoch;
+        hdr.epoch         = atomic_load(&ctx->memb.epoch);
         hdr.payload_len   = (uint32_t)len;
         (void)dsm_net_send(ctx, s, &hdr, payload);
     }
@@ -691,7 +723,7 @@ static dsm_status_t alloc_takeover_sync(dsm_ctx_t *ctx)
         hdr.type          = MSG_ALLOC_SYNC;
         hdr.src_slot      = self;
         hdr.dst_slot      = peers[i];
-        hdr.epoch         = ctx->memb.epoch;
+        hdr.epoch         = atomic_load(&ctx->memb.epoch);
         if (dsm_net_send(ctx, peers[i], &hdr, NULL) != DSM_OK) {
             pthread_mutex_lock(&ctx->alloc.mu);
             if (ctx->alloc.map_sync_pending > 0) {
@@ -740,7 +772,7 @@ void dsm_alloc_on_sync_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
 
     welcome_t w;
     memset(&w, 0, sizeof(w));
-    w.epoch = ctx->memb.epoch;
+    w.epoch = atomic_load(&ctx->memb.epoch);
     memcpy(w.origin_uuid, ctx->memb.self_uuid, 16);
     w.alloc_count = dsm_alloc_export(ctx, w.allocs, 64u);
 
@@ -761,7 +793,7 @@ void dsm_alloc_on_sync_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
     hdr.src_slot      = ctx->memb.self_slot;
     hdr.dst_slot      = m->hdr.src_slot;
     hdr.req_id        = m->hdr.req_id;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.payload_len   = (uint32_t)len;
     (void)dsm_net_send(ctx, m->hdr.src_slot, &hdr, payload);
     free(payload);
@@ -917,6 +949,7 @@ dsm_status_t dsm_alloc(uint64_t size, void **out)
 
     uint32_t npages = alloc_pages_for(size, ctx->cfg.page_size);
     if (npages == 0) return DSM_ERR_NO_SPACE;
+    if (npages > alloc_capacity_pages(ctx)) return DSM_ERR_NO_SPACE;
 
     uint32_t self = 0;
     dsm_status_t src = alloc_self_slot(ctx, &self);
@@ -959,9 +992,20 @@ dsm_status_t dsm_alloc(uint64_t size, void **out)
             return DSM_ERR_NO_SPACE;
         }
 
+        /* La cota se vuelve a consultar bajo el mutex: un hueco creado cuando
+         * habia mas nodos puede quedar fuera de la capacidad vigente. */
+        uint32_t capacity = alloc_capacity_pages(ctx);
         first = alloc_hole_take(&ctx->alloc, npages);
+        if (first != DSM_PAGE_ID_NONE &&
+            (uint64_t)first + npages > capacity) {
+            if (ctx->alloc.nholes < ALLOC_HOLE_MAX) {
+                alloc_hole_add(&ctx->alloc, first, npages);
+            }
+            first = DSM_PAGE_ID_NONE;
+        }
         if (first == DSM_PAGE_ID_NONE) {
-            if ((uint64_t)ctx->alloc.next_page + npages > ctx->mem.npages) {
+            uint64_t end = (uint64_t)ctx->alloc.next_page + npages;
+            if (end > ctx->mem.npages || end > capacity) {
                 pthread_mutex_unlock(&ctx->alloc.mu);
                 return DSM_ERR_NO_SPACE;
             }
@@ -997,11 +1041,15 @@ dsm_status_t dsm_alloc(uint64_t size, void **out)
         if (rc != DSM_OK) return rc;
 
         /* La respuesta se valida antes de tocar el estado local: el rango
-         * debe caber en la misma vista que mapea dsm_mem en este nodo. */
+         * debe caber en la vista que mapea dsm_mem y en la memoria efectivamente
+         * aportada al cluster, aunque el coordinador tenga una vista antigua. */
         if (resp.npages != npages || resp.first_page == DSM_PAGE_ID_NONE ||
             resp.first_page >= ctx->mem.npages ||
             (uint64_t)resp.first_page + npages > ctx->mem.npages) {
             return DSM_ERR_PROTO;
+        }
+        if ((uint64_t)resp.first_page + npages > alloc_capacity_pages(ctx)) {
+            return DSM_ERR_NO_SPACE;
         }
         first = resp.first_page;
 
@@ -1182,6 +1230,27 @@ dsm_status_t dsm_free(void *ptr, uint64_t size)
     return DSM_OK;
 }
 
+uint32_t dsm_alloc_free_pages(dsm_ctx_t *ctx)
+{
+    if (!ctx || ctx->cfg.client_mode) return 0;
+
+    /* La cuenta se hace sobre las páginas aportadas por los miembros vivos,
+     * no sobre el tamaño de la vista: VIEW_SIZE solo acota el espacio de
+     * direcciones y no todo él tiene respaldo en el clúster. */
+    uint64_t total = alloc_capacity_pages(ctx);
+
+    pthread_mutex_lock(&ctx->alloc.mu);
+    uint64_t reserved = ctx->alloc.next_page;
+    for (uint32_t i = 0; i < ctx->alloc.nholes; i++) {
+        uint64_t n = ctx->alloc.holes[i].npages;
+        reserved = (reserved > n) ? reserved - n : 0;
+    }
+    uint64_t free_pages = (total > reserved) ? total - reserved : 0;
+    pthread_mutex_unlock(&ctx->alloc.mu);
+
+    return (free_pages > UINT32_MAX) ? UINT32_MAX : (uint32_t)free_pages;
+}
+
 /* Retira cada página del protocolo de coherencia y después borra su contenido,
  * la marca Invalid y le quita permisos. El retiro se completa antes de tocar
  * el estado local: si una página no puede liberarse, el bloque queda intacto y
@@ -1220,7 +1289,7 @@ static void alloc_send_response(dsm_ctx_t *ctx, const dsm_msg_t *req,
     hdr.src_slot      = ctx->memb.self_slot;
     hdr.dst_slot      = req->hdr.src_slot;
     hdr.req_id        = req->hdr.req_id;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.status        = DSM_ST_OK;
     hdr.payload_len   = DSM_ALLOC_MSG_LEN;
 
@@ -1286,7 +1355,9 @@ void dsm_alloc_on_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
             return;
         }
 
-        if (in.npages == 0 || in.npages > ctx->mem.npages) {
+        uint32_t capacity = alloc_capacity_pages(ctx);
+        if (in.npages == 0 || in.npages > ctx->mem.npages ||
+            in.npages > capacity) {
             out.status = DSM_ST_NO_SPACE;
         } else {
             pthread_mutex_lock(&ctx->alloc.mu);
@@ -1295,8 +1366,16 @@ void dsm_alloc_on_request(dsm_ctx_t *ctx, const dsm_msg_t *m)
             ctx->alloc.map_origin       = ctx->memb.self_slot;
 
             uint32_t first = alloc_hole_take(&ctx->alloc, in.npages);
-            if (first == DSM_PAGE_ID_NONE &&
-                (uint64_t)ctx->alloc.next_page + in.npages <= ctx->mem.npages) {
+            if (first != DSM_PAGE_ID_NONE &&
+                (uint64_t)first + in.npages > capacity) {
+                if (ctx->alloc.nholes < ALLOC_HOLE_MAX) {
+                    alloc_hole_add(&ctx->alloc, first, in.npages);
+                }
+                first = DSM_PAGE_ID_NONE;
+            }
+            uint64_t end = (uint64_t)ctx->alloc.next_page + in.npages;
+            if (first == DSM_PAGE_ID_NONE && end <= ctx->mem.npages &&
+                end <= capacity) {
                 first = ctx->alloc.next_page;
                 ctx->alloc.next_page += in.npages;
             }
@@ -1473,6 +1552,28 @@ dsm_status_t dsm_node_count(uint32_t *out)
     return DSM_OK;
 }
 
+dsm_status_t dsm_wait_members(uint32_t min_nodes, uint32_t timeout_ms)
+{
+    dsm_ctx_t *ctx = dsm_ctx_get();
+    if (!ctx) return DSM_ERR_NOT_INIT;
+
+    uint64_t deadline = mono_ms() + timeout_ms;
+
+    for (;;) {
+        /* La marca se toma antes de contar: un aviso emitido entre la cuenta y
+         * la espera cambia el contador y la espera no se bloquea. */
+        uint64_t mark = membership_progress_mark(&ctx->memb);
+        uint32_t count = 0;
+        dsm_status_t rc = dsm_node_count(&count);
+        if (rc != DSM_OK) return rc;
+        if (count >= min_nodes) return DSM_OK;
+
+        uint64_t now = mono_ms();
+        if (now >= deadline) return DSM_ERR_TIMEOUT;
+        membership_progress_wait(&ctx->memb, mark, deadline);
+    }
+}
+
 dsm_status_t dsm_global_size(uint64_t *out)
 {
     dsm_ctx_t *ctx = dsm_ctx_get();
@@ -1547,7 +1648,7 @@ dsm_status_t dsm_debug_dump_fd(int fd)
     if (!ctx) return DSM_ERR_NOT_INIT;
 
     dprintf(fd, "Volcado de depuración DSM. Nodo %u, época %lu.\n",
-            ctx->memb.self_slot, (unsigned long)ctx->memb.epoch);
+            ctx->memb.self_slot, (unsigned long)atomic_load(&ctx->memb.epoch));
     dprintf(fd, "Vista base: %p, tamaño: %lu MiB\n",
             (void *)ctx->mem.view, (unsigned long)(ctx->mem.view_size >> 20));
 

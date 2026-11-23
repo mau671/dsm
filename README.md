@@ -146,9 +146,12 @@ int main(void)
 `dsmctl` consulta un nodo en ejecución sin unirse al clúster:
 
 ```sh
-./build/bin/release/dsmctl stats
-./build/bin/release/dsmctl nodes
-./build/bin/release/dsmctl pages 0 16
+./build/bin/release/dsmctl stats          # totales de todos los nodos
+./build/bin/release/dsmctl nodes          # membresía y latidos perdidos
+./build/bin/release/dsmctl pages 0 16     # resumen local y directorio global
+./build/bin/release/dsmctl dir 0 16       # directorio global con copyset y franja
+./build/bin/release/dsmctl alloc          # bloques reservados
+./build/bin/release/dsmctl html /tmp/html # informe HTML en el nodo consultado
 ```
 
 ## Compilar y probar
@@ -164,18 +167,18 @@ Los cuatro perfiles comparten `-Wall -Wextra -Wpedantic -Werror` y se organizan 
 `build/{bin,lib,obj}/<perfil>/`.
 
 ```sh
-make test-unit   # 12 suites de módulo, bajo ASan+UBSan
-make test-e2e    # dos procesos reales por la API pública
+make test-unit   # suites de módulo, bajo ASan+UBSan
+make test-e2e    # escenarios con procesos reales por la API pública
 ```
 
 ## Estructura
 
 ```
 include/     cabeceras; dsm.h es la única que una aplicación necesita
-src/         núcleo: config, wire, net, util, discovery, mem, msi, ring, sigsegv, sync, worker
-apps/        dsm (nodo), test_basico, filtro_video, juego_vida
+src/         núcleo: config, wire, net, util, discovery, mem, msi, ring, raid, dist, report, sigsegv, sync, worker
+apps/        dsm (nodo), test_basico, filtro_video, juego_vida, dsm_dist_demo, dsm_raid_demo
 tools/       dsmctl y video_pack
-tests/       unit/ (12 suites) y e2e/
+tests/       unit/ y e2e/ (flujo MSI, ejecución distribuida y RAID5)
 docs/        API.md e informes compilados
 datos/       video y fotografía reales para las aplicaciones de prueba
 ```

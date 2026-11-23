@@ -33,9 +33,24 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Las señales de parada se bloquean antes de crear los hilos del nodo:
+     * todos heredan la máscara y la señal queda pendiente hasta que el hilo
+     * principal la espera con sigsuspend. Así no se pierde un aviso emitido
+     * entre la comprobación de la bandera y la espera. */
+    sigset_t stopmask;
+    sigset_t oldmask;
+    sigemptyset(&stopmask);
+    sigaddset(&stopmask, SIGINT);
+    sigaddset(&stopmask, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &stopmask, &oldmask) != 0) {
+        fprintf(stderr, "No se pudo preparar la espera de terminación.\n");
+        return 1;
+    }
+
     dsm_status_t st = dsm_init(conf_path, 0);
     if (st != DSM_OK) {
         fprintf(stderr, "Error al inicializar DSM: %s\n", dsm_strerror(st));
+        sigprocmask(SIG_SETMASK, &oldmask, NULL);
         return 1;
     }
 
@@ -44,8 +59,9 @@ int main(int argc, char **argv)
     printf("Nodo activo en la ranura %u. Pulse Ctrl+C para detenerlo.\n", slot);
 
     while (!g_stop) {
-        sleep(1);
+        sigsuspend(&oldmask);
     }
+    sigprocmask(SIG_SETMASK, &oldmask, NULL);
 
     printf("\nRecibida señal de terminación. Finalizando nodo.\n");
 

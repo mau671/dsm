@@ -384,7 +384,7 @@ static int sync_send_lock_grant(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
     hdr.dst_slot      = dst;
     hdr.req_id        = req_id;
     hdr.page_id       = id;
-    hdr.epoch         = ctx->sync.epoch;
+    hdr.epoch         = atomic_load(&ctx->sync.epoch);
 
     return sync_send_msg(ctx, dst, &hdr, NULL);
 }
@@ -402,7 +402,7 @@ static int sync_send_lock_req(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
     hdr.dst_slot      = dst;
     hdr.req_id        = req_id;
     hdr.page_id       = id;
-    hdr.epoch         = ctx->sync.epoch;
+    hdr.epoch         = atomic_load(&ctx->sync.epoch);
 
     return sync_send_msg(ctx, dst, &hdr, NULL);
 }
@@ -420,7 +420,7 @@ static int sync_send_lock_rel(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
     hdr.dst_slot      = dst;
     hdr.req_id        = req_id;
     hdr.page_id       = id;
-    hdr.epoch         = ctx->sync.epoch;
+    hdr.epoch         = atomic_load(&ctx->sync.epoch);
 
     return sync_send_msg(ctx, dst, &hdr, NULL);
 }
@@ -440,7 +440,7 @@ void sync_send_lock_ack(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
     hdr.dst_slot      = dst;
     hdr.req_id        = req_id;
     hdr.page_id       = id;
-    hdr.epoch         = ctx->sync.epoch;
+    hdr.epoch         = atomic_load(&ctx->sync.epoch);
     hdr.flags         = DSM_FLAG_PROBE;
 
     (void)sync_send_msg(ctx, dst, &hdr, NULL);
@@ -465,7 +465,7 @@ static int sync_send_barrier_arrive(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
     hdr.dst_slot      = dst;
     hdr.req_id        = req_id;
     hdr.page_id       = id;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.payload_len   = 8;
 
     return sync_send_msg(ctx, dst, &hdr, payload);
@@ -489,7 +489,7 @@ static int sync_send_barrier_go(dsm_ctx_t *ctx, uint32_t dst, uint32_t id,
     hdr.dst_slot      = dst;
     hdr.req_id        = req_id;
     hdr.page_id       = id;
-    hdr.epoch         = ctx->memb.epoch;
+    hdr.epoch         = atomic_load(&ctx->memb.epoch);
     hdr.flags         = flags;
     hdr.payload_len   = 4;
 
@@ -1581,7 +1581,7 @@ void sync_on_node_down(dsm_ctx_t *ctx, uint32_t slot)
      * número, y el mapa de muertos evita descartar la segunda. */
     uint64_t memb_epoch;
     pthread_rwlock_rdlock(&ctx->memb.rw);
-    memb_epoch = ctx->memb.epoch;
+    memb_epoch = atomic_load(&ctx->memb.epoch);
     pthread_rwlock_unlock(&ctx->memb.rw);
 
     uint64_t epoch;

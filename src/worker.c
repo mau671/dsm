@@ -48,11 +48,12 @@ static void *dispatcher_thread_main(void *arg)
          * devuelve el error una sola vez y se libera la ranura. El tope de
          * reintentos subsiste como red de seguridad.
          *
-         * DSM_ERR_NODE_DOWN es la condición terminal del dueño muerto en M:
-         * ningún reintento la resuelve, así que el ciclo no espera ni repite
-         * en ese estado. El hilo de aplicación vuelve a fallar al despertar y
-         * reencolará el acceso; cada ciclo nuevo la rechaza de inmediato.
-         * La latencia abarca la resolución completa, reintentos incluidos.
+         * Los errores terminales no se resuelven con otro intento: el dueño
+         * muerto en M, una ranura inválida, la falta de espacio y la falta de
+         * memoria local. El ciclo no espera ni repite en esos estados; el
+         * motivo se publica en la ranura y el manejador de SIGSEGV reenvía la
+         * señal en lugar de dejar al hilo fallar en bucle. La latencia abarca
+         * la resolución completa, reintentos incluidos.
          */
         uint32_t timeout_ms = ctx->cfg.lock_timeout_ms
                                   ? ctx->cfg.lock_timeout_ms : 10000u;
@@ -102,10 +103,12 @@ static void *dispatcher_thread_main(void *arg)
         atomic_fetch_add_explicit(&ctx->ctr.faults_serviced, 1,
                                   memory_order_relaxed);
 
-        /* Un dueño muerto en M o una ranura inválida no se resuelven con otro
-         * intento. El motivo se publica en la ranura y el manejador reenvía
-         * SIGSEGV: el fallo termina el proceso en lugar de repetirse. */
-        if (rc == DSM_ERR_NODE_DOWN || rc == DSM_ERR_INVALID) {
+        /* Un dueño muerto en M, una ranura inválida, la falta de espacio o la
+         * falta de memoria no se resuelven con otro intento. El motivo se
+         * publica una sola vez en la ranura y el manejador reenvía SIGSEGV: el
+         * fallo termina el proceso en lugar de repetirse. */
+        if (rc == DSM_ERR_NODE_DOWN || rc == DSM_ERR_INVALID ||
+            rc == DSM_ERR_NO_SPACE || rc == DSM_ERR_MEM) {
             DSM_LOG_ERR("Fallo terminal en la página %u (acceso %u): %d; se "
                         "reenvía SIGSEGV al hilo", slot->page, slot->access, rc);
             __atomic_store_n(&slot->error, (uint16_t)(-rc), __ATOMIC_RELEASE);
