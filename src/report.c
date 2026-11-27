@@ -644,7 +644,7 @@ dsm_status_t dsm_html_report(const char *out_dir)
     snprintf(path, sizeof(path), "%s/global.html", dir);
     FILE *global = fopen(path, "w");
     if (!global) return DSM_ERR_NO_SPACE;
-    report_html_head(global, "Tabla global de paginas DSM");
+    report_html_head(global, "Tabla global de páginas DSM");
 
     uint32_t nodos = 0;
     uint32_t clientes = 0;
@@ -659,9 +659,9 @@ dsm_status_t dsm_html_report(const char *out_dir)
             "<div class=\"meta\">"
             "<div><strong>Nodos:</strong> %u</div>"
             "<div><strong>Clientes:</strong> %u</div>"
-            "<div><strong>Epoca:</strong> %llu</div>"
-            "<div><strong>Tamano de pagina:</strong> %u B</div>"
-            "<div><strong>Paginas de la vista:</strong> %u</div>"
+            "<div><strong>Época:</strong> %llu</div>"
+            "<div><strong>Tamaño de página:</strong> %u B</div>"
+            "<div><strong>Páginas de la vista:</strong> %u</div>"
             "<div><strong>Particiones distribuidas:</strong> %llu ok, "
             "%llu fallidas</div>"
             "</div>\n",
@@ -671,9 +671,9 @@ dsm_status_t dsm_html_report(const char *out_dir)
             (unsigned long long)st.dist_tasks_failed);
 
     fprintf(global,
-            "<h2>Nodos y clientes del cluster</h2>\n"
+            "<h2>Nodos y clientes del clúster</h2>\n"
             "<table>\n<tr><th>Ranura</th><th>Rol</th><th>Estado</th>"
-            "<th>Memoria</th><th>Direccion</th><th>Informe</th></tr>\n");
+            "<th>Memoria</th><th>Dirección</th><th>Informe</th></tr>\n");
     for (uint32_t k = 0; k < nnodes; k++) {
         char ip[INET_ADDRSTRLEN] = "0.0.0.0";
         struct in_addr in;
@@ -683,7 +683,7 @@ dsm_status_t dsm_html_report(const char *out_dir)
         }
         fprintf(global,
                 "<tr><td>%u</td><td>nodo</td><td>%s</td>"
-                "<td>%u paginas</td><td>%s:%u</td>"
+                "<td>%u páginas</td><td>%s:%u</td>"
                 "<td><a href=\"nodo-%u.html\">nodo-%u.html</a></td></tr>\n",
                 nodes[k].slot, report_node_state_name(nodes[k].state),
                 nodes[k].mem_pages, ip, (unsigned)nodes[k].port,
@@ -698,15 +698,15 @@ dsm_status_t dsm_html_report(const char *out_dir)
         }
         fprintf(global,
                 "<tr><td>%u</td><td>cliente</td><td>%s</td>"
-                "<td>0 paginas</td><td>%s:%u</td><td>-</td></tr>\n",
+                "<td>0 páginas</td><td>%s:%u</td><td>-</td></tr>\n",
                 clients[k].slot, report_node_state_name(clients[k].state),
                 ip, (unsigned)clients[k].port);
     }
     fprintf(global, "</table>\n");
 
     fprintf(global,
-            "<h2>Tabla global de paginas</h2>\n"
-            "<table>\n<tr><th>Pagina</th><th>Propietario</th>"
+            "<h2>Tabla global de páginas</h2>\n"
+            "<table>\n<tr><th>Página</th><th>Propietario</th>"
             "<th>Proceso</th><th>Orden</th>"
             "<th>Copyset</th><th>Franja</th></tr>\n");
 
@@ -737,17 +737,17 @@ dsm_status_t dsm_html_report(const char *out_dir)
                 "<div><strong>Ranura:</strong> %u</div>"
                 "<div><strong>Rol:</strong> nodo</div>"
                 "<div><strong>Estado:</strong> %s</div>"
-                "<div><strong>Memoria aportada:</strong> %u paginas</div>"
-                "<div><strong>Direccion:</strong> %s:%u</div>"
+                "<div><strong>Memoria aportada:</strong> %u páginas</div>"
+                "<div><strong>Dirección:</strong> %s:%u</div>"
                 "</div>\n",
                 nodes[k].slot, report_node_state_name(nodes[k].state),
                 nodes[k].mem_pages, ip, (unsigned)nodes[k].port);
 
         if (nodes[k].slot == ctx->memb.self_slot) {
             fprintf(fp,
-                    "<h2>Estadisticas del nodo local</h2>\n"
+                    "<h2>Estadísticas del nodo local</h2>\n"
                     "<table>\n"
-                    "<tr><th>Metrica</th><th>Valor</th></tr>\n"
+                    "<tr><th>Métrica</th><th>Valor</th></tr>\n"
                     "<tr><td>Fallos de lectura</td><td>%llu</td></tr>\n"
                     "<tr><td>Fallos de escritura</td><td>%llu</td></tr>\n"
                     "<tr><td>Mensajes enviados</td><td>%llu</td></tr>\n"
@@ -768,8 +768,8 @@ dsm_status_t dsm_html_report(const char *out_dir)
         }
 
         fprintf(fp,
-                "<h2>Tabla de paginas</h2>\n"
-                "<table>\n<tr><th>Pagina</th><th>Estado</th>"
+                "<h2>Tabla de páginas</h2>\n"
+                "<table>\n<tr><th>Página</th><th>Estado</th>"
                 "<th>Propietario</th><th>Proceso</th><th>Orden</th>"
                 "<th>Copyset</th><th>Franja</th></tr>\n");
     }
@@ -895,7 +895,7 @@ dsm_status_t dsm_html_report(const char *out_dir)
 
     if (materialized == 0) {
         fprintf(global,
-                "<tr><td colspan=\"6\">No hay paginas materializadas en la "
+                "<tr><td colspan=\"6\">No hay páginas materializadas en la "
                 "vista.</td></tr>\n");
     }
 

@@ -657,17 +657,25 @@ static int cmd_html(query_conn_t *c, const cli_opts_t *opts,
     uint8_t rx[RX_CAPACITY];
     uint32_t rx_len = sizeof(rx) - 1u;
     query_resp_t resp;
-    uint32_t len = dir ? (uint32_t)strlen(dir) : 0u;
+
+    /* Sin argumento, el destino es el OUTPUT_DIR de la configuración con la
+     * que se invoca dsmctl. Se envía siempre de forma explícita para que el
+     * nodo escriba en ese mismo directorio y el mensaje no anuncie otro. */
+    const char *dest = (dir && *dir) ? dir : cfg->output_dir;
+    if (!dest || *dest == '\0') {
+        fprintf(stderr, "dsmctl: la configuración no define OUTPUT_DIR\n");
+        return DSM_ERR_INVALID;
+    }
+    uint32_t len = (uint32_t)strlen(dest);
 
     int rc = query_exchange_full(c, DSM_QUERY_HTML, DSM_QUERY_GLOBAL, 0, 0,
-                                 dir, len, &resp, rx, &rx_len);
+                                 dest, len, &resp, rx, &rx_len);
     if (rc != DSM_OK) return rc;
     if (resp.kind != DSM_QUERY_HTML) {
         fprintf(stderr, "dsmctl: respuesta de informe inesperada\n");
         return DSM_ERR_PROTO;
     }
 
-    const char *dest = (dir && *dir) ? dir : cfg->output_dir;
     printf("Informe HTML generado en %s\n", dest);
     printf("Archivos: %s/global.html y un archivo nodo-<ranura>.html por nodo\n",
            dest);
@@ -740,8 +748,8 @@ static void print_usage(const char *prog)
     printf("                     proceso, orden, copyset y franja.\n");
     printf("  alloc [inicio] [n] Bloques reservados del espacio global.\n");
     printf("  html [directorio]  Genera el informe HTML del clúster en el\n");
-    printf("                     nodo consultado, o en OUTPUT_DIR si se omite\n");
-    printf("                     el directorio.\n");
+    printf("                     nodo consultado, o en el OUTPUT_DIR de la\n");
+    printf("                     configuración si se omite el directorio.\n");
     printf("  config             Configuración cargada desde dsm.conf.\n");
     printf("  help               Muestra esta ayuda.\n");
     printf("\n");

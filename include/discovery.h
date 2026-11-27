@@ -28,7 +28,11 @@ typedef struct {
     uint8_t  is_client;
     /* Verdadero desde el primer latido recibido tras el JOIN. */
     uint8_t  hb_seen;
-    uint8_t  reserved[2];
+    /* Marcas de las transiciones ya contadas en ctr.hb_missed: un episodio
+     * de silencio suma una vez al llegar a sospecha y otra al declarar la
+     * muerte, nunca por cada intervalo transcurrido. */
+    uint8_t  hb_miss_mark;
+    uint8_t  reserved;
 } node_info_t;
 
 _Static_assert(sizeof(node_info_t) == 64, "node_info_t debe ocupar 64 bytes");

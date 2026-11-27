@@ -2,6 +2,7 @@
 #include "wire.h"
 #include "log.h"
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -701,29 +702,61 @@ void config_free(dsm_config_t *cfg)
     (void)cfg;
 }
 
+/* Rellena la etiqueta hasta 38 columnas visibles. printf cuenta bytes y los
+ * acentos ocupan dos en UTF-8, así que el ancho se calcula por caracteres y no
+ * con %-38s; de otro modo el separador se desplaza una columna por acento. */
+static void config_dump_label(char *out, size_t cap, const char *label)
+{
+    size_t cols = 0;
+    for (const unsigned char *p = (const unsigned char *)label; *p; p++) {
+        if ((*p & 0xC0u) != 0x80u) cols++;
+    }
+    size_t pad = cols < 38u ? 38u - cols : 0u;
+    snprintf(out, cap, "  %s%*s", label, (int)pad, "");
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((format(printf, 2, 3)))
+#endif
+static void config_dump_field(const char *label, const char *fmt, ...)
+{
+    char padded[96];
+    char value[512];
+
+    config_dump_label(padded, sizeof(padded), label);
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(value, sizeof(value), fmt, ap);
+    va_end(ap);
+
+    DSM_LOG_INFO("%s : %s", padded, value);
+}
+
 void config_dump(const dsm_config_t *cfg)
 {
-    DSM_LOG_INFO("Configuración cargada:");
-    DSM_LOG_INFO("  Identificador de clúster           : 0x%08X", cfg->cluster_id);
-    DSM_LOG_INFO("  Tamaño de página                   : %u bytes", cfg->page_size);
-    DSM_LOG_INFO("  Dirección base                     : 0x%lX", (unsigned long)cfg->base_addr);
-    DSM_LOG_INFO("  Tamaño de vista                    : %lu bytes", (unsigned long)cfg->view_size);
-    DSM_LOG_INFO("  Memoria por nodo                   : %lu bytes", (unsigned long)cfg->node_mem);
-    DSM_LOG_INFO("  Redundancia                        : %s", cfg->redundancy ? "true" : "false");
-    DSM_LOG_INFO("  Rango de puertos                   : %u - %u", cfg->port_min, cfg->port_max);
-    DSM_LOG_INFO("  Grupo de descubrimiento            : 0x%08X", cfg->discovery_group);
-    DSM_LOG_INFO("  Puerto de descubrimiento           : %u", cfg->discovery_port);
-    DSM_LOG_INFO("  Latidos                            : %u ms", cfg->hb_interval_ms);
-    DSM_LOG_INFO("  Sospecha                           : %u", cfg->hb_suspect);
-    DSM_LOG_INFO("  Caído                              : %u", cfg->hb_dead);
-    DSM_LOG_INFO("  Hilos                              : %u trabajadores y %u despachadores",
-                 cfg->worker_threads, cfg->dispatcher_threads);
-    DSM_LOG_INFO("  Margen de custodio                 : %u.%03u",
-                 cfg->home_slack_permille / 1000, cfg->home_slack_permille % 1000);
-    DSM_LOG_INFO("  Páginas por fragmento              : %u", cfg->chunk_pages);
-    DSM_LOG_INFO("  Capacidad de particiones distribuidas: %u", cfg->wait_pool_entries);
-    DSM_LOG_INFO("  Directorio de salida               : %s", cfg->output_dir);
-    DSM_LOG_INFO("  Plazo de ejecución distribuida     : %u ms", cfg->dist_timeout_ms);
-    DSM_LOG_INFO("  Modo de proceso                    : %s", cfg->client_mode ? "cliente" : "nodo");
-    DSM_LOG_INFO("  Hash de configuración compartida   : 0x%08X", cfg->shared_hash);
+    DSM_LOG_INFO("  Configuración cargada:");
+    config_dump_field("Identificador de clúster", "0x%08X", cfg->cluster_id);
+    config_dump_field("Tamaño de página", "%u bytes", cfg->page_size);
+    config_dump_field("Dirección base", "0x%lX", (unsigned long)cfg->base_addr);
+    config_dump_field("Tamaño de vista", "%lu bytes", (unsigned long)cfg->view_size);
+    config_dump_field("Memoria por nodo", "%lu bytes", (unsigned long)cfg->node_mem);
+    config_dump_field("Redundancia", "%s", cfg->redundancy ? "true" : "false");
+    config_dump_field("Rango de puertos", "%u - %u", cfg->port_min, cfg->port_max);
+    config_dump_field("Grupo de descubrimiento", "0x%08X", cfg->discovery_group);
+    config_dump_field("Puerto de descubrimiento", "%u", cfg->discovery_port);
+    config_dump_field("Latidos", "%u ms", cfg->hb_interval_ms);
+    config_dump_field("Sospecha", "%u", cfg->hb_suspect);
+    config_dump_field("Caído", "%u", cfg->hb_dead);
+    config_dump_field("Hilos", "%u trabajadores y %u despachadores",
+                      cfg->worker_threads, cfg->dispatcher_threads);
+    config_dump_field("Margen de custodio", "%u.%03u",
+                      cfg->home_slack_permille / 1000, cfg->home_slack_permille % 1000);
+    config_dump_field("Páginas por fragmento", "%u", cfg->chunk_pages);
+    config_dump_field("Capacidad de particiones distribuidas", "%u",
+                      cfg->wait_pool_entries);
+    config_dump_field("Directorio de salida", "%s", cfg->output_dir);
+    config_dump_field("Plazo de ejecución distribuida", "%u ms", cfg->dist_timeout_ms);
+    config_dump_field("Modo de proceso", "%s", cfg->client_mode ? "cliente" : "nodo");
+    config_dump_field("Hash de configuración compartida", "0x%08X", cfg->shared_hash);
 }

@@ -52,12 +52,18 @@ void dsm_log_write(int level, const char *file, int line, const char *fmt, ...)
     const char *base_file = strrchr(file, '/');
     base_file = base_file ? base_file + 1 : file;
 
+    /* El campo de origen se paddea a un ancho fijo: el nombre del archivo
+     * cambia de largo y, sin el relleno, el mensaje empezaría en una columna
+     * distinta en cada línea. */
+    char origin[64];
+    snprintf(origin, sizeof(origin), "[%s:%d]", base_file, line);
+
     flockfile(stderr);
 
-    fprintf(stderr, "[%s.%03ld] [%-10s] [%s:%d] ",
+    fprintf(stderr, "[%s.%03ld] [%-10s] %-26s ",
             time_str, (long)(tv.tv_usec / 1000),
             (level >= 0 && level <= 4) ? level_names[level] : "?????",
-            base_file, line);
+            origin);
 
     va_list ap;
     va_start(ap, fmt);

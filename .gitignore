@@ -20,6 +20,12 @@ docs/Entregable03/*.pdf
 dsm-repo.zip
 peda-session-*.txt
 reports-demo/
+entrega-laboratorio/
+entrega-fuente/
+dsm-laboratorio*.zip
+/conf/
+/reports/
+/*.log
 
 # Cerrojo de compilación de invocaciones concurrentes.
 /.build.lock

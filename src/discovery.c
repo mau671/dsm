@@ -42,6 +42,24 @@
  */
 #define DISCOVERY_JOIN_GRACE_MS 30000u
 
+/* Marcas del episodio de latidos perdidos de una ranura. El contador global
+ * hb_missed sube una sola vez al entrar en sospecha y otra al declarar la
+ * muerte; los intervalos adicionales de silencio no lo incrementan. */
+#define HB_MISS_MARK_SUSPECT 0x01u
+#define HB_MISS_MARK_DEAD    0x02u
+
+/* Una ranura que sale o se declara muerta deja de aportar actividad de
+ * latidos. Limpiar la marca de tiempo, el indicador de primer latido y las
+ * marcas de transición evita que una ranura terminada siga contando atrasos
+ * de reloj o conserve un episodio anterior si se reutiliza. */
+static void membership_forget_heartbeat(node_info_t *ni)
+{
+    ni->last_hb_ms   = 0;
+    ni->hb_seen      = 0;
+    ni->missed_hb    = 0;
+    ni->hb_miss_mark = 0;
+}
+
 /* Cadencia de los anuncios UDP y plazo de sondeo del hilo de descubrimiento. */
 #define DISCOVERY_ANNOUNCE_MS 500u
 #define DISCOVERY_POLL_MS     100u
@@ -323,9 +341,9 @@ static void discovery_warn_hash_mismatch(dsm_ctx_t *ctx,
     pthread_mutex_unlock(&ctx->disc.mu);
 
     if (warn) {
-        DSM_LOG_WARN("Anuncio del par '%s' (%s, uuid %s) rechazado: "
-                     "configuración compartida distinta (shared_hash "
-                     "0x%08x, propio 0x%08x); no se incorpora al clúster",
+        DSM_LOG_WARN("Anuncio del par '%s' en %s con uuid %s rechazado: la "
+                     "configuración compartida no coincide, shared_hash "
+                     "0x%08x frente a 0x%08x propio; no se incorpora al clúster",
                      name, ip_str, uuid_str, w->shared_hash,
                      ctx->cfg.shared_hash);
     }
@@ -530,7 +548,7 @@ int discovery_mcast_start(dsm_ctx_t *ctx)
     d->thread_started = true;
 
     char group_text[INET_ADDRSTRLEN];
-    DSM_LOG_INFO("Descubrimiento UDP en %s:%u (%s)",
+    DSM_LOG_INFO("Descubrimiento UDP en %s:%u por %s",
                  ip_to_text(group, group_text, sizeof(group_text)),
                  ctx->cfg.discovery_port,
                  joined ? "multicast" : "broadcast");
@@ -903,9 +921,9 @@ static int discovery_walk(dsm_ctx_t *ctx, discovery_walk_t *walk)
         if (memcmp(w.origin_uuid, ctx->memb.self_uuid, 16) == 0) {
             char own_uuid[37];
             uuid_to_str(w.origin_uuid, own_uuid);
-            DSM_LOG_ERR("El par anunciado responde con el mismo UUID (%s); "
-                         "cada nodo necesita un DSM_NODE_TAG distinto",
-                         own_uuid);
+            DSM_LOG_ERR("El par anunciado responde con el mismo UUID %s; "
+                        "cada nodo necesita un DSM_NODE_TAG distinto",
+                        own_uuid);
             return DSM_ERR_CONFIG;
         }
 
@@ -933,7 +951,7 @@ int discovery_scan(dsm_ctx_t *ctx, welcome_t *out)
         return DSM_ERR_NOT_FOUND;
     }
 
-    DSM_LOG_INFO("Par descubierto (epoch=%lu, nodos=%u)",
+    DSM_LOG_INFO("Par descubierto: época %lu, nodos %u",
                  (unsigned long)out->epoch, out->count);
     return DSM_OK;
 }
@@ -1176,6 +1194,7 @@ static void membership_seed_claim(dsm_ctx_t *ctx, const slot_claim_t *claim)
         ni->last_hb_ms  = mono_ms();
         ni->joined_ms   = ni->last_hb_ms;
         ni->missed_hb   = 0;
+        ni->hb_miss_mark = 0;
         ni->hb_seen     = 0;
         m->present[s / 8] |= (uint8_t)(1u << (s % 8));
         inserted = true;
@@ -1315,7 +1334,7 @@ static int discovery_converge(dsm_ctx_t *ctx, uint64_t *max_epoch)
 
         uint64_t now = mono_ms();
         if (now >= deadline) {
-            DSM_LOG_WARN("La vista local no convergio con %u par(es) en %u ms",
+            DSM_LOG_WARN("La vista local no convergió con %u pares en %u ms",
                          walk.nep, 2u * ctx->cfg.discovery_timeout_ms);
             return DSM_OK;
         }
@@ -1370,8 +1389,8 @@ static int discovery_resolve_slots(dsm_ctx_t *ctx, uint32_t *peers_out)
         if (rival && uuid_less(rival->uuid, m->self_uuid)) {
             char rival_uuid[37];
             uuid_to_str(rival->uuid, rival_uuid);
-            DSM_LOG_INFO("Ranura %u reclamada por el nodo %s (UUID menor); se cede",
-                         self, rival_uuid);
+            DSM_LOG_INFO("Ranura %u reclamada por el nodo %s por tener UUID "
+                         "menor; se cede", self, rival_uuid);
             cede = true;
         } else {
             uint16_t status = DSM_ST_OK;
@@ -1406,7 +1425,7 @@ static int discovery_resolve_slots(dsm_ctx_t *ctx, uint32_t *peers_out)
                 continue;
             }
             if (status == DSM_ST_NO_SPACE) {
-                DSM_LOG_ERR("El cluster no tiene ranuras libres");
+                DSM_LOG_ERR("El clúster no tiene ranuras libres");
                 return DSM_ERR_NO_SPACE;
             }
             if (status != DSM_ST_OK && status != DSM_ST_SLOT_TAKEN) {
@@ -1426,7 +1445,7 @@ static int discovery_resolve_slots(dsm_ctx_t *ctx, uint32_t *peers_out)
 
         uint32_t next = discovery_pick_slot(ctx, &walk, rejected);
         if (next == DSM_SLOT_NONE) {
-            DSM_LOG_ERR("No hay slots libres en el cluster");
+            DSM_LOG_ERR("No hay ranuras libres en el clúster");
             return DSM_ERR_NO_SPACE;
         }
         DSM_LOG_INFO("Ranura %u no disponible; se solicita la ranura %u", self, next);
@@ -1437,7 +1456,7 @@ static int discovery_resolve_slots(dsm_ctx_t *ctx, uint32_t *peers_out)
         }
     }
 
-    DSM_LOG_ERR("El reparto de ranuras no convergio tras %u vueltas",
+    DSM_LOG_ERR("El reparto de ranuras no convergió tras %u vueltas",
                 (unsigned)DISCOVERY_RESOLVE_ROUNDS);
     return DSM_ERR_BUSY;
 }
@@ -1565,10 +1584,10 @@ static int discovery_join_locked(dsm_ctx_t *ctx)
 
     if (!membership_has_memory_node(ctx)) {
         if (ctx->cfg.client_mode) {
-            DSM_LOG_ERR("modo cliente: no se encontro ningun nodo con memoria en el cluster");
+            DSM_LOG_ERR("Modo cliente: no se encontró ningún nodo con memoria en el clúster");
             return DSM_ERR_NO_SPACE;
         }
-        DSM_LOG_ERR("No hay ningun nodo con memoria en el cluster");
+        DSM_LOG_ERR("No hay ningún nodo con memoria en el clúster");
         return DSM_ERR_NO_SPACE;
     }
 
@@ -1580,7 +1599,7 @@ static int discovery_join_locked(dsm_ctx_t *ctx)
     uint32_t old_slot = m->self_slot;
     uint32_t slot = discovery_pick_slot(ctx, &walk, NULL);
     if (slot == DSM_SLOT_NONE) {
-        DSM_LOG_ERR("No hay slots libres en el cluster");
+        DSM_LOG_ERR("No hay ranuras libres en el clúster");
         return DSM_ERR_NO_SPACE;
     }
     if (slot != old_slot) {
@@ -1617,8 +1636,8 @@ static int discovery_join_locked(dsm_ctx_t *ctx)
         m->epoch = converge_epoch;
     }
 
-    DSM_LOG_INFO("Union completada exitosamente: Slot asignado = %u, Epoch = %lu, "
-                 "pares alcanzables = %u",
+    DSM_LOG_INFO("Unión completada: ranura %u asignada, época %lu, pares "
+                 "alcanzables %u",
                  m->self_slot, (unsigned long)m->epoch, peers);
 
     return DSM_OK;
@@ -1635,7 +1654,7 @@ int discovery_join(dsm_ctx_t *ctx)
 
     char uuid_str[37];
     uuid_to_str(m->self_uuid, uuid_str);
-    DSM_LOG_INFO("Identificador del nodo (UUID): %s", uuid_str);
+    DSM_LOG_INFO("Identificador del nodo: %s", uuid_str);
 
     if ((rc = discovery_bind_first_free(ctx)) != DSM_OK) {
         return rc;
@@ -1745,6 +1764,7 @@ void discovery_leave(dsm_ctx_t *ctx)
     if (m->self_slot < MAX_NODES) {
         m->nodes[m->self_slot].state = DSM_NODE_DEAD;
         m->present[m->self_slot / 8] &= (uint8_t)~(1u << (m->self_slot % 8));
+        membership_forget_heartbeat(&m->nodes[m->self_slot]);
     }
     pthread_rwlock_unlock(&m->rw);
 }
@@ -1885,6 +1905,7 @@ void membership_add_self(dsm_ctx_t *ctx)
         ni->last_hb_ms  = mono_ms();
         ni->joined_ms   = ni->last_hb_ms;
         ni->missed_hb   = 0;
+        ni->hb_miss_mark = 0;
         ni->hb_seen     = 1;
 
         m->present[s / 8] |= (uint8_t)(1u << (s % 8));
@@ -1973,6 +1994,7 @@ void membership_claim_slot(dsm_ctx_t *ctx, uint32_t slot)
             m->nodes[prev].state = DSM_NODE_DEAD;
             m->present[prev / 8] &= (uint8_t)~(1u << (prev % 8));
             m->reusable_after_ms[prev] = 0;
+            membership_forget_heartbeat(&m->nodes[prev]);
         }
         /* Reubicarse cambia el reparto de la tabla. Si la ranura previa ya
          * estaba ocupada por un par, su fila se conserva y también debe
@@ -2090,6 +2112,7 @@ void membership_merge_wire(dsm_membership_t *m, const welcome_t *w)
             m->nodes[other].state = DSM_NODE_DEAD;
             m->present[other / 8] &= (uint8_t)~(1u << (other % 8));
             m->reusable_after_ms[other] = 0;
+            membership_forget_heartbeat(&m->nodes[other]);
         }
 
         bool present = (m->present[s / 8] & (1u << (s % 8))) != 0;
@@ -2119,6 +2142,7 @@ void membership_merge_wire(dsm_membership_t *m, const welcome_t *w)
         ni->last_hb_ms  = mono_ms();
         ni->joined_ms   = ni->last_hb_ms;
         ni->missed_hb   = 0;
+        ni->hb_miss_mark = 0;
         ni->hb_seen     = 0;
 
         m->present[s / 8] |= (uint8_t)(1u << (s % 8));
@@ -2258,10 +2282,11 @@ void membership_on_heartbeat(dsm_ctx_t *ctx, const dsm_msg_t *m)
         node_info_t *ni = &ctx->memb.nodes[s];
         ni->last_hb_ms = mono_ms();
         ni->missed_hb  = 0;
+        ni->hb_miss_mark = 0;
         ni->hb_seen    = 1;
         if (ni->state == DSM_NODE_SUSPECT) {
             ni->state = DSM_NODE_ALIVE;
-            DSM_LOG_INFO("Nodo en slot %u recupero estado ALIVE", s);
+            DSM_LOG_INFO("Nodo en ranura %u recuperó el estado ALIVE", s);
         }
         if (m->payload && m->hdr.payload_len >= 12) {
             uint32_t free_p = 0;
@@ -2295,6 +2320,7 @@ void membership_on_heartbeat(dsm_ctx_t *ctx, const dsm_msg_t *m)
             ctx->memb.present[other / 8] &=
                 (uint8_t)~(1u << (other % 8));
             ctx->memb.reusable_after_ms[other] = 0;
+            membership_forget_heartbeat(&ctx->memb.nodes[other]);
         }
 
         node_info_t *ni = &ctx->memb.nodes[s];
@@ -2310,6 +2336,7 @@ void membership_on_heartbeat(dsm_ctx_t *ctx, const dsm_msg_t *m)
         ni->last_hb_ms  = mono_ms();
         ni->joined_ms   = ni->last_hb_ms;
         ni->missed_hb   = 0;
+        ni->hb_miss_mark = 0;
         ni->hb_seen     = 1;
         ctx->memb.present[s / 8] |= (uint8_t)(1u << (s % 8));
         learned = true;
@@ -2319,14 +2346,14 @@ void membership_on_heartbeat(dsm_ctx_t *ctx, const dsm_msg_t *m)
     if (learned) {
         char uuid_str[37];
         uuid_to_str(ident.uuid, uuid_str);
-        DSM_LOG_INFO("Latido de una ranura desconocida (%u): se incorpora el "
+        DSM_LOG_INFO("Latido de una ranura desconocida %u: se incorpora el "
                      "nodo %s", s, uuid_str);
         membership_progress_notify(&ctx->memb);
         membership_replicate(ctx);
         if (ctx->cfg.redundancy && ctx->raid.stripes) {
             int rrc = raid_reconfigure(ctx);
             if (rrc != DSM_OK) {
-                DSM_LOG_WARN("No se pudo ajustar K tras incorporar el slot %u: %s",
+                DSM_LOG_WARN("No se pudo ajustar K tras incorporar la ranura %u: %s",
                              s, dsm_strerror((dsm_status_t)rrc));
             }
         }
@@ -2404,6 +2431,7 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
         ctx->memb.nodes[other].state = DSM_NODE_DEAD;
         ctx->memb.present[other / 8] &= (uint8_t)~(1u << (other % 8));
         ctx->memb.reusable_after_ms[other] = 0;
+        membership_forget_heartbeat(&ctx->memb.nodes[other]);
     }
 
     bool taken = membership_slot_present(ctx, s) &&
@@ -2432,6 +2460,7 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
     ni->last_hb_ms  = mono_ms();
     ni->joined_ms   = ni->last_hb_ms;
     ni->missed_hb   = 0;
+    ni->hb_miss_mark = 0;
     ni->hb_seen     = 0;
     ctx->memb.present[s / 8] |= (uint8_t)(1u << (s % 8));
 
@@ -2467,7 +2496,8 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
     } else {
         dsm_net_send(ctx, s, &ack_hdr, NULL);
     }
-    DSM_LOG_INFO("Nuevo nodo incorporado a la membresia: Slot %u (Port %u)", s, wire.port);
+    DSM_LOG_INFO("Nuevo nodo incorporado a la membresía: ranura %u, puerto %u",
+                 s, wire.port);
 
     /* El JOIN solo lo recibió este nodo. Se replica la tabla a los demás
      * miembros vivos para que el recién llegado aparezca en todas las vistas
@@ -2480,7 +2510,7 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
     if (ctx->cfg.redundancy && ctx->raid.stripes) {
         int rrc = raid_reconfigure(ctx);
         if (rrc != DSM_OK) {
-            DSM_LOG_WARN("No se pudo recalcular K tras la unión del slot %u: %s",
+            DSM_LOG_WARN("No se pudo recalcular K tras la unión de la ranura %u: %s",
                          s, dsm_strerror((dsm_status_t)rrc));
         }
     }
@@ -2533,7 +2563,7 @@ static void node_down_recover_enqueue(dsm_ctx_t *ctx, uint32_t slot)
     msg.hdr.page_id     = slot;
 
     if (worker_enqueue(ctx, &msg, NULL) != DSM_OK) {
-        DSM_LOG_WARN("Recuperación del slot %u aplazada: sin capacidad de "
+        DSM_LOG_WARN("Recuperación de la ranura %u aplazada: sin capacidad de "
                      "cola; los fallos de página la completarán", slot);
     }
 }
@@ -2549,8 +2579,9 @@ void membership_on_node_down(dsm_ctx_t *ctx, const dsm_msg_t *m)
         ctx->memb.nodes[s].state = DSM_NODE_DEAD;
         ctx->memb.present[s / 8] &= (uint8_t)~(1u << (s % 8));
         ctx->memb.reusable_after_ms[s] = mono_ms() + ctx->cfg.reconnect_max_ms;
+        membership_forget_heartbeat(&ctx->memb.nodes[s]);
         changed = true;
-        DSM_LOG_WARN("Notificacion NODE_DOWN procesada para slot %u", s);
+        DSM_LOG_WARN("Aviso de caída procesado para el nodo en la ranura %u", s);
     }
     pthread_rwlock_unlock(&ctx->memb.rw);
 
@@ -2573,8 +2604,9 @@ void membership_on_leave(dsm_ctx_t *ctx, const dsm_msg_t *m)
         ctx->memb.nodes[s].state = DSM_NODE_DEAD;
         ctx->memb.present[s / 8] &= (uint8_t)~(1u << (s % 8));
         ctx->memb.reusable_after_ms[s] = mono_ms() + ctx->cfg.reconnect_max_ms;
+        membership_forget_heartbeat(&ctx->memb.nodes[s]);
         changed = true;
-        DSM_LOG_INFO("Salida ordenada (LEAVE) del nodo en slot %u", s);
+        DSM_LOG_INFO("Salida ordenada del nodo en la ranura %u", s);
     }
     pthread_rwlock_unlock(&ctx->memb.rw);
 
@@ -3031,31 +3063,45 @@ void membership_evaluate(dsm_ctx_t *ctx, uint64_t now_ms)
             m->present[s / 8] &= (uint8_t)~(1u << (s % 8));
             m->reusable_after_ms[s] = now_ms + ctx->cfg.reconnect_max_ms;
             dead_slots[dead_count++] = s;
-            DSM_LOG_WARN("Nodo en slot %u sin latidos desde su unión; "
+            atomic_fetch_add_explicit(&ctx->ctr.hb_missed, 1,
+                                      memory_order_relaxed);
+            DSM_LOG_WARN("Nodo en ranura %u sin latidos desde su unión; "
                          "se dictamina DEAD", s);
+            membership_forget_heartbeat(ni);
             continue;
         }
 
         uint64_t elapsed = now_ms - ni->last_hb_ms;
         uint32_t missed = (uint32_t)(elapsed / ctx->cfg.hb_interval_ms);
-        /* Cada intervalo perdido se cuenta una sola vez: el acumulador
-         * crece con el incremento respecto de la evaluación anterior. */
-        if (missed > ni->missed_hb) {
-            atomic_fetch_add_explicit(&ctx->ctr.hb_missed,
-                                      (uint64_t)(missed - ni->missed_hb),
-                                      memory_order_relaxed);
-        }
         ni->missed_hb = (uint8_t)(missed > 255 ? 255 : missed);
 
-        if (ni->missed_hb >= ctx->cfg.hb_dead) {
+        /* El contador global refleja transiciones, no intervalos: un nodo que
+         * sigue callado dentro de SUSPECT no vuelve a sumar por cada vuelta. */
+        uint8_t lost = ni->missed_hb;
+        if (lost > 0 && lost >= ctx->cfg.hb_suspect &&
+            !(ni->hb_miss_mark & HB_MISS_MARK_SUSPECT)) {
+            atomic_fetch_add_explicit(&ctx->ctr.hb_missed, 1,
+                                      memory_order_relaxed);
+            ni->hb_miss_mark |= HB_MISS_MARK_SUSPECT;
+        }
+
+        if (lost >= ctx->cfg.hb_dead) {
+            if (!(ni->hb_miss_mark & HB_MISS_MARK_DEAD)) {
+                atomic_fetch_add_explicit(&ctx->ctr.hb_missed, 1,
+                                          memory_order_relaxed);
+                ni->hb_miss_mark |= HB_MISS_MARK_DEAD;
+            }
             ni->state = DSM_NODE_DEAD;
             m->present[s / 8] &= (uint8_t)~(1u << (s % 8));
             m->reusable_after_ms[s] = now_ms + ctx->cfg.reconnect_max_ms;
             dead_slots[dead_count++] = s;
-            DSM_LOG_WARN("Nodo en slot %u dictaminado DEAD (latidos perdidos: %u)", s, ni->missed_hb);
-        } else if (ni->missed_hb >= ctx->cfg.hb_suspect && ni->state == DSM_NODE_ALIVE) {
+            DSM_LOG_WARN("Nodo en ranura %u dictaminado DEAD con %u latidos "
+                         "perdidos", s, lost);
+            membership_forget_heartbeat(ni);
+        } else if (lost >= ctx->cfg.hb_suspect && ni->state == DSM_NODE_ALIVE) {
             ni->state = DSM_NODE_SUSPECT;
-            DSM_LOG_WARN("Nodo en slot %u degradado a SUSPECT (latidos perdidos: %u)", s, ni->missed_hb);
+            DSM_LOG_WARN("Nodo en ranura %u degradado a SUSPECT con %u latidos "
+                         "perdidos", s, lost);
         }
     }
     pthread_rwlock_unlock(&m->rw);

@@ -242,7 +242,7 @@ typedef struct {
     uint64_t dist_tasks_run;
     /** Particiones de ejecución distribuida que terminaron en fallo. */
     uint64_t dist_tasks_failed;
-    /** Latidos perdidos acumulados respecto de los pares del cluster. */
+    /** Transiciones a SUSPECT y DEAD acumuladas de los pares del clúster. */
     uint64_t hb_missed;
     /** Cantidad de operaciones de página pendientes de respuesta. */
     uint32_t pending_count;

@@ -206,7 +206,7 @@ Las cargas fijas se serializan campo por campo y la cabecera conserva sus 56 byt
 | `parity_latency_us` | `uint64_t` | Suma acumulada de la latencia de paridad, en microsegundos. |
 | `dist_tasks_run` | `uint64_t` | Particiones de ejecución distribuida ejecutadas correctamente. |
 | `dist_tasks_failed` | `uint64_t` | Particiones de ejecución distribuida que terminaron en fallo. |
-| `hb_missed` | `uint64_t` | Latidos perdidos acumulados respecto de los pares del cluster. |
+| `hb_missed` | `uint64_t` | Transiciones a SUSPECT y DEAD acumuladas de los pares del clúster; cada episodio suma una vez por transición y no por intervalo. |
 | `pending_count` | `uint32_t` | Operaciones de página pendientes de respuesta. |
 | `wait_pool_used` | `uint32_t` | Entradas ocupadas del conjunto de espera. |
 | `slots_enqueued` | `uint32_t` | Fallos encolados para el despachador. |

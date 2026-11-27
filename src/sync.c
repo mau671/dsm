@@ -1467,7 +1467,7 @@ void sync_on_lock_migrate(dsm_ctx_t *ctx, const dsm_msg_t *m)
     }
     if (!m->payload || m->hdr.payload_len != DSM_LOCK_MIGRATE_WIRE_LEN) return;
     dsm_unpack_lock_migrate(m->payload, &mig);
-    DSM_LOG_INFO("LOCK_MIGRATE en slot %u: época %lu, muerto %u (propia %lu)",
+    DSM_LOG_INFO("LOCK_MIGRATE en slot %u: época %lu, muerto %u, propia %lu",
                  ctx->memb.self_slot, (unsigned long)mig.epoch, mig.dead_slot,
                  (unsigned long)ctx->sync.migrate_epoch);
     if (mig.dead_slot >= MAX_NODES || mig.dead_slot == ctx->memb.self_slot) return;
