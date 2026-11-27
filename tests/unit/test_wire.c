@@ -713,7 +713,7 @@ static int test_wire_payload_ok_matrix(void)
 {
     const uint32_t ps = 4096;
 
-    /* HELLO: uuid[16] + raw_hash[4] = 20 exacto */
+    /* HELLO: uuid[16] + shared_hash[4] = 20 exacto */
     CHECK(wire_payload_ok(MSG_HELLO, 0, 20, ps) == true);
     CHECK(wire_payload_ok(MSG_HELLO, 0, 19, ps) == false);
     CHECK(wire_payload_ok(MSG_HELLO, 0, 21, ps) == false);
@@ -1352,7 +1352,7 @@ static int test_rig_payload_ok_por_tipo(void)
         CHECK(wire_payload_ok(vacios[i], 0, max + 1, ps) == false);
     }
 
-    /* HELLO: 20 exacto (uuid[16] + raw_hash[4]). */
+    /* HELLO: 20 exacto (uuid[16] + shared_hash[4]). */
     CHECK(wire_payload_ok(MSG_HELLO, 0, 20, ps) == true);
     CHECK(wire_payload_ok(MSG_HELLO, 0, 0, ps) == false);
     CHECK(wire_payload_ok(MSG_HELLO, 0, 16, ps) == false);

@@ -5,7 +5,7 @@
 #include <pthread.h>
 #include "wire.h"
 
-/* Numero maximo de paginas de datos por franja (validado en config.c). */
+/* Numero maximo de paginas de datos por franja que puede derivar la membresia. */
 #define DSM_RAID_MAX_K       8u
 /* Tamano de la tabla de solicitudes de paridad pendientes. */
 #define DSM_RAID_PENDING_MAX 256u
@@ -82,6 +82,15 @@ typedef struct dsm_ctx dsm_ctx_t;
 
 int  raid_init(dsm_ctx_t *ctx);
 void raid_shutdown(dsm_ctx_t *ctx);
+
+/* K de datos por franja para un cluster de 'nodes' miembros vivos que aportan
+ * memoria: nodes - 1, acotado a [2, DSM_RAID_MAX_K]. */
+uint32_t raid_k_for_nodes(uint32_t nodes);
+/* K vigente del nodo: deriva de la membresía y queda fijado al formar la
+ * paridad. */
+uint32_t raid_k_effective(dsm_ctx_t *ctx);
+/* Recalcula K y las estructuras de franja al terminar la unión al cluster. */
+int  raid_reconfigure(dsm_ctx_t *ctx);
 
 int  raid_on_write(dsm_ctx_t *ctx, uint32_t page,
                    const uint8_t *old_data, const uint8_t *new_data);

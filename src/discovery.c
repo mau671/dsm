@@ -12,14 +12,16 @@
 #include <errno.h>
 #include <time.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/file.h>
 #include <fcntl.h>
+#include <poll.h>
 
 /*
- * Vueltas maximas del reparto de ranuras. Cada vuelta recorre el rango de
- * puertos una vez y envia un JOIN por par conocido, de modo que el reparto
+ * Vueltas maximas del reparto de ranuras. Cada vuelta sondea los pares
+ * anunciados por UDP y envia un JOIN por cada uno, de modo que el reparto
  * converge en tantas vueltas como nodos simultaneos haya; el limite solo
  * acota un caso patologico y lo reporta como error.
  */
@@ -39,6 +41,15 @@
  * enviado ningún latido; en cuanto llega el primero, rige la detección normal.
  */
 #define DISCOVERY_JOIN_GRACE_MS 30000u
+
+/* Cadencia de los anuncios UDP y plazo de sondeo del hilo de descubrimiento. */
+#define DISCOVERY_ANNOUNCE_MS 500u
+#define DISCOVERY_POLL_MS     100u
+
+/* Intervalo mínimo entre avisos por un mismo par con configuración distinta.
+ * El anuncio se repite cada DISCOVERY_ANNOUNCE_MS; sin este límite el aviso
+ * enterraría el resto del registro. */
+#define DISCOVERY_HASH_WARN_MS 5000u
 
 /*
  * Cerrojo de descubrimiento del cluster.
@@ -140,6 +151,408 @@ static uint32_t socket_local_ip(int fd)
     return sa.sin_addr.s_addr;
 }
 
+/* Dirección legible para el diagnóstico, en orden de red. */
+static const char *ip_to_text(uint32_t ip, char *out, size_t cap)
+{
+    struct in_addr addr;
+    addr.s_addr = ip;
+    if (!inet_ntop(AF_INET, &addr, out, cap)) {
+        snprintf(out, cap, "0.0.0.0");
+    }
+    return out;
+}
+
+/* Interfaz IPv4 principal, descubierta sin enviar tráfico: connect sobre un
+ * datagrama solo fija el destino por defecto. Cero significa "la que elija el
+ * kernel", que es el respaldo cuando no hay una ruta fuera de la máquina. */
+static uint32_t discovery_principal_iface(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+
+    struct sockaddr_in dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family      = AF_INET;
+    dst.sin_port        = htons(9u);
+    dst.sin_addr.s_addr = htonl(0x08080808u);
+
+    uint32_t ip = 0;
+    if (connect(fd, (struct sockaddr *)&dst, sizeof(dst)) == 0) {
+        ip = socket_local_ip(fd);
+    }
+    close(fd);
+    return ip;
+}
+
+/* Nombre que se publica en el anuncio: etiqueta del proceso o nombre de la
+ * máquina. El campo del cable tiene longitud fija y siempre termina en cero. */
+static void discovery_node_name(char out[32])
+{
+    const char *tag = getenv("DSM_NODE_TAG");
+    if (tag && tag[0] != '\0') {
+        snprintf(out, 32, "%s", tag);
+    } else if (gethostname(out, 32) != 0) {
+        snprintf(out, 32, "dsm");
+    }
+    out[31] = '\0';
+}
+
+/* Construye el anuncio campo por campo con el estado vigente del nodo. */
+static size_t discovery_build_announcement(dsm_ctx_t *ctx,
+                                           uint8_t out[DSM_DISCOVERY_WIRE_LEN])
+{
+    discovery_wire_t w;
+    memset(&w, 0, sizeof(w));
+
+    w.magic         = DSM_MAGIC;
+    w.proto_version = DSM_PROTO_VERSION;
+    w.cluster_id    = ctx->cfg.cluster_id;
+    w.shared_hash   = ctx->cfg.shared_hash;
+    memcpy(w.uuid, ctx->memb.self_uuid, 16);
+    discovery_node_name((char *)w.name);
+
+    pthread_rwlock_rdlock(&ctx->memb.rw);
+    w.slot = ctx->memb.self_slot;
+    /* INADDR_ANY nunca es un destino alcanzable; mientras no se observe una IP
+     * real se publica el loopback, suficiente para el clúster local. */
+    w.ip = ip_is_usable(ctx->memb.self_ip)
+               ? ctx->memb.self_ip
+               : htonl(INADDR_LOOPBACK);
+    pthread_rwlock_unlock(&ctx->memb.rw);
+
+    w.port      = ctx->net.listen_port;
+    uint32_t ps = (ctx->cfg.page_size > 0) ? ctx->cfg.page_size : 4096u;
+    w.mem_pages = ctx->cfg.client_mode ? 0u : (uint32_t)(ctx->cfg.node_mem / ps);
+    w.role      = ctx->cfg.client_mode ? 1u : 0u;
+
+    return dsm_pack_discovery(&w, out);
+}
+
+/* Envía un anuncio por la interfaz indicada. Un entorno sin ruta multicast o
+ * sin broadcast no detiene el hilo: el próximo periodo vuelve a intentarlo. */
+static void discovery_send_packet(dsm_ctx_t *ctx, const uint8_t *buf, size_t len,
+                                  uint32_t iface, bool multicast,
+                                  const struct sockaddr_in *dst)
+{
+    if (multicast && iface != 0) {
+        if (setsockopt(ctx->disc.fd, IPPROTO_IP, IP_MULTICAST_IF,
+                       &iface, sizeof(iface)) != 0) {
+            return;
+        }
+    }
+    (void)sendto(ctx->disc.fd, buf, len, 0,
+                 (const struct sockaddr *)dst, sizeof(*dst));
+}
+
+/* Emite el anuncio por todas las vías disponibles. La copia por loopback hace
+ * que dos procesos de la misma máquina se vean aunque la ruta multicast por
+ * defecto no devuelva los paquetes; la copia por la interfaz principal sirve
+ * para nodos en equipos distintos. El broadcast es el respaldo. */
+static void discovery_announce_once(dsm_ctx_t *ctx)
+{
+    uint8_t buf[DSM_DISCOVERY_WIRE_LEN];
+    size_t len = discovery_build_announcement(ctx, buf);
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port   = htons(ctx->cfg.discovery_port);
+    dest.sin_addr.s_addr = ctx->disc.multicast
+                               ? htonl(ctx->cfg.discovery_group)
+                               : htonl(INADDR_BROADCAST);
+
+    if (ctx->disc.multicast) {
+        discovery_send_packet(ctx, buf, len, htonl(INADDR_LOOPBACK), true, &dest);
+
+        uint32_t principal = discovery_principal_iface();
+        uint32_t loopback  = htonl(INADDR_LOOPBACK);
+        if (ip_is_usable(principal) && principal != loopback) {
+            discovery_send_packet(ctx, buf, len, principal, true, &dest);
+            uint32_t restore = ctx->disc.mcast_if;
+            (void)setsockopt(ctx->disc.fd, IPPROTO_IP, IP_MULTICAST_IF,
+                             &restore, sizeof(restore));
+        }
+    }
+
+    dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    discovery_send_packet(ctx, buf, len, 0, false, &dest);
+}
+
+/* Avisa que un par quedó fuera del clúster por configuración compartida
+ * distinta. El anuncio se repite, así que el aviso se limita por UUID. */
+static void discovery_warn_hash_mismatch(dsm_ctx_t *ctx,
+                                         const discovery_wire_t *w,
+                                         uint32_t ip)
+{
+    char uuid_str[37];
+    char ip_str[INET_ADDRSTRLEN];
+    char name[33];
+
+    uuid_to_str(w->uuid, uuid_str);
+    memcpy(name, w->name, sizeof(w->name));
+    name[sizeof(name) - 1] = '\0';
+
+    struct in_addr addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.s_addr = ip;
+    if (!inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str))) {
+        snprintf(ip_str, sizeof(ip_str), "?");
+    }
+
+    uint64_t now = mono_ms();
+    bool warn = false;
+
+    pthread_mutex_lock(&ctx->disc.mu);
+    uint32_t i = 0;
+    while (i < ctx->disc.nconflicts &&
+           memcmp(ctx->disc.conflicts[i].uuid, w->uuid, 16) != 0) {
+        i++;
+    }
+    if (i == ctx->disc.nconflicts) {
+        if (ctx->disc.nconflicts < MAX_NODES) {
+            i = ctx->disc.nconflicts++;
+            memcpy(ctx->disc.conflicts[i].uuid, w->uuid, 16);
+            ctx->disc.conflicts[i].last_warn_ms = now;
+            warn = true;
+        }
+    } else if (now - ctx->disc.conflicts[i].last_warn_ms >=
+               DISCOVERY_HASH_WARN_MS) {
+        ctx->disc.conflicts[i].last_warn_ms = now;
+        warn = true;
+    }
+    pthread_mutex_unlock(&ctx->disc.mu);
+
+    if (warn) {
+        DSM_LOG_WARN("Anuncio del par '%s' (%s, uuid %s) rechazado: "
+                     "configuración compartida distinta (shared_hash "
+                     "0x%08x, propio 0x%08x); no se incorpora al clúster",
+                     name, ip_str, uuid_str, w->shared_hash,
+                     ctx->cfg.shared_hash);
+    }
+}
+
+/* Registra un anuncio válido. La IP del remitente observada en el socket
+ * sustituye a una dirección loopback publicada por el propio nodo. */
+static void discovery_on_announcement(dsm_ctx_t *ctx, const uint8_t *buf,
+                                      size_t len, const struct sockaddr_in *src)
+{
+    if (len != DSM_DISCOVERY_WIRE_LEN) {
+        return;
+    }
+
+    discovery_wire_t w;
+    dsm_unpack_discovery(buf, &w);
+
+    if (w.magic != DSM_MAGIC || w.proto_version != DSM_PROTO_VERSION ||
+        w.cluster_id != ctx->cfg.cluster_id) {
+        return;
+    }
+    if (memcmp(w.uuid, ctx->memb.self_uuid, 16) == 0) {
+        return;
+    }
+
+    uint32_t ip = w.ip;
+    uint32_t src_ip = (src && src->sin_family == AF_INET)
+                          ? src->sin_addr.s_addr
+                          : 0;
+    if (ip_replaceable(ip, src_ip)) {
+        ip = src_ip;
+    }
+
+    if (w.shared_hash != ctx->cfg.shared_hash) {
+        discovery_warn_hash_mismatch(ctx, &w, ip);
+        return;
+    }
+    if (w.port == 0 || w.role > 1u) {
+        return;
+    }
+    if (!ip_is_usable(ip)) {
+        return;
+    }
+
+    w.name[sizeof(w.name) - 1] = '\0';
+
+    bool notify = false;
+    pthread_mutex_lock(&ctx->disc.mu);
+
+    uint32_t i = 0;
+    while (i < ctx->disc.npeers &&
+           memcmp(ctx->disc.peers[i].uuid, w.uuid, 16) != 0) {
+        i++;
+    }
+
+    if (i == ctx->disc.npeers && ctx->disc.npeers < MAX_NODES) {
+        discovery_peer_t *p = &ctx->disc.peers[ctx->disc.npeers++];
+        memset(p, 0, sizeof(*p));
+        memcpy(p->uuid, w.uuid, 16);
+        memcpy(p->name, w.name, sizeof(p->name) - 1);
+        p->name[sizeof(p->name) - 1] = '\0';
+        notify = true;
+    } else if (i < ctx->disc.npeers) {
+        notify = (ctx->disc.peers[i].slot != w.slot ||
+                  ctx->disc.peers[i].port != w.port);
+    }
+
+    if (i < ctx->disc.npeers) {
+        discovery_peer_t *p = &ctx->disc.peers[i];
+        p->ip         = ip;
+        p->port       = w.port;
+        p->mem_pages  = w.mem_pages;
+        p->slot       = w.slot;
+        p->role       = w.role;
+        p->last_seen_ms = mono_ms();
+        memcpy(p->name, w.name, sizeof(p->name) - 1);
+        p->name[sizeof(p->name) - 1] = '\0';
+    }
+
+    pthread_mutex_unlock(&ctx->disc.mu);
+
+    membership_observe_peer_ip(ctx, w.uuid, ip);
+    if (notify) {
+        membership_progress_notify(&ctx->memb);
+    }
+}
+
+static void *discovery_udp_thread_main(void *arg)
+{
+    dsm_ctx_t *ctx = (dsm_ctx_t *)arg;
+    uint64_t next_announce = mono_ms();
+
+    while (atomic_load(&ctx->disc.running)) {
+        uint64_t now = mono_ms();
+        if (now >= next_announce) {
+            discovery_announce_once(ctx);
+            next_announce = now + DISCOVERY_ANNOUNCE_MS;
+        }
+
+        struct pollfd pfd = { .fd = ctx->disc.fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, DISCOVERY_POLL_MS);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            DSM_LOG_ERR("poll del socket de descubrimiento falló: %s", strerror(errno));
+            break;
+        }
+        if (pr == 0) continue;
+        if (pfd.revents & POLLNVAL) break;
+        if (!(pfd.revents & POLLIN)) continue;
+
+        for (;;) {
+            uint8_t buf[DSM_DISCOVERY_WIRE_LEN];
+            struct sockaddr_in src;
+            socklen_t slen = sizeof(src);
+            memset(&src, 0, sizeof(src));
+
+            ssize_t n = recvfrom(ctx->disc.fd, buf, sizeof(buf), MSG_DONTWAIT,
+                                 (struct sockaddr *)&src, &slen);
+            if (n < 0) break;
+            if (n == (ssize_t)DSM_DISCOVERY_WIRE_LEN) {
+                discovery_on_announcement(ctx, buf, (size_t)n, &src);
+            }
+        }
+    }
+    return NULL;
+}
+
+int discovery_mcast_start(dsm_ctx_t *ctx)
+{
+    dsm_discovery_t *d = &ctx->disc;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        DSM_LOG_ERR("No se pudo crear el socket UDP de descubrimiento: %s",
+                    strerror(errno));
+        return DSM_ERR_NET;
+    }
+    set_cloexec(fd);
+
+    int opt = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    (void)setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &opt, sizeof(opt));
+    (void)setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &opt, sizeof(opt));
+    uint8_t ttl = 1;
+    (void)setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port        = htons(ctx->cfg.discovery_port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        DSM_LOG_ERR("No se pudo enlazar el socket UDP de descubrimiento en el puerto %u: %s",
+                    ctx->cfg.discovery_port, strerror(errno));
+        close(fd);
+        return DSM_ERR_NET;
+    }
+
+    bool joined = false;
+    d->mcast_if = 0;
+    uint32_t group = htonl(ctx->cfg.discovery_group);
+    bool is_multicast = (ctx->cfg.discovery_group & 0xF0000000u) == 0xE0000000u;
+
+    if (is_multicast) {
+        struct ip_mreq mreq;
+        memset(&mreq, 0, sizeof(mreq));
+        mreq.imr_multiaddr.s_addr = group;
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+
+        if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                       &mreq, sizeof(mreq)) == 0) {
+            joined = true;
+            /* Segunda suscripción por loopback: permite que otro proceso de la
+             * misma máquina sea visto aunque la interfaz por defecto no
+             * devuelva los datágramas multicast. */
+            mreq.imr_interface.s_addr = htonl(INADDR_LOOPBACK);
+            (void)setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                             &mreq, sizeof(mreq));
+        } else {
+            mreq.imr_interface.s_addr = htonl(INADDR_LOOPBACK);
+            if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                           &mreq, sizeof(mreq)) == 0) {
+                joined = true;
+                d->mcast_if = htonl(INADDR_LOOPBACK);
+            }
+        }
+    }
+
+    d->multicast = joined;
+    d->fd        = fd;
+    d->npeers    = 0;
+    atomic_store(&d->running, true);
+
+    int rc = pthread_create(&d->thread, NULL, discovery_udp_thread_main, ctx);
+    if (rc != 0) {
+        DSM_LOG_ERR("No se pudo crear el hilo de descubrimiento UDP: %d", rc);
+        atomic_store(&d->running, false);
+        close(fd);
+        d->fd = -1;
+        d->multicast = false;
+        return DSM_ERR_MEM;
+    }
+    d->thread_started = true;
+
+    char group_text[INET_ADDRSTRLEN];
+    DSM_LOG_INFO("Descubrimiento UDP en %s:%u (%s)",
+                 ip_to_text(group, group_text, sizeof(group_text)),
+                 ctx->cfg.discovery_port,
+                 joined ? "multicast" : "broadcast");
+    return DSM_OK;
+}
+
+void discovery_mcast_stop(dsm_ctx_t *ctx)
+{
+    dsm_discovery_t *d = &ctx->disc;
+
+    atomic_store(&d->running, false);
+    if (d->thread_started) {
+        (void)pthread_join(d->thread, NULL);
+        d->thread_started = false;
+    }
+    if (d->fd >= 0) {
+        close(d->fd);
+        d->fd = -1;
+    }
+    d->multicast = false;
+}
+
 int uuid_load_or_create(dsm_ctx_t *ctx, uint8_t out[16])
 {
     const char *tag = getenv("DSM_NODE_TAG");
@@ -214,10 +627,10 @@ static int probe_peer(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t 
      * unica que el par puede usar para responderle. */
     membership_observe_self_ip(ctx, socket_local_ip(fd));
 
-    /* Enviar mensaje HELLO: 20 bytes (uuid[16] + raw_hash[4]) */
+    /* Enviar mensaje HELLO: 20 bytes (uuid[16] + shared_hash[4]) */
     uint8_t hello_payload[20];
     memcpy(hello_payload, ctx->memb.self_uuid, 16);
-    uint32_t hash_net = htonl(ctx->cfg.raw_hash);
+    uint32_t hash_net = htonl(ctx->cfg.shared_hash);
     memcpy(hello_payload + 16, &hash_net, 4);
 
     msg_header_t hdr;
@@ -257,7 +670,12 @@ static int probe_peer(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t 
     }
 
     if (rx_hdr.status == DSM_ST_CONFIG_MISMATCH) {
-        DSM_LOG_ERR("Rechazado por par: discrepancia en dsm.conf (raw_hash distinto)");
+        char ip_str[INET_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str))) {
+            snprintf(ip_str, sizeof(ip_str), "?");
+        }
+        DSM_LOG_ERR("El par %s rechazó la unión: la configuración compartida "
+                    "difiere (shared_hash distinto)", ip_str);
         close(fd);
         return DSM_ERR_CONFIG;
     }
@@ -295,8 +713,8 @@ static int probe_peer(dsm_ctx_t *ctx, const struct sockaddr_in *addr, welcome_t 
 /*
  * Reclamacion de ranura observada en una pasada de escaneo.
  *
- * 'seen' evita contar dos veces al mismo nodo cuando PEER_HOSTS resuelve varias
- * direcciones al mismo equipo. 'claims' reune la ranura que publica cada par
+ * 'seen' evita contar dos veces al mismo UUID cuando llegan anuncios repetidos
+ * por varias interfaces. 'claims' reune la ranura que publica cada par
  * en su WELCOME: es la vista con la que se decide el desempate por UUID.
  */
 typedef struct {
@@ -304,6 +722,7 @@ typedef struct {
     uint32_t slot;
     uint32_t ip;      /* orden de red */
     uint16_t port;    /* orden de host */
+    uint32_t mem_pages;
 } slot_claim_t;
 
 /* Direccion de escucha de un par descubierto y la ranura que publica. */
@@ -361,9 +780,10 @@ static void discovery_record_claim(dsm_ctx_t *ctx, discovery_walk_t *walk,
 
         slot_claim_t *c = &walk->claims[walk->nclaims++];
         memcpy(c->uuid, m->uuid, 16);
-        c->slot = m->slot;
-        c->ip   = m->ip;
-        c->port = m->port;
+        c->slot      = m->slot;
+        c->ip        = m->ip;
+        c->port      = m->port;
+        c->mem_pages = m->mem_pages;
         return;
     }
 }
@@ -424,98 +844,75 @@ static int discovery_visit_peer(dsm_ctx_t *ctx, const welcome_t *w,
 }
 
 /*
- * Recorre una vez todas las direcciones de PEER_HOSTS y todos los puertos del
- * rango asignado. Cada par que responde se entrega a discovery_visit_peer, de
- * modo que el escaneo completo deja la tabla local fusionada con todos los
- * pares alcanzables y no solo con el primero.
+ * Sondea una vez cada par anunciado por UDP. Cada par que responde se entrega a
+ * discovery_visit_peer, de modo que la pasada deja la tabla local fusionada con
+ * todos los pares descubiertos y no solo con el primero.
  *
- * Un par con la tabla vacia cuenta como par vivo aunque no aporte ninguna
- * reclamacion de ranura: acaba de abrir su listener y publica su reclamo en
- * discovery_join.
+ * El anuncio da la dirección y el puerto TCP; el WELCOME posterior da la
+ * ranura y la membresía. Un par con la tabla vacía cuenta como par vivo aunque
+ * no aporte ninguna reclamación: acaba de abrir su listener y publica su
+ * reclamo en su propia unión.
  */
 static int discovery_walk(dsm_ctx_t *ctx, discovery_walk_t *walk)
 {
-    dsm_config_t *cfg = &ctx->cfg;
-    uint64_t deadline = mono_ms() + cfg->discovery_timeout_ms;
+    uint64_t deadline = mono_ms() + ctx->cfg.discovery_timeout_ms;
+    discovery_peer_t peers[MAX_NODES];
+    uint32_t npeers;
 
-    for (uint32_t h = 0; h < cfg->peer_host_count; h++) {
+    pthread_mutex_lock(&ctx->disc.mu);
+    npeers = ctx->disc.npeers;
+    if (npeers > MAX_NODES) {
+        npeers = MAX_NODES;
+    }
+    memcpy(peers, ctx->disc.peers, (size_t)npeers * sizeof(peers[0]));
+    pthread_mutex_unlock(&ctx->disc.mu);
+
+    for (uint32_t i = 0; i < npeers; i++) {
         if (mono_ms() >= deadline) break;
 
-        struct addrinfo hints;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family   = AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-        hints.ai_flags    = AI_ADDRCONFIG;
+        const discovery_peer_t *p = &peers[i];
+        if (memcmp(p->uuid, ctx->memb.self_uuid, 16) == 0) {
+            continue; /* El loopback del propio anuncio no es un par */
+        }
 
-        struct addrinfo *res = NULL;
-        int gai = getaddrinfo(cfg->peer_hosts[h], NULL, &hints, &res);
-        if (gai != 0 || !res) {
-            if (gai != EAI_NONAME) {
-                DSM_LOG_WARN("No se pudo resolver %s: %s", cfg->peer_hosts[h],
-                             gai_strerror(gai));
-            }
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = p->ip;
+        addr.sin_port        = htons(p->port);
+
+        welcome_t w;
+        int pr = probe_peer(ctx, &addr, &w);
+        if (pr == DSM_ERR_CONFIG) {
+            char text[INET_ADDRSTRLEN];
+            DSM_LOG_ERR("Configuración compartida distinta en el par anunciado %s:%u",
+                        ip_to_text(p->ip, text, sizeof(text)), p->port);
+            return DSM_ERR_CONFIG;
+        }
+        if (pr != DSM_OK) {
             continue;
         }
 
-        for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-            if (mono_ms() >= deadline) break;
-            if (ai->ai_family != AF_INET || !ai->ai_addr) continue;
-
-            struct sockaddr_in sa;
-            memcpy(&sa, ai->ai_addr, sizeof(sa));
-            struct in_addr in = sa.sin_addr;
-
-            for (uint16_t port = cfg->port_min; port <= cfg->port_max; port++) {
-                if (mono_ms() >= deadline) break;
-                if (port == ctx->net.listen_port &&
-                    (in.s_addr == htonl(INADDR_LOOPBACK) || in.s_addr == htonl(INADDR_ANY) ||
-                     (in.s_addr & htonl(0xFF000000)) == htonl(0x7F000000))) {
-                    continue; /* No escanearse a sí mismo en loopback */
-                }
-
-                struct sockaddr_in addr;
-                memset(&addr, 0, sizeof(addr));
-                addr.sin_family = AF_INET;
-                addr.sin_addr   = in;
-                addr.sin_port   = htons(port);
-
-                welcome_t w;
-                int pr = probe_peer(ctx, &addr, &w);
-                if (pr == DSM_ERR_CONFIG) {
-                    DSM_LOG_ERR("probe_peer devolvio DSM_ERR_CONFIG en %s:%u",
-                                cfg->peer_hosts[h], port);
-                    freeaddrinfo(res);
-                    return DSM_ERR_CONFIG;
-                }
-                if (pr != DSM_OK) {
-                    continue;
-                }
-
-                /*
-                 * La membresia identifica a cada nodo por su UUID, de modo que dos
-                 * procesos con el mismo UUID (mismo archivo de identidad, puerto
-                 * distinto) no se pueden distinguir entre si. Ese caso se reporta
-                 * en lugar de ignorar al par: ignorarlo deja a los dos procesos
-                 * creyendose el primer nodo del cluster.
-                 */
-                if (memcmp(w.origin_uuid, ctx->memb.self_uuid, 16) == 0) {
-                    char own_uuid[37];
-                    uuid_to_str(w.origin_uuid, own_uuid);
-                    DSM_LOG_ERR("Otro proceso escucha en %s:%u con el mismo UUID (%s); "
-                                "cada nodo necesita un DSM_NODE_TAG distinto",
-                                cfg->peer_hosts[h], port, own_uuid);
-                    freeaddrinfo(res);
-                    return DSM_ERR_CONFIG;
-                }
-
-                int rc = discovery_visit_peer(ctx, &w, &addr, walk);
-                if (rc != DSM_OK) {
-                    freeaddrinfo(res);
-                    return rc;
-                }
-            }
+        /*
+         * La membresía identifica a cada nodo por su UUID, de modo que dos
+         * procesos con el mismo UUID (mismo archivo de identidad, puerto
+         * distinto) no se pueden distinguir entre sí. Ese caso se reporta en
+         * lugar de ignorar al par: ignorarlo deja a los dos procesos creyéndose
+         * el primer nodo del clúster.
+         */
+        if (memcmp(w.origin_uuid, ctx->memb.self_uuid, 16) == 0) {
+            char own_uuid[37];
+            uuid_to_str(w.origin_uuid, own_uuid);
+            DSM_LOG_ERR("El par anunciado responde con el mismo UUID (%s); "
+                         "cada nodo necesita un DSM_NODE_TAG distinto",
+                         own_uuid);
+            return DSM_ERR_CONFIG;
         }
-        freeaddrinfo(res);
+
+        int rc = discovery_visit_peer(ctx, &w, &addr, walk);
+        if (rc != DSM_OK) {
+            return rc;
+        }
     }
 
     return DSM_OK;
@@ -750,6 +1147,46 @@ static uint32_t membership_self_slot(dsm_ctx_t *ctx)
     return slot;
 }
 
+/* Incorpora la reclamación de un par que ocupa la ranura que este nodo deja
+ * al reubicarse. La reclamación no publica memoria ni estado completo; el
+ * siguiente latido o WELCOME corrige esos campos. */
+static void membership_seed_claim(dsm_ctx_t *ctx, const slot_claim_t *claim)
+{
+    if (!ctx || !claim || claim->slot >= MAX_NODES) return;
+    if (memcmp(claim->uuid, ctx->memb.self_uuid, 16) == 0) return;
+    if (!ip_is_usable(claim->ip) || claim->port == 0) return;
+
+    dsm_membership_t *m = &ctx->memb;
+    uint32_t s = claim->slot;
+    bool inserted = false;
+
+    pthread_rwlock_wrlock(&m->rw);
+    bool present = membership_slot_present(ctx, s);
+    if (!present || memcmp(m->nodes[s].uuid, claim->uuid, 16) == 0) {
+        node_info_t *ni = &m->nodes[s];
+        memcpy(ni->uuid, claim->uuid, 16);
+        ni->slot        = s;
+        ni->ip          = claim->ip;
+        ni->port        = claim->port;
+        ni->state       = DSM_NODE_ALIVE;
+        ni->incarnation = 1;
+        ni->mem_pages   = claim->mem_pages;
+        ni->free_pages  = claim->mem_pages;
+        ni->is_client   = (claim->mem_pages == 0) ? 1u : 0u;
+        ni->last_hb_ms  = mono_ms();
+        ni->joined_ms   = ni->last_hb_ms;
+        ni->missed_hb   = 0;
+        ni->hb_seen     = 0;
+        m->present[s / 8] |= (uint8_t)(1u << (s % 8));
+        inserted = true;
+    }
+    pthread_rwlock_unlock(&m->rw);
+
+    if (inserted) {
+        membership_progress_notify(m);
+    }
+}
+
 /*
  * Ranura que este nodo adopta buscando desde la primera, saltando las que
  * 'rejected' marca como rechazadas por un par confirmado.
@@ -802,7 +1239,15 @@ static uint32_t discovery_pick_slot(dsm_ctx_t *ctx, const discovery_walk_t *walk
 static int discovery_settle(dsm_ctx_t *ctx, discovery_walk_t *walk,
                             uint64_t *max_epoch)
 {
-    uint64_t deadline = mono_ms() + ctx->cfg.discovery_timeout_ms;
+    /* La ventana debe cubrir varios periodos de anuncio: un plazo de sondeo
+     * más corto que la cadencia UDP dejaría al primer nodo creyéndose solo
+     * aunque otro estuviera a punto de anunciarse. */
+    uint64_t window = ctx->cfg.discovery_timeout_ms;
+    uint64_t min_window = 3u * DISCOVERY_ANNOUNCE_MS;
+    if (window < min_window) {
+        window = min_window;
+    }
+    uint64_t deadline = mono_ms() + window;
 
     for (;;) {
         uint64_t mark = membership_progress_mark(&ctx->memb);
@@ -985,7 +1430,11 @@ static int discovery_resolve_slots(dsm_ctx_t *ctx, uint32_t *peers_out)
             return DSM_ERR_NO_SPACE;
         }
         DSM_LOG_INFO("Ranura %u no disponible; se solicita la ranura %u", self, next);
+        const slot_claim_t *vacated = walk_claim_for_slot(&walk, self);
         membership_claim_slot(ctx, next);
+        if (vacated) {
+            membership_seed_claim(ctx, vacated);
+        }
     }
 
     DSM_LOG_ERR("El reparto de ranuras no convergio tras %u vueltas",
@@ -1016,6 +1465,61 @@ static bool membership_has_memory_node(dsm_ctx_t *ctx)
     }
     pthread_rwlock_unlock(&m->rw);
     return found;
+}
+
+/* Con redundancia activa la franja necesita al menos dos custodios de datos y
+ * uno de paridad. La comprobación se hace aquí, cuando la membresía ya existe,
+ * y no en config_validate, que solo ve el archivo.
+ *
+ * La espera no se limita a mirar la tabla: vuelve a escanear a los pares
+ * anunciados y fusiona sus vistas. Un nodo que arranca después del JOIN
+ * original puede así aparecer en esta tabla y completar el mínimo. Solo se
+ * falla cuando el plazo vence sin que existan tres nodos alcanzables. */
+static int discovery_wait_redundancy_members(dsm_ctx_t *ctx)
+{
+    const uint32_t min_nodes = 3u;
+    uint64_t wait_ms = (uint64_t)ctx->cfg.discovery_timeout_ms * 8u;
+    if (wait_ms < 15000u) wait_ms = 15000u;
+    if (wait_ms > 30000u) wait_ms = 30000u;
+
+    uint64_t deadline = mono_ms() + wait_ms;
+    uint64_t max_epoch = atomic_load(&ctx->memb.epoch);
+    uint32_t count = membership_alive_count(ctx);
+
+    while (count < min_nodes) {
+        uint64_t now = mono_ms();
+        if (now >= deadline) break;
+
+        discovery_walk_t walk;
+        uint64_t pass_epoch = max_epoch;
+        if (discovery_pass(ctx, &walk, &pass_epoch) == DSM_OK &&
+            pass_epoch > max_epoch) {
+            max_epoch = pass_epoch;
+        }
+        if (max_epoch > atomic_load(&ctx->memb.epoch)) {
+            atomic_store(&ctx->memb.epoch, max_epoch);
+        }
+
+        count = membership_alive_count(ctx);
+        if (count >= min_nodes) break;
+
+        now = mono_ms();
+        if (now >= deadline) break;
+        uint64_t mark = membership_progress_mark(&ctx->memb);
+        uint64_t wake = now + DISCOVERY_SETTLE_STEP_MS;
+        if (wake > deadline) wake = deadline;
+        membership_progress_wait(&ctx->memb, mark, wake);
+        count = membership_alive_count(ctx);
+    }
+
+    if (count < min_nodes) {
+        DSM_LOG_ERR("REDUNDANCY=true requiere al menos %u nodos vivos que "
+                    "aporten memoria; hay %u tras %llu ms de descubrimiento. "
+                    "El nodo no se une al clúster.",
+                    min_nodes, count, (unsigned long long)wait_ms);
+        return DSM_ERR_CONFIG;
+    }
+    return DSM_OK;
 }
 
 /* Cuerpo de discovery_join, con el cerrojo de descubrimiento ya tomado. */
@@ -1073,13 +1577,21 @@ static int discovery_join_locked(dsm_ctx_t *ctx)
     }
 
     uint32_t peers = walk.peers;
+    uint32_t old_slot = m->self_slot;
     uint32_t slot = discovery_pick_slot(ctx, &walk, NULL);
     if (slot == DSM_SLOT_NONE) {
         DSM_LOG_ERR("No hay slots libres en el cluster");
         return DSM_ERR_NO_SPACE;
     }
-    if (slot != m->self_slot) {
+    if (slot != old_slot) {
+        /* Si la ranura que se abandona estaba ocupada por otro nodo, su
+         * reclamación se conserva. La fusión previa no pudo escribirla porque
+         * coincidía con la ranura propia provisional. */
+        const slot_claim_t *vacated = walk_claim_for_slot(&walk, old_slot);
         membership_claim_slot(ctx, slot);
+        if (vacated) {
+            membership_seed_claim(ctx, vacated);
+        }
     }
 
     /* El hilo de latidos arranca antes de resolver el reparto: la ranura ya
@@ -1135,6 +1647,12 @@ int discovery_join(dsm_ctx_t *ctx)
         return rc;
     }
 
+    /* El descubrimiento UDP arranca junto al listener y sigue anunciando
+     * mientras el nodo está vivo, sin bloquear la aceptación de conexiones. */
+    if ((rc = discovery_mcast_start(ctx)) != DSM_OK) {
+        return rc;
+    }
+
     int lock_fd = discovery_lock_acquire(ctx);
     if (lock_fd < 0) {
         DSM_LOG_WARN("Sin cerrojo de descubrimiento; el reparto depende del desempate por UUID");
@@ -1148,11 +1666,36 @@ int discovery_join(dsm_ctx_t *ctx)
     }
 
     discovery_lock_release(lock_fd);
+
+    /* La espera de miembros y el ajuste de K ocurren sin el cerrojo de
+     * descubrimiento: los demás nodos necesitan tomarlo para completar su
+     * propia unión. */
+    if (rc == DSM_OK && ctx->cfg.redundancy) {
+        rc = discovery_wait_redundancy_members(ctx);
+        if (rc == DSM_OK) {
+            rc = raid_reconfigure(ctx);
+            if (rc != DSM_OK) {
+                DSM_LOG_ERR("No se pudo ajustar la paridad al tamaño del clúster: %s",
+                            dsm_strerror((dsm_status_t)rc));
+            }
+        }
+        if (rc != DSM_OK) {
+            hb_stop(ctx);
+        }
+    }
+
+    /* Un fallo en cualquier fase deja el socket y el hilo UDP cerrados; en el
+     * arranque correcto siguen anunciando hasta discovery_leave. */
+    if (rc != DSM_OK) {
+        discovery_mcast_stop(ctx);
+    }
+
     return rc;
 }
 
 void discovery_leave(dsm_ctx_t *ctx)
 {
+    discovery_mcast_stop(ctx);
     hb_stop(ctx);
 
     dsm_membership_t *m = &ctx->memb;
@@ -1251,6 +1794,20 @@ int membership_init(dsm_ctx_t *ctx)
         pthread_rwlock_destroy(&m->rw);
         return DSM_ERR_MEM;
     }
+    if (pthread_mutex_init(&ctx->disc.mu, NULL) != 0) {
+        pthread_cond_destroy(&m->hb_cv);
+        pthread_mutex_destroy(&m->hb_mu);
+        pthread_cond_destroy(&m->progress_cv);
+        pthread_mutex_destroy(&m->wait_mu);
+        pthread_rwlock_destroy(&m->rw);
+        return DSM_ERR_MEM;
+    }
+    ctx->disc.fd = -1;
+    ctx->disc.npeers = 0;
+    ctx->disc.nconflicts = 0;
+    ctx->disc.multicast = false;
+    ctx->disc.thread_started = false;
+    atomic_store(&ctx->disc.running, false);
     m->self_slot = DSM_SLOT_NONE;
     m->cfg       = &ctx->cfg;
     return DSM_OK;
@@ -1258,6 +1815,8 @@ int membership_init(dsm_ctx_t *ctx)
 
 void membership_destroy(dsm_ctx_t *ctx)
 {
+    discovery_mcast_stop(ctx);
+    pthread_mutex_destroy(&ctx->disc.mu);
     pthread_cond_destroy(&ctx->memb.hb_cv);
     pthread_mutex_destroy(&ctx->memb.hb_mu);
     pthread_cond_destroy(&ctx->memb.progress_cv);
@@ -1408,15 +1967,16 @@ void membership_claim_slot(dsm_ctx_t *ctx, uint32_t slot)
     pthread_rwlock_wrlock(&m->rw);
 
     uint32_t prev = m->self_slot;
-    if (prev < MAX_NODES && prev != slot &&
-        (m->present[prev / 8] & (1u << (prev % 8))) &&
-        memcmp(m->nodes[prev].uuid, m->self_uuid, 16) == 0) {
-        m->nodes[prev].state = DSM_NODE_DEAD;
-        m->present[prev / 8] &= (uint8_t)~(1u << (prev % 8));
-        m->reusable_after_ms[prev] = 0;
-        /* Reubicarse cambia el reparto de la tabla: la vista previa deja de
-         * ser valida y la nueva publicacion debe superar a cualquier epoca
-         * observada. */
+    if (prev < MAX_NODES && prev != slot) {
+        if ((m->present[prev / 8] & (1u << (prev % 8))) &&
+            memcmp(m->nodes[prev].uuid, m->self_uuid, 16) == 0) {
+            m->nodes[prev].state = DSM_NODE_DEAD;
+            m->present[prev / 8] &= (uint8_t)~(1u << (prev % 8));
+            m->reusable_after_ms[prev] = 0;
+        }
+        /* Reubicarse cambia el reparto de la tabla. Si la ranura previa ya
+         * estaba ocupada por un par, su fila se conserva y también debe
+         * avanzar la época para que las vistas anteriores no la pisen. */
         m->epoch++;
     }
 
@@ -1470,6 +2030,23 @@ bool membership_is_alive(dsm_ctx_t *ctx, uint32_t slot)
     return alive;
 }
 
+uint32_t membership_alive_count(dsm_ctx_t *ctx)
+{
+    if (!ctx) return 0;
+    dsm_membership_t *m = &ctx->memb;
+    uint32_t count = 0;
+
+    pthread_rwlock_rdlock(&m->rw);
+    for (uint32_t s = 0; s < MAX_NODES; s++) {
+        if (!membership_slot_present(ctx, s)) continue;
+        if (m->nodes[s].state == DSM_NODE_DEAD) continue;
+        if (m->nodes[s].is_client || m->nodes[s].mem_pages == 0) continue;
+        count++;
+    }
+    pthread_rwlock_unlock(&m->rw);
+    return count;
+}
+
 /*
  * Fusiona la tabla que publico un par en su WELCOME.
  *
@@ -1493,7 +2070,17 @@ void membership_merge_wire(dsm_membership_t *m, const welcome_t *w)
         uint32_t s = wire->slot;
         if (s >= MAX_NODES) continue;
         if (memcmp(wire->uuid, m->self_uuid, 16) == 0) continue;
-        if (s == m->self_slot) continue;
+        if (s == m->self_slot) {
+            /* Una ranura propia provisional puede estar ocupada de hecho por
+             * un nodo que ya la reclamó. Si su UUID es menor, la vista del par
+             * manda y esta fila se reemplaza; así el nodo no pierde al par al
+             * reubicarse. Ya confirmado el reparto, la ranura propia no se
+             * toca. */
+            if (!atomic_load(&m->claim_pending) ||
+                memcmp(m->self_uuid, wire->uuid, 16) < 0) {
+                continue;
+            }
+        }
 
         /* El uuid se reubico: la fila de su ranura previa es una vista vieja. */
         for (uint32_t other = 0; other < MAX_NODES; other++) {
@@ -1540,10 +2127,131 @@ void membership_merge_wire(dsm_membership_t *m, const welcome_t *w)
     pthread_rwlock_unlock(&m->rw);
 }
 
+/*
+ * Replica la tabla de membresía vigente a todos los pares vivos.
+ *
+ * Se usa al aceptar un JOIN y al aprender una ranura por un latido. Sin esta
+ * réplica, solo el nodo que atendió el JOIN incorpora al recién llegado y los
+ * demás siguen con una vista incompleta hasta que su propio escaneo los une.
+ * El mensaje es un WELCOME no solicitado: la tabla es la misma que viaja en el
+ * saludo y el receptor la fusiona con las reglas de siempre.
+ */
+static void membership_replicate(dsm_ctx_t *ctx)
+{
+    if (!ctx) return;
+
+    dsm_membership_t *m = &ctx->memb;
+    welcome_t w;
+    memset(&w, 0, sizeof(w));
+    w.epoch = atomic_load(&m->epoch);
+    memcpy(w.origin_uuid, m->self_uuid, 16);
+
+    uint32_t count = 0;
+    pthread_rwlock_rdlock(&m->rw);
+    for (uint32_t s = 0; s < MAX_NODES; s++) {
+        if (!membership_slot_present(ctx, s)) continue;
+        node_info_t *ni = &m->nodes[s];
+        membership_wire_t *mw = &w.members[count++];
+        memcpy(mw->uuid, ni->uuid, 16);
+        mw->ip          = ni->ip;
+        mw->port        = ni->port;
+        mw->slot        = (uint8_t)s;
+        mw->state       = ni->state;
+        mw->incarnation = ni->incarnation;
+        mw->mem_pages   = ni->mem_pages;
+    }
+    pthread_rwlock_unlock(&m->rw);
+    w.count = count;
+    w.alloc_count = 0;
+
+    uint8_t payload[DSM_WELCOME_WIRE_MAX];
+    size_t len = dsm_pack_welcome(&w, payload, sizeof(payload));
+    if (len == 0) {
+        return;
+    }
+
+    for (uint32_t s = 0; s < MAX_NODES; s++) {
+        if (s == m->self_slot) continue;
+        if (!membership_is_alive(ctx, s)) continue;
+
+        msg_header_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.magic         = DSM_MAGIC;
+        hdr.cluster_id    = ctx->cfg.cluster_id;
+        hdr.proto_version = DSM_PROTO_VERSION;
+        hdr.type          = MSG_WELCOME;
+        hdr.src_slot      = m->self_slot;
+        hdr.dst_slot      = s;
+        hdr.epoch         = w.epoch;
+        hdr.payload_len   = (uint32_t)len;
+        (void)dsm_net_send(ctx, s, &hdr, payload);
+    }
+}
+
+/* WELCOME no solicitado: réplica de membresía de un par. Se fusiona con la
+ * tabla local y se avisa a las esperas de descubrimiento. */
+void membership_on_welcome(dsm_ctx_t *ctx, const dsm_msg_t *m)
+{
+    if (!ctx || !m || !m->payload || m->hdr.payload_len < 32u) {
+        return;
+    }
+
+    welcome_t w;
+    memset(&w, 0, sizeof(w));
+    if (dsm_unpack_welcome((const uint8_t *)m->payload, m->hdr.payload_len,
+                           &w) != DSM_OK) {
+        return;
+    }
+    if (memcmp(w.origin_uuid, ctx->memb.self_uuid, 16) == 0) {
+        return;
+    }
+
+    membership_merge_wire(&ctx->memb, &w);
+    uint64_t epoch = atomic_load(&ctx->memb.epoch);
+    if (w.epoch > epoch) {
+        atomic_store(&ctx->memb.epoch, w.epoch);
+    }
+    membership_progress_notify(&ctx->memb);
+
+    /* La réplica puede incorporar un nodo que aún no estaba en la vista. Con
+     * redundancia activa, el K derivado de la membresía cambia y todas las
+     * vistas deben ajustarlo, no solo la que atendió el JOIN. */
+    if (ctx->cfg.redundancy && ctx->raid.stripes) {
+        int rrc = raid_reconfigure(ctx);
+        if (rrc != DSM_OK) {
+            DSM_LOG_WARN("No se pudo ajustar K tras fusionar la membresía: %s",
+                         dsm_strerror((dsm_status_t)rrc));
+        }
+    }
+}
+
+/* UUID sin inicializar: un latido extendido solo se aprende si trae identidad. */
+static bool membership_uuid_zero(const uint8_t uuid[16])
+{
+    for (uint32_t i = 0; i < 16; i++) {
+        if (uuid[i] != 0) return false;
+    }
+    return true;
+}
+
 void membership_on_heartbeat(dsm_ctx_t *ctx, const dsm_msg_t *m)
 {
     uint32_t s = m->hdr.src_slot;
     if (s >= MAX_NODES || s == ctx->memb.self_slot) return;
+
+    membership_wire_t ident;
+    memset(&ident, 0, sizeof(ident));
+    bool have_ident = false;
+
+    if (m->payload && m->hdr.payload_len >= DSM_HEARTBEAT_ID_WIRE_LEN) {
+        dsm_unpack_membership((const uint8_t *)m->payload +
+                                  DSM_HEARTBEAT_WIRE_LEN,
+                              &ident);
+        have_ident = ident.slot == s && !membership_uuid_zero(ident.uuid) &&
+                     memcmp(ident.uuid, ctx->memb.self_uuid, 16) != 0;
+    }
+
+    bool learned = false;
 
     pthread_rwlock_wrlock(&ctx->memb.rw);
     if (membership_slot_present(ctx, s)) {
@@ -1560,8 +2268,69 @@ void membership_on_heartbeat(dsm_ctx_t *ctx, const dsm_msg_t *m)
             memcpy(&free_p, (const uint8_t *)m->payload + 8, 4);
             ni->free_pages = ntohl(free_p);
         }
+        if (have_ident && memcmp(ni->uuid, ident.uuid, 16) == 0) {
+            /* El latido también refresca la dirección de escucha: el JOIN
+             * pudo llegar antes de que el par publicara su puerto final. */
+            if (ip_replaceable(ni->ip, ident.ip)) {
+                ni->ip = ident.ip;
+            }
+            if (ident.port != 0) {
+                ni->port = ident.port;
+            }
+            ni->mem_pages = ident.mem_pages;
+            ni->is_client = (ident.mem_pages == 0) ? 1u : 0u;
+        }
+    } else if (have_ident) {
+        /* Un latido de una ranura que la tabla no conoce significa que este
+         * nodo se perdió el JOIN original. La identidad viaja en el latido;
+         * se retira cualquier fila vieja del mismo UUID y se incorpora el
+         * nodo en su ranura. */
+        for (uint32_t other = 0; other < MAX_NODES; other++) {
+            if (other == s || other == ctx->memb.self_slot) continue;
+            if (!membership_slot_present(ctx, other)) continue;
+            if (memcmp(ctx->memb.nodes[other].uuid, ident.uuid, 16) != 0) {
+                continue;
+            }
+            ctx->memb.nodes[other].state = DSM_NODE_DEAD;
+            ctx->memb.present[other / 8] &=
+                (uint8_t)~(1u << (other % 8));
+            ctx->memb.reusable_after_ms[other] = 0;
+        }
+
+        node_info_t *ni = &ctx->memb.nodes[s];
+        memcpy(ni->uuid, ident.uuid, 16);
+        ni->slot        = s;
+        ni->ip          = ip_is_usable(ident.ip) ? ident.ip : 0;
+        ni->port        = ident.port;
+        ni->state       = DSM_NODE_ALIVE;
+        ni->incarnation = ident.incarnation;
+        ni->mem_pages   = ident.mem_pages;
+        ni->free_pages  = ident.mem_pages;
+        ni->is_client   = (ident.mem_pages == 0) ? 1u : 0u;
+        ni->last_hb_ms  = mono_ms();
+        ni->joined_ms   = ni->last_hb_ms;
+        ni->missed_hb   = 0;
+        ni->hb_seen     = 1;
+        ctx->memb.present[s / 8] |= (uint8_t)(1u << (s % 8));
+        learned = true;
     }
     pthread_rwlock_unlock(&ctx->memb.rw);
+
+    if (learned) {
+        char uuid_str[37];
+        uuid_to_str(ident.uuid, uuid_str);
+        DSM_LOG_INFO("Latido de una ranura desconocida (%u): se incorpora el "
+                     "nodo %s", s, uuid_str);
+        membership_progress_notify(&ctx->memb);
+        membership_replicate(ctx);
+        if (ctx->cfg.redundancy && ctx->raid.stripes) {
+            int rrc = raid_reconfigure(ctx);
+            if (rrc != DSM_OK) {
+                DSM_LOG_WARN("No se pudo ajustar K tras incorporar el slot %u: %s",
+                             s, dsm_strerror((dsm_status_t)rrc));
+            }
+        }
+    }
 }
 
 /* Responde al solicitante de un JOIN con el rechazo indicado. */
@@ -1699,6 +2468,22 @@ void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd)
         dsm_net_send(ctx, s, &ack_hdr, NULL);
     }
     DSM_LOG_INFO("Nuevo nodo incorporado a la membresia: Slot %u (Port %u)", s, wire.port);
+
+    /* El JOIN solo lo recibió este nodo. Se replica la tabla a los demás
+     * miembros vivos para que el recién llegado aparezca en todas las vistas
+     * sin esperar a que cada uno lo descubra por su cuenta. */
+    membership_replicate(ctx);
+
+    /* Mientras la paridad no tenga contenido, un nodo nuevo cambia el K
+     * derivado de la membresía. Si ya hay franjas escritas, raid_reconfigure
+     * conserva el K con el que se formaron. */
+    if (ctx->cfg.redundancy && ctx->raid.stripes) {
+        int rrc = raid_reconfigure(ctx);
+        if (rrc != DSM_OK) {
+            DSM_LOG_WARN("No se pudo recalcular K tras la unión del slot %u: %s",
+                         s, dsm_strerror((dsm_status_t)rrc));
+        }
+    }
 }
 
 void membership_on_join(dsm_ctx_t *ctx, const dsm_msg_t *m)
@@ -1726,7 +2511,7 @@ void membership_node_down_recover(dsm_ctx_t *ctx, uint32_t slot)
     sync_on_node_down(ctx, slot);
     /* La membresia ya esta cerrada: raid_on_node_down consulta el anillo
      * antes de tomar el mutex de franja, sin invertir el orden de locks. */
-    if (ctx->cfg.redundancy_raid5) {
+    if (ctx->cfg.redundancy) {
         raid_on_node_down(ctx, slot);
     }
 }

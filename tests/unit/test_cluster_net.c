@@ -31,11 +31,10 @@ static void write_node_conf(const char *path, uint16_t port_min, uint16_t port_m
         "VIEW_SIZE           = 4294967296\n"
         "MAX_RUNTIME_NODES   = 256\n"
         "VNODES_PER_MB       = 16\n"
-        "REDUNDANCY          = NONE\n"
+        "REDUNDANCY          = false\n"
         "NODE_MEM            = 268435456\n"
         "PORT_MIN            = %u\n"
         "PORT_MAX            = %u\n"
-        "PEER_HOSTS          = 127.0.0.1\n"
         "CONNECT_TIMEOUT_MS  = 300\n"
         "DISCOVERY_TIMEOUT_MS= 300\n"
         "SEND_TIMEOUT_MS     = 2000\n"
@@ -71,7 +70,7 @@ static void clean_uuid_files(const char *prefix)
  * PRUEBA 1: Descubrimiento y Unión real entre 2 nodos sobre sockets TCP locales
  *           (rango 27600..27699)
  *  - Nodo A (puerto 27600) se reconoce como Slot 0, Epoch 1.
- *  - Nodo B (puerto 27601) escanea el rango, envía HELLO (UUID + raw_hash),
+ *  - Nodo B (puerto 27601) escanea el rango, envía HELLO (UUID + shared_hash),
  *    recibe WELCOME, envía JOIN al Nodo A y es aceptado como Slot 1 con Epoch 2.
  *  - Comprueba en ambos nodos que la membresía refleja 2 nodos vivos (dsm_node_count == 2).
  * ============================================================================
@@ -494,7 +493,7 @@ static int test_cluster_orderly_leave(void)
  * PRUEBA 4: Ciclo de vida API y verificación de métricas y apagado limpio
  *  - Verificación de dsm_node_id(), dsm_node_count(), dsm_global_size(), dsm_stats().
  *  - Verificación de apagado limpio sin fugas de memoria con ASan ni descriptores colgados.
- *  - Verificación de rechazo por discrepancia de configuración (raw_hash).
+ *  - Verificación de rechazo por discrepancia de configuración (shared_hash).
  * ============================================================================
  */
 static int test_cluster_api_lifecycle_and_reject(void)
@@ -534,7 +533,7 @@ static int test_cluster_api_lifecycle_and_reject(void)
     CHECK(stats.write_faults == 0);
     CHECK(dsm_stats(NULL) == DSM_ERR_INVALID);
 
-    /* 5. Verificación de rechazo sobre socket TCP ante raw_hash discordante */
+    /* 5. Verificación de rechazo sobre socket TCP ante shared_hash discordante */
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     REQUIRE(sock >= 0);
 
@@ -546,7 +545,7 @@ static int test_cluster_api_lifecycle_and_reject(void)
 
     REQUIRE(connect(sock, (struct sockaddr *)&sin, sizeof(sin)) == 0);
 
-    /* Enviar HELLO con hash inválido (0xDEADBEEF != raw_hash del cluster) */
+    /* Enviar HELLO con hash inválido (0xDEADBEEF != shared_hash del cluster) */
     uint8_t bad_hello[20];
     memset(bad_hello, 0xFE, 16);
     uint32_t bad_hash = htonl(0xDEADBEEF);

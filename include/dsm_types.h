@@ -46,8 +46,8 @@ typedef enum {
     /**
      * Error de configuración: el archivo dsm.conf no se puede abrir, no es un
      * archivo regular, supera 1 MiB, tiene una línea o clave inválida, un valor
-     * fuera de rango, o el par rechazó la unión por discrepancia de
-     * configuración (raw_hash distinto).
+     * fuera de rango, o el par rechazó la unión por discrepancia de la
+     * configuración compartida (shared_hash distinto).
      */
     DSM_ERR_CONFIG    = -1,
     /** El subsistema no está inicializado: no existe contexto activo en este proceso. */
@@ -181,7 +181,7 @@ typedef enum {
     DSM_ST_SLOT_TAKEN      = 6,
     /** No quedan páginas o ranuras disponibles. */
     DSM_ST_NO_SPACE        = 7,
-    /** El archivo de configuración del par no coincide (raw_hash distinto). */
+    /** La configuración compartida del par no coincide (shared_hash distinto). */
     DSM_ST_CONFIG_MISMATCH = 8,
     /**
      * El dueño de la copia modificada murió antes de devolverla. El estado es

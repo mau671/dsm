@@ -349,8 +349,8 @@ static void report_format_copyset(const uint8_t *copyset, char *buf,
 static uint32_t report_stripe(const dsm_ctx_t *ctx, uint32_t page)
 {
     uint32_t group = ctx->cfg.chunk_pages ? ctx->cfg.chunk_pages : 1u;
-    if (ctx->cfg.redundancy_raid5 && ctx->cfg.raid_k >= 2) {
-        group = ctx->cfg.raid_k;
+    if (ctx->cfg.redundancy) {
+        group = raid_k_effective((dsm_ctx_t *)ctx);
     }
     return page / group;
 }

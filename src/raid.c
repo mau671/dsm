@@ -11,6 +11,24 @@
 #define DSM_RAID_PARITY_ATTEMPTS 3u
 #define DSM_RAID_REBUILD_QUEUE_CAP MAX_NODES
 
+uint32_t raid_k_for_nodes(uint32_t nodes)
+{
+    if (nodes == 0) return 2u;
+    uint32_t k = nodes - 1u;
+    if (k < 2u) k = 2u;
+    if (k > DSM_RAID_MAX_K) k = DSM_RAID_MAX_K;
+    return k;
+}
+
+uint32_t raid_k_effective(dsm_ctx_t *ctx)
+{
+    if (!ctx) return 2u;
+    if (ctx->raid.stripes && ctx->raid.k >= 2u) {
+        return ctx->raid.k;
+    }
+    return raid_k_for_nodes(membership_alive_count(ctx));
+}
+
 /* --- Tabla de solicitudes pendientes ------------------------------------- */
 
 static void raid_pending_clear(raid_pending_t *p)
@@ -166,7 +184,7 @@ static int raid_pending_wait(dsm_ctx_t *ctx, int idx, uint32_t req,
 
 static void raid_stripe_refresh(dsm_ctx_t *ctx, stripe_rt_t *s)
 {
-    uint32_t k = ctx->cfg.raid_k;
+    uint32_t k = raid_k_effective(ctx);
     if (k > DSM_RAID_MAX_K) k = DSM_RAID_MAX_K;
 
     for (uint32_t j = 0; j < DSM_RAID_MAX_K; j++) {
@@ -357,32 +375,32 @@ int raid_init(dsm_ctx_t *ctx)
     rebuild_qtail = 0;
     rebuild_qlen = 0;
 
-    if (!ctx->cfg.redundancy_raid5) return DSM_OK;
+    if (!ctx->cfg.redundancy) return DSM_OK;
 
-    uint32_t k = ctx->cfg.raid_k;
+    uint32_t k = raid_k_for_nodes(membership_alive_count(ctx));
     uint32_t ps = (uint32_t)ctx->mem.page_size;
     uint32_t npages = ctx->mem.npages;
     if (k < 2 || k > DSM_RAID_MAX_K || ps == 0 || npages == 0) {
-        DSM_LOG_WARN("RAID5: configuracion insuficiente; paridad desactivada");
+        DSM_LOG_WARN("Paridad: configuracion insuficiente; redundancia desactivada");
         return DSM_OK;
     }
 
     uint32_t nstripes = npages / k + ((npages % k) != 0 ? 1u : 0u);
     if ((size_t)nstripes > SIZE_MAX / ps) {
-        DSM_LOG_WARN("RAID5: tamano de paridad fuera de rango");
+        DSM_LOG_WARN("Paridad: tamano de paridad fuera de rango");
         return DSM_OK;
     }
 
     r->stripes = calloc(nstripes, sizeof(*r->stripes));
     if (!r->stripes) {
-        DSM_LOG_WARN("RAID5: sin memoria para la tabla de franjas");
+        DSM_LOG_WARN("Paridad: sin memoria para la tabla de franjas");
         return DSM_OK;
     }
     r->parity = calloc(nstripes, sizeof(*r->parity));
     if (!r->parity) {
         free(r->stripes);
         r->stripes = NULL;
-        DSM_LOG_WARN("RAID5: sin memoria para el indice de marcos de paridad");
+        DSM_LOG_WARN("Paridad: sin memoria para el indice de marcos de paridad");
         return DSM_OK;
     }
 
@@ -408,10 +426,94 @@ int raid_init(dsm_ctx_t *ctx)
             s->data_slot[j] = DSM_SLOT_NONE;
         }
     }
-    DSM_LOG_INFO("RAID5: %u franjas de K=%u, indice de %u KiB y marcos de %u "
+    DSM_LOG_INFO("Paridad: %u franjas de K=%u, indice de %u KiB y marcos de %u "
                  "bytes bajo demanda",
                  nstripes, k, (nstripes * (uint32_t)sizeof(uint8_t *)) / 1024u,
                  ps);
+    return DSM_OK;
+}
+
+int raid_reconfigure(dsm_ctx_t *ctx)
+{
+    if (!ctx) return DSM_ERR_INVALID;
+    dsm_raid_t *r = &ctx->raid;
+    if (!ctx->cfg.redundancy) return DSM_OK;
+    if (!r->stripes || !r->parity) return DSM_OK;
+
+    uint32_t ps = (uint32_t)ctx->mem.page_size;
+    uint32_t npages = ctx->mem.npages;
+    uint32_t k = raid_k_for_nodes(membership_alive_count(ctx));
+    if (k == r->k || ps == 0 || npages == 0) return DSM_OK;
+
+    /* Cambiar K reasigna páginas a franjas. Solo es seguro antes de que la
+     * paridad tenga contenido: una vez escrito, la franja conserva su K. */
+    pthread_mutex_lock(&r->mu);
+    bool touched = false;
+    for (uint32_t sid = 0; sid < r->nstripes; sid++) {
+        if (r->stripes[sid].version != 0u || r->parity[sid] != NULL ||
+            r->stripes[sid].state != DSM_STRIPE_ACTIVE) {
+            touched = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&r->mu);
+    if (touched) return DSM_OK;
+
+    uint32_t nstripes = npages / k + ((npages % k) != 0 ? 1u : 0u);
+    stripe_rt_t *stripes = calloc(nstripes, sizeof(*stripes));
+    if (!stripes) return DSM_ERR_MEM;
+    uint8_t **parity = calloc(nstripes, sizeof(*parity));
+    if (!parity) {
+        free(stripes);
+        return DSM_ERR_MEM;
+    }
+
+    for (uint32_t sid = 0; sid < nstripes; sid++) {
+        stripe_rt_t *s = &stripes[sid];
+        s->stripe_id = sid;
+        s->k = k;
+        s->state = DSM_STRIPE_ACTIVE;
+        s->parity_slot = DSM_SLOT_NONE;
+        for (uint32_t j = 0; j < DSM_RAID_MAX_K; j++) {
+            uint32_t page = (j < k) ? (sid * k + j) : DSM_PAGE_ID_NONE;
+            if (page >= npages) page = DSM_PAGE_ID_NONE;
+            s->data_page[j] = page;
+            s->data_slot[j] = DSM_SLOT_NONE;
+        }
+    }
+
+    pthread_mutex_lock(&r->mu);
+    for (uint32_t sid = 0; sid < r->nstripes; sid++) {
+        if (r->stripes[sid].version != 0u || r->parity[sid] != NULL ||
+            r->stripes[sid].state != DSM_STRIPE_ACTIVE) {
+            touched = true;
+            break;
+        }
+    }
+    if (touched) {
+        pthread_mutex_unlock(&r->mu);
+        free(parity);
+        free(stripes);
+        return DSM_OK;
+    }
+
+    stripe_rt_t *old_stripes = r->stripes;
+    uint8_t **old_parity = r->parity;
+    uint32_t old_nstripes = r->nstripes;
+    r->stripes = stripes;
+    r->parity = parity;
+    r->nstripes = nstripes;
+    r->k = k;
+    pthread_mutex_unlock(&r->mu);
+
+    for (uint32_t sid = 0; sid < old_nstripes; sid++) {
+        free(old_parity[sid]);
+    }
+    free(old_parity);
+    free(old_stripes);
+
+    DSM_LOG_INFO("Paridad: K=%u para %u nodos vivos", k,
+                 membership_alive_count(ctx));
     return DSM_OK;
 }
 
@@ -471,10 +573,10 @@ int raid_on_write(dsm_ctx_t *ctx, uint32_t page,
                   const uint8_t *old_data, const uint8_t *new_data)
 {
     if (!ctx || !new_data) return DSM_ERR_INVALID;
-    if (!ctx->cfg.redundancy_raid5) return DSM_OK;
+    if (!ctx->cfg.redundancy) return DSM_OK;
 
     uint32_t ps = (uint32_t)ctx->mem.page_size;
-    uint32_t k = ctx->raid.k;
+    uint32_t k = raid_k_effective(ctx);
     if (ps == 0 || k < 2 || k > DSM_RAID_MAX_K || page >= ctx->mem.npages) {
         return DSM_ERR_INVALID;
     }
@@ -485,7 +587,7 @@ int raid_on_write(dsm_ctx_t *ctx, uint32_t page,
     raid_stripe_sync(ctx, sid, &s);
     if (s.parity_slot == DSM_SLOT_NONE || s.parity_slot >= MAX_NODES ||
         !membership_is_alive(ctx, s.parity_slot)) {
-        DSM_LOG_WARN("RAID5: franja %u sin custodio de paridad; delta omitido", sid);
+        DSM_LOG_WARN("Paridad: franja %u sin custodio de paridad; delta omitido", sid);
         return DSM_ERR_NODE_DOWN;
     }
 
@@ -553,7 +655,7 @@ int raid_on_write(dsm_ctx_t *ctx, uint32_t page,
         int wr = raid_pending_wait(ctx, pidx, req, ctx->cfg.request_timeout_ms,
                                    &status, &applied);
         if (wr != DSM_OK) {
-            DSM_LOG_WARN("RAID5: franja %u sin acuse; se conserva la version %u",
+            DSM_LOG_WARN("Paridad: franja %u sin acuse; se conserva la version %u",
                          sid, version);
             rc = DSM_ERR_TIMEOUT;
             break;
@@ -563,7 +665,7 @@ int raid_on_write(dsm_ctx_t *ctx, uint32_t page,
             break;
         }
         if (status != DSM_ST_BAD_STATE) {
-            DSM_LOG_WARN("RAID5: acuse de paridad de la franja %u rechazado (estado %u)",
+            DSM_LOG_WARN("Paridad: acuse de paridad de la franja %u rechazado (estado %u)",
                          sid, status);
             rc = DSM_ERR_PROTO;
             break;
@@ -575,7 +677,7 @@ int raid_on_write(dsm_ctx_t *ctx, uint32_t page,
          * franja queda sin paridad hasta su reconstruccion. */
         if (applied < prev) {
             raid_version_restore(ctx, sid, version, prev);
-            DSM_LOG_WARN("RAID5: custodio de la franja %u con version %u "
+            DSM_LOG_WARN("Paridad: custodio de la franja %u con version %u "
                          "ante una publicada %u; delta omitido",
                          sid, applied, prev);
             rc = DSM_ERR_PROTO;
@@ -586,13 +688,13 @@ int raid_on_write(dsm_ctx_t *ctx, uint32_t page,
         ctx->raid.stripes[sid].version = applied;
         pthread_mutex_unlock(&ctx->raid.mu);
         if (attempt + 1u < DSM_RAID_PARITY_ATTEMPTS) {
-            DSM_LOG_WARN("RAID5: franja %u con version obsoleta; reenvio con version %u",
+            DSM_LOG_WARN("Paridad: franja %u con version obsoleta; reenvio con version %u",
                          sid, applied + 1u);
         }
     }
 
     if (rc != DSM_OK) {
-        DSM_LOG_WARN("RAID5: no se pudo actualizar la paridad de la franja %u "
+        DSM_LOG_WARN("Paridad: no se pudo actualizar la paridad de la franja %u "
                      "en el slot %u", sid, s.parity_slot);
     }
 
@@ -639,11 +741,11 @@ void raid_on_parity_delta(dsm_ctx_t *ctx, const dsm_msg_t *m)
                  * rechaza con NOT_HOME para que el emisor no reintente
                  * contra este marco. */
                 status = DSM_ST_NOT_HOME;
-                DSM_LOG_WARN("RAID5: delta de la franja %u sobre un marco "
+                DSM_LOG_WARN("Paridad: delta de la franja %u sobre un marco "
                              "sin instalar", sid);
             } else if (m->hdr.data_version != expected) {
                 status = DSM_ST_BAD_STATE;
-                DSM_LOG_WARN("RAID5: delta de la franja %u con version %u, esperada %u",
+                DSM_LOG_WARN("Paridad: delta de la franja %u con version %u, esperada %u",
                              sid, m->hdr.data_version, expected);
             } else {
                 uint8_t *frame = raid_parity_frame_locked(&ctx->raid, sid, true);
@@ -702,7 +804,7 @@ void raid_on_parity_ack(dsm_ctx_t *ctx, const dsm_msg_t *m)
                                   memory_order_relaxed);
     }
     if (m->hdr.status != DSM_ST_OK) {
-        DSM_LOG_WARN("RAID5: acuse de paridad de la franja %u rechazado (estado %u)",
+        DSM_LOG_WARN("Paridad: acuse de paridad de la franja %u rechazado (estado %u)",
                      w.value, m->hdr.status);
     }
 }
@@ -839,7 +941,7 @@ void raid_on_state_report(dsm_ctx_t *ctx, const dsm_msg_t *m)
         ctx->raid.stripes[w.value].state = DSM_STRIPE_DEGRADED;
     }
     pthread_mutex_unlock(&ctx->raid.mu);
-    DSM_LOG_WARN("RAID5: franja %u degradada por caida notificada", w.value);
+    DSM_LOG_WARN("Paridad: franja %u degradada por caida notificada", w.value);
 }
 
 void raid_on_dir_done(dsm_ctx_t *ctx, const dsm_msg_t *m)
@@ -987,7 +1089,7 @@ static void raid_deliver_page(dsm_ctx_t *ctx, uint32_t page, uint32_t home,
             ctx->mem.local[page].state = DSM_PAGE_S;
             dsm_mem_stripe_unlock(&ctx->mem, page);
         } else {
-            DSM_LOG_WARN("RAID5: sin marco para instalar la pagina %u", page);
+            DSM_LOG_WARN("Paridad: sin marco para instalar la pagina %u", page);
         }
     } else {
         uint8_t *wire = malloc(ps);
@@ -999,7 +1101,7 @@ static void raid_deliver_page(dsm_ctx_t *ctx, uint32_t page, uint32_t home,
                                  DSM_ACCESS_READ, DSM_FLAG_HAS_DATA,
                                  wire, (uint32_t)n, &status, NULL, &rx_len);
             if (rc != DSM_OK || status != DSM_ST_OK) {
-                DSM_LOG_WARN("RAID5: traslado de la pagina %u al slot %u fallo (%d/%u)",
+                DSM_LOG_WARN("Paridad: traslado de la pagina %u al slot %u fallo (%d/%u)",
                              page, home, rc, status);
             }
             free(wire);
@@ -1046,7 +1148,7 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
     if (!ctx || slot >= MAX_NODES || !ctx->raid.stripes) return;
 
     uint32_t ps = ctx->raid.page_size;
-    uint32_t k = ctx->raid.k;
+    uint32_t k = raid_k_effective(ctx);
     if (ps == 0 || k < 2u || k > DSM_RAID_MAX_K) return;
 
     for (uint32_t sid = 0; sid < ctx->raid.nstripes; sid++) {
@@ -1103,7 +1205,7 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
             /* La franja perdio su dato y la paridad anterior ya no esta: solo
              * la pagina del nodo caido se perdio de verdad, el resto sigue
              * vivo en sus homes. */
-            DSM_LOG_WARN("RAID5: franja %u sin paridad ni copia del nodo caido", sid);
+            DSM_LOG_WARN("Paridad: franja %u sin paridad ni copia del nodo caido", sid);
             if (old_s.data_page[lost] != DSM_PAGE_ID_NONE) {
                 raid_invalidate_page(ctx, old_s.data_page[lost]);
             }
@@ -1188,7 +1290,7 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
                     break;
                 }
                 if (rx_version != old_s.version) {
-                    DSM_LOG_WARN("RAID5: franja %u, copia del slot %u con version %u "
+                    DSM_LOG_WARN("Paridad: franja %u, copia del slot %u con version %u "
                                  "en lugar de %u; descartada",
                                  sid, srcs[i], rx_version, old_s.version);
                     have = false;
@@ -1249,7 +1351,7 @@ static void raid_rebuild_run(dsm_ctx_t *ctx, uint32_t slot)
             if (!parity_loss && old_s.data_page[lost] != DSM_PAGE_ID_NONE) {
                 raid_invalidate_page(ctx, old_s.data_page[lost]);
             }
-            DSM_LOG_WARN("RAID5: franja %u irrecuperable tras la baja del slot %u",
+            DSM_LOG_WARN("Paridad: franja %u irrecuperable tras la baja del slot %u",
                          sid, slot);
             pthread_mutex_lock(&ctx->raid.mu);
             ctx->raid.stripes[sid].state = DSM_STRIPE_DEGRADED;
@@ -1281,7 +1383,7 @@ static bool raid_rebuild_enqueue(uint32_t slot)
         if (rebuild_queue[idx] == slot) return false;
     }
     if (rebuild_qlen >= DSM_RAID_REBUILD_QUEUE_CAP) {
-        DSM_LOG_WARN("RAID5: cola de reconstruccion llena; baja del slot %u omitida",
+        DSM_LOG_WARN("Paridad: cola de reconstruccion llena; baja del slot %u omitida",
                      slot);
         return false;
     }
@@ -1316,7 +1418,7 @@ static void *raid_rebuild_thread(void *arg)
 
 void raid_on_node_down(dsm_ctx_t *ctx, uint32_t slot)
 {
-    if (!ctx || slot >= MAX_NODES || !ctx->cfg.redundancy_raid5 ||
+    if (!ctx || slot >= MAX_NODES || !ctx->cfg.redundancy ||
         !ctx->raid.stripes) return;
 
     dsm_raid_t *r = &ctx->raid;
@@ -1349,7 +1451,7 @@ void raid_on_node_down(dsm_ctx_t *ctx, uint32_t slot)
         r->rebuild_active = false;
         r->rebuild_pending = (rebuild_qlen > 0);
         pthread_mutex_unlock(&r->rebuild_mu);
-        DSM_LOG_WARN("RAID5: no se pudo iniciar el hilo de reconstruccion (%d)", rc);
+        DSM_LOG_WARN("Paridad: no se pudo iniciar el hilo de reconstruccion (%d)", rc);
         return;
     }
     pthread_mutex_unlock(&r->rebuild_mu);

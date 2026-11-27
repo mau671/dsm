@@ -68,6 +68,43 @@ typedef struct {
     pthread_cond_t   hb_cv;
 } dsm_membership_t;
 
+/* Par anunciado por UDP. La IP está en orden de red y el puerto en orden de
+ * host; 'slot' es informativo, la ranura autoritativa llega en el WELCOME. */
+typedef struct {
+    uint8_t  uuid[16];
+    char     name[32];
+    uint32_t ip;
+    uint16_t port;
+    uint32_t mem_pages;
+    uint32_t slot;
+    uint8_t  role;
+    uint64_t last_seen_ms;
+} discovery_peer_t;
+
+/* Par que anunció una configuración compartida distinta. Se conserva para
+ * emitir un aviso claro sin repetirlo en cada anuncio. */
+typedef struct {
+    uint8_t  uuid[16];
+    uint64_t last_warn_ms;
+} discovery_conflict_t;
+
+/* Estado del descubrimiento UDP, separado del listener TCP. El hilo propio
+ * emite anuncios y atiende los de los demás sin bloquear la aceptación de
+ * conexiones. */
+typedef struct {
+    int             fd;
+    pthread_t       thread;
+    atomic_bool     running;
+    bool            thread_started;
+    uint32_t        mcast_if;   /* interfaz del grupo, orden de red */
+    bool            multicast;
+    pthread_mutex_t mu;
+    discovery_peer_t peers[MAX_NODES];
+    uint32_t         npeers;
+    discovery_conflict_t conflicts[MAX_NODES];
+    uint32_t             nconflicts;
+} dsm_discovery_t;
+
 /* Forward declaration del contexto global */
 struct dsm_ctx;
 typedef struct dsm_ctx dsm_ctx_t;
@@ -79,6 +116,14 @@ int  discovery_bind_first_free(dsm_ctx_t *ctx);
 int  discovery_scan(dsm_ctx_t *ctx, welcome_t *out);
 int  discovery_join(dsm_ctx_t *ctx);
 void discovery_leave(dsm_ctx_t *ctx);
+
+/* Abre el socket UDP, se une al grupo o prepara el respaldo broadcast y arranca
+ * el hilo de anuncios. Se llama después de abrir el listener TCP. */
+int  discovery_mcast_start(dsm_ctx_t *ctx);
+/* Detiene el hilo, cierra el socket y libera la tabla de pares anunciados. Es
+ * idempotente y se invoca desde discovery_leave y desde la destrucción de la
+ * membresía. */
+void discovery_mcast_stop(dsm_ctx_t *ctx);
 
 /* --- Gestión de tabla de membresía --- */
 
@@ -93,6 +138,7 @@ uint32_t membership_first_free_slot(dsm_ctx_t *ctx);
 uint32_t membership_next_free_slot(dsm_ctx_t *ctx, uint32_t from);
 
 void membership_on_heartbeat(dsm_ctx_t *ctx, const dsm_msg_t *m);
+void membership_on_welcome(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void membership_on_join(dsm_ctx_t *ctx, const dsm_msg_t *m);
 void membership_on_join_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd);
 void membership_on_join_ack(dsm_ctx_t *ctx, const dsm_msg_t *m);
@@ -112,6 +158,8 @@ void membership_handle_query_fd(dsm_ctx_t *ctx, const dsm_msg_t *m, int cfd);
 void membership_merge_wire(dsm_membership_t *m, const welcome_t *w);
 bool membership_is_alive(dsm_ctx_t *ctx, uint32_t slot);
 bool membership_slot_present(dsm_ctx_t *ctx, uint32_t slot);
+/* Cantidad de miembros presentes, no muertos y que aportan memoria. */
+uint32_t membership_alive_count(dsm_ctx_t *ctx);
 void membership_evaluate(dsm_ctx_t *ctx, uint64_t now_ms);
 uint32_t membership_total_pages(dsm_ctx_t *ctx);
 

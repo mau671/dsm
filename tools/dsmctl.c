@@ -692,12 +692,10 @@ static int cmd_config(const cli_opts_t *opts, const dsm_config_t *cfg)
     printf("  Nodos máximos en ejecución         : %u\n", cfg->max_runtime_nodes);
     printf("  Nodos virtuales por MiB            : %u\n", cfg->vnodes_per_mb);
     printf("  Redundancia                        : %s\n",
-           cfg->redundancy_raid5 ? "RAID5" : "NONE");
+           cfg->redundancy ? "true" : "false");
     printf("  Rango de puertos                   : %u - %u\n", cfg->port_min, cfg->port_max);
-    printf("  Equipos vecinos                    : %u\n", cfg->peer_host_count);
-    for (uint32_t i = 0; i < cfg->peer_host_count; i++) {
-        printf("    [%u] %s\n", i, cfg->peer_hosts[i]);
-    }
+    printf("  Grupo de descubrimiento            : 0x%08X\n", cfg->discovery_group);
+    printf("  Puerto de descubrimiento           : %u\n", cfg->discovery_port);
     printf("  Conexión                           : %u ms\n", cfg->connect_timeout_ms);
     printf("  Descubrimiento                     : %u ms\n", cfg->discovery_timeout_ms);
     printf("  Envío                              : %u ms\n", cfg->send_timeout_ms);
@@ -714,7 +712,7 @@ static int cmd_config(const cli_opts_t *opts, const dsm_config_t *cfg)
     printf("  Plazo de cerrojo                   : %u ms\n", cfg->lock_timeout_ms);
     printf("  Capacidad de cola de trabajadores  : %u\n", cfg->worker_queue_cap);
     printf("  Nivel de registro DSM              : %s\n", cfg->log_level);
-    printf("  Hash bruto                         : 0x%08X\n", cfg->raw_hash);
+    printf("  Hash de configuración compartida   : 0x%08X\n", cfg->shared_hash);
 
     if (opts->port_set && opts->port != cfg->port_min) {
         printf("\nAviso: se consulta el puerto %u, fuera del rango %u-%u "

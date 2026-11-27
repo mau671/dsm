@@ -1536,19 +1536,7 @@ dsm_status_t dsm_node_count(uint32_t *out)
     if (!ctx) return DSM_ERR_NOT_INIT;
     if (!out) return DSM_ERR_INVALID;
 
-    uint32_t count = 0;
-    pthread_rwlock_rdlock(&ctx->memb.rw);
-    for (uint32_t s = 0; s < MAX_NODES; s++) {
-        if (!membership_slot_present(ctx, s)) continue;
-        if (ctx->memb.nodes[s].state == DSM_NODE_DEAD) continue;
-        /* Un cliente usa la memoria del cluster pero no la aporta: no cuenta
-         * como nodo del cluster en las consultas. */
-        if (ctx->memb.nodes[s].is_client || ctx->memb.nodes[s].mem_pages == 0) continue;
-        count++;
-    }
-    pthread_rwlock_unlock(&ctx->memb.rw);
-
-    *out = count;
+    *out = membership_alive_count(ctx);
     return DSM_OK;
 }
 

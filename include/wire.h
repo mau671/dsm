@@ -128,6 +128,30 @@ typedef struct {
 } membership_wire_t;
 
 #define DSM_MEMBERSHIP_WIRE_LEN 36u
+/* Latido base: incarnation[8] + free_pages[4]. La variante extendida añade una
+ * membresía completa para que un receptor que no conoce la ranura pueda
+ * incorporar al nodo sin esperar otro JOIN. */
+#define DSM_HEARTBEAT_WIRE_LEN     12u
+#define DSM_HEARTBEAT_ID_WIRE_LEN  (DSM_HEARTBEAT_WIRE_LEN + DSM_MEMBERSHIP_WIRE_LEN)
+
+/* Anuncio UDP de descubrimiento: 80 B exactos en el cable. Todos los campos se
+ * serializan por separado; la estructura en memoria nunca viaja tal cual. */
+typedef struct {
+    uint32_t magic;
+    uint16_t proto_version;
+    uint32_t cluster_id;
+    uint32_t shared_hash;
+    uint8_t  uuid[16];
+    uint8_t  name[32];
+    uint32_t ip;          /* orden de red */
+    uint16_t port;        /* orden de host */
+    uint32_t mem_pages;
+    uint32_t slot;
+    uint8_t  role;        /* 0 nodo con memoria, 1 cliente */
+    uint8_t  reserved[3];
+} discovery_wire_t;
+
+#define DSM_DISCOVERY_WIRE_LEN 80u
 
 typedef struct {                 /* 24 B */
     uint32_t alloc_id;
@@ -419,6 +443,7 @@ typedef struct {
 _Static_assert(sizeof(msg_header_t)  == 64, "msg_header_t debe ser 64 B");
 _Static_assert(_Alignof(msg_header_t) == 8,  "msg_header_t debe alinear a 8");
 _Static_assert(sizeof(membership_wire_t) == 40, "membership_wire_t en memoria debe ser 40 B");
+_Static_assert(DSM_DISCOVERY_WIRE_LEN == 80u, "el anuncio de descubrimiento debe ser 80 B");
 _Static_assert(sizeof(alloc_rec_t)  == 24, "alloc_rec_t debe ser 24 B");
 _Static_assert(sizeof(dir_entry_t)  == 72, "dir_entry_t debe ser 72 B");
 _Static_assert(DSM_DIST_RUN_WIRE_LEN == 48u, "DIST_RUN debe ser 48 B en el cable");
@@ -472,6 +497,9 @@ bool wire_payload_ok(uint16_t type, uint8_t flags, uint32_t len, uint32_t page_s
 /* Empaquetado de cargas fijas */
 size_t dsm_pack_membership(const membership_wire_t *m, uint8_t out[DSM_MEMBERSHIP_WIRE_LEN]);
 void   dsm_unpack_membership(const uint8_t in[DSM_MEMBERSHIP_WIRE_LEN], membership_wire_t *m);
+
+size_t dsm_pack_discovery(const discovery_wire_t *d, uint8_t out[DSM_DISCOVERY_WIRE_LEN]);
+void   dsm_unpack_discovery(const uint8_t in[DSM_DISCOVERY_WIRE_LEN], discovery_wire_t *d);
 
 size_t dsm_pack_alloc_rec(const alloc_rec_t *a, uint8_t out[DSM_ALLOC_REC_LEN]);
 void   dsm_unpack_alloc_rec(const uint8_t in[DSM_ALLOC_REC_LEN], alloc_rec_t *a);

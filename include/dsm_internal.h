@@ -109,6 +109,7 @@ typedef struct dsm_ctx {
     dsm_config_t      cfg;
     dsm_mem_t         mem;
     dsm_membership_t  memb;
+    dsm_discovery_t   disc;
     dsm_net_t         net;
     dsm_msi_t         msi;
     dsm_sync_t        sync;

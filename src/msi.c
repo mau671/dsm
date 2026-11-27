@@ -303,14 +303,14 @@ static bool page_can_serve(dsm_ctx_t *ctx, uint32_t page, void *buf)
     return dsm_mem_backing_load(&ctx->mem, page, buf) == DSM_OK;
 }
 
-/* Persiste el contenido vigente de una página custodiada y, con RAID5 activo,
- * emite el delta de paridad contra el respaldo previo: una página nunca
+/* Persiste el contenido vigente de una página custodiada y, con redundancia
+ * activa, emite el delta de paridad contra el respaldo previo: una página nunca
  * persistida cuenta como ceros. Cuando el contenido no cambia respecto del
  * respaldo no se genera delta, que seria un XOR de ceros. */
 static int home_persist_delta(dsm_ctx_t *ctx, uint32_t page, const void *data)
 {
     uint8_t *old = NULL;
-    if (ctx->cfg.redundancy_raid5) {
+    if (ctx->cfg.redundancy) {
         old = malloc(ctx->mem.page_size);
         if (old && dsm_mem_backing_load(&ctx->mem, page, old) != DSM_OK) {
             memset(old, 0, ctx->mem.page_size);
@@ -321,7 +321,7 @@ static int home_persist_delta(dsm_ctx_t *ctx, uint32_t page, const void *data)
     if (rc == DSM_OK && old &&
         memcmp(old, data, ctx->mem.page_size) != 0) {
         (void)raid_on_write(ctx, page, old, data);
-    } else if (rc == DSM_OK && !old && ctx->cfg.redundancy_raid5) {
+    } else if (rc == DSM_OK && !old && ctx->cfg.redundancy) {
         DSM_LOG_WARN("Sin memoria para el delta de paridad de la pagina %u", page);
     }
     free(old);

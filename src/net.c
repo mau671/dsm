@@ -250,9 +250,10 @@ static void *listener_thread_main(void *arg)
                 memcpy(&peer_hash, hello_payload + 16, 4);
                 peer_hash = ntohl(peer_hash);
 
-                /* El HELLO identifica al par y trae su hash de configuracion.
-                 * La IP que se publica en el WELCOME es la observada en este
-                 * socket, no una direccion inventada. */
+                /* El HELLO identifica al par y trae el hash de su
+                 * configuración compartida. La IP que se publica en el
+                 * WELCOME es la observada en este socket, no una dirección
+                 * inventada. */
                 membership_observe_self_ip(ctx, socket_endpoint_ip(cfd, false));
                 membership_observe_peer_ip(ctx, hello_payload,
                                            socket_endpoint_ip(cfd, true));
@@ -295,7 +296,7 @@ static void *listener_thread_main(void *arg)
                 resp_hdr.cluster_id    = ctx->cfg.cluster_id;
                 resp_hdr.proto_version = DSM_PROTO_VERSION;
                 resp_hdr.type          = MSG_WELCOME;
-                resp_hdr.status        = (peer_hash == ctx->cfg.raw_hash) ? DSM_ST_OK
+                resp_hdr.status        = (peer_hash == ctx->cfg.shared_hash) ? DSM_ST_OK
                                                                           : DSM_ST_CONFIG_MISMATCH;
                 if (wlen == 0) {
                     /* El empaquetado no cabe ni en el peor caso: un aviso
@@ -642,13 +643,32 @@ int net_send_heartbeat(dsm_ctx_t *ctx, uint32_t dst, uint32_t free_pages)
     hdr.src_slot      = ctx->memb.self_slot;
     hdr.dst_slot      = dst;
     hdr.epoch         = atomic_load(&ctx->memb.epoch);
-    hdr.payload_len   = 12;
+    hdr.payload_len   = DSM_HEARTBEAT_ID_WIRE_LEN;
 
-    uint8_t payload[12];
+    uint8_t payload[DSM_HEARTBEAT_ID_WIRE_LEN];
     uint64_t inc_net = dsm_htonll(1);
     uint32_t fp_net  = htonl(free_pages);
     memcpy(payload, &inc_net, 8);
     memcpy(payload + 8, &fp_net, 4);
+
+    /* La membresía del emisor viaja tras la cabecera del latido. Un receptor
+     * que no recibió el JOIN original puede incorporar la ranura desde aquí y
+     * pedir una vista completa en su siguiente pasada de descubrimiento. */
+    membership_wire_t self;
+    memset(&self, 0, sizeof(self));
+    memcpy(self.uuid, ctx->memb.self_uuid, 16);
+    pthread_rwlock_rdlock(&ctx->memb.rw);
+    self.slot = (uint8_t)ctx->memb.self_slot;
+    self.ip   = ctx->memb.self_ip ? ctx->memb.self_ip
+                                  : htonl(INADDR_LOOPBACK);
+    pthread_rwlock_unlock(&ctx->memb.rw);
+    self.port        = ctx->net.listen_port;
+    self.state       = DSM_NODE_ALIVE;
+    self.incarnation = 1;
+    uint32_t ps = ctx->cfg.page_size ? ctx->cfg.page_size : 4096u;
+    self.mem_pages = ctx->cfg.client_mode ? 0u
+                                          : (uint32_t)(ctx->cfg.node_mem / ps);
+    dsm_pack_membership(&self, payload + DSM_HEARTBEAT_WIRE_LEN);
 
     return dsm_net_send(ctx, dst, &hdr, payload);
 }

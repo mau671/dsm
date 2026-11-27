@@ -5,9 +5,6 @@
 #include <stdbool.h>
 #include "dsm_types.h"
 
-#define DSM_MAX_PEER_HOSTS 16
-#define DSM_MAX_HOST_LEN   256
-
 /* Tope de intentos de una RPC de pagina. Acota el peor caso de una falla de
  * pagina: (intentos - 1) esperas de backoff mas un plazo de espera cada una. */
 #define DSM_MAX_REQUEST_RETRIES 10u
@@ -31,14 +28,13 @@ typedef struct dsm_config {
     uint64_t node_mem;
     uint32_t max_runtime_nodes;
     uint32_t vnodes_per_mb;
-    bool     redundancy_raid5;
-    uint32_t raid_k;
+    bool     redundancy;
     uint32_t chunk_pages;
 
     uint16_t port_min;
     uint16_t port_max;
-    char     peer_hosts[DSM_MAX_PEER_HOSTS][DSM_MAX_HOST_LEN];
-    uint32_t peer_host_count;
+    uint32_t discovery_group;   /* IPv4 en orden de host */
+    uint16_t discovery_port;
 
     uint32_t connect_timeout_ms;
     uint32_t discovery_timeout_ms;
@@ -69,12 +65,14 @@ typedef struct dsm_config {
      * sin aportar memoria ni custodiar páginas. */
     bool     client_mode;
 
-    /* Hash CRC32 del archivo original para validar consistencia entre nodos */
-    uint32_t raw_hash;
+    /* CRC32 del subconjunto canónico de claves que deben coincidir entre
+     * nodos. NODE_MEM y los parámetros locales quedan fuera. */
+    uint32_t shared_hash;
 } dsm_config_t;
 
 /**
- * Carga un archivo de configuración dsm.conf, calcula su raw_hash y valida campos.
+ * Carga un archivo de configuración dsm.conf, calcula su shared_hash y valida
+ * los campos.
  * @param cfg Estructura de configuración a rellenar.
  * @param path Ruta al archivo (NULL para "dsm.conf").
  * @return DSM_OK en éxito, DSM_ERR_CONFIG o DSM_ERR_MEM en fallo.

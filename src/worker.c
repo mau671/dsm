@@ -243,7 +243,9 @@ static void *worker_thread_main(void *arg)
             dsm_free_on_request(ctx, &item->msg);
             break;
         case MSG_WELCOME:
-            /* WELCOME no solicitado: réplica del mapa global del coordinador. */
+            /* WELCOME no solicitado: réplica de membresía y del mapa global
+             * del coordinador. */
+            membership_on_welcome(ctx, &item->msg);
             dsm_alloc_on_welcome(ctx, &item->msg);
             break;
         case MSG_ALLOC_SYNC:

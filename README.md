@@ -30,8 +30,24 @@ DSM_NODE_TAG=n1 ./build/bin/release/dsm dsm.conf   # terminal 1
 DSM_NODE_TAG=n2 ./build/bin/release/dsm dsm.conf   # terminal 2
 ```
 
-El primero asume la ranura 0 y el segundo lo descubre por TCP y se une. Cada nodo toma el
-primer puerto libre del bloque 27600–27699.
+Cada nodo anuncia su nombre, IP, puerto TCP y rol por UDP en el grupo multicast
+`239.255.42.99:27699`, con broadcast como respaldo. El primero asume la ranura 0 y el
+segundo lo descubre, hace `JOIN` por TCP y se une. Cada nodo toma el primer puerto libre
+del bloque 27600–27699. No hay lista de equipos: basta el mismo `dsm.conf` en cada PC y
+un `DSM_NODE_TAG` distinto por proceso.
+
+### Configuración por PC
+
+Cada PC lleva su propio `dsm.conf`. `NODE_MEM` es local y puede variar entre nodos; las
+claves de identidad del clúster (`CLUSTER_ID`, `PAGE_SIZE`, `BASE_ADDR`, `VIEW_SIZE`,
+rango de puertos, grupo y puerto de descubrimiento, `VNODES_PER_MB`, `HOME_SLACK` y
+`REDUNDANCY`) deben coincidir. El nodo resume esas claves en un hash compartido que viaja
+en el saludo: dos archivos con distinto `NODE_MEM` se aceptan, uno con distinto
+`CLUSTER_ID` se rechaza.
+
+`REDUNDANCY = true` activa la paridad y exige al menos tres nodos vivos que aporten
+memoria. El número de páginas de datos por franja se deriva de la membresía,
+`K = nodos vivos - 1`, acotado entre 2 y 8. Con `REDUNDANCY = false` no se forma paridad.
 
 ### Nodos y clientes
 
@@ -92,7 +108,17 @@ ninguna, así que ejecutarlas no agrega un nodo. Solo necesitan un clúster en m
 # Autómata de Conway sembrado con una fotografía real de 192 x 192
 ./build/bin/release/juego_vida --imagen datos/tablero_192.gray 192 192 30 4
 ./build/bin/release/juego_vida --imagen datos/tablero_192.gray --verificar 192 192 30 4
+
+# Multiplicación de matrices cuadradas sobre la vista distribuida
+./build/bin/release/matmul_dsm 256 --hilos 4
+./build/bin/release/matmul_dsm 256 --conf dsm.conf --hilos 8
 ```
+
+`matmul_dsm` reserva A, B y C con `dsm_alloc`, llena A y B con un patrón determinista,
+reparte las filas de C entre los hilos y llama a `dsm_sync`. Después calcula el checksum
+de C y lo compara elemento por elemento contra una referencia secuencial en memoria local,
+e imprime `VERIFICACION: OK` o `VERIFICACION: FALLO`. `N` vale 256 por defecto y cada
+matriz ocupa `N² × 8 B`: con 256 son 0.5 MiB por matriz y con 2048, 32 MiB por matriz.
 
 Los archivos de `datos/` son material real versionado en el repositorio, no datos
 sintéticos generados al vuelo: un video y una fotografía convertidos con `ffmpeg`. Para
@@ -176,9 +202,9 @@ make test-e2e    # escenarios con procesos reales por la API pública
 ```
 include/     cabeceras; dsm.h es la única que una aplicación necesita
 src/         núcleo: config, wire, net, util, discovery, mem, msi, ring, raid, dist, report, sigsegv, sync, worker
-apps/        dsm (nodo), test_basico, filtro_video, juego_vida, dsm_dist_demo, dsm_raid_demo
+apps/        dsm (nodo), test_basico, filtro_video, juego_vida, dsm_dist_demo, dsm_raid_demo, matmul_dsm
 tools/       dsmctl y video_pack
-tests/       unit/ y e2e/ (flujo MSI, ejecución distribuida y RAID5)
+tests/       unit/ y e2e/ (flujo MSI, ejecución distribuida y reconstrucción con paridad)
 docs/        API.md e informes compilados
 datos/       video y fotografía reales para las aplicaciones de prueba
 ```

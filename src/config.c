@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
 
 /* Recorta espacios en blanco al inicio y al final de una cadena en sitio */
 static char *trim_whitespace(char *str)
@@ -131,24 +132,29 @@ static int parse_slack_permille(const char *s, uint32_t *out)
     return 0;
 }
 
-/* Parsea lista de hosts separados por coma */
-static int parse_hosts(char *val_str, dsm_config_t *cfg)
+/* Parsea un booleano en las formas true/false y 1/0. */
+static int parse_bool(const char *val_str, bool *out)
 {
-    cfg->peer_host_count = 0;
-    char *token = strtok(val_str, ",");
-    while (token) {
-        char *h = trim_whitespace(token);
-        if (*h != '\0') {
-            if (cfg->peer_host_count >= DSM_MAX_PEER_HOSTS) {
-                return -1;
-            }
-            strncpy(cfg->peer_hosts[cfg->peer_host_count], h, DSM_MAX_HOST_LEN - 1);
-            cfg->peer_hosts[cfg->peer_host_count][DSM_MAX_HOST_LEN - 1] = '\0';
-            cfg->peer_host_count++;
-        }
-        token = strtok(NULL, ",");
+    if (!val_str) return -1;
+    if (strcasecmp(val_str, "true") == 0 || strcmp(val_str, "1") == 0) {
+        *out = true;
+        return 0;
     }
-    return (cfg->peer_host_count > 0) ? 0 : -1;
+    if (strcasecmp(val_str, "false") == 0 || strcmp(val_str, "0") == 0) {
+        *out = false;
+        return 0;
+    }
+    return -1;
+}
+
+/* Parsea una dirección IPv4 y la devuelve en orden de host. */
+static int parse_ipv4(const char *val_str, uint32_t *out)
+{
+    if (!val_str || *val_str == '\0') return -1;
+    struct in_addr addr;
+    if (inet_pton(AF_INET, val_str, &addr) != 1) return -1;
+    *out = ntohl(addr.s_addr);
+    return 0;
 }
 
 /* Máscara de bits para detectar claves duplicadas. Los bits son consecutivos:
@@ -165,32 +171,66 @@ static int parse_hosts(char *val_str, dsm_config_t *cfg)
 #define KEY_REDUNDANCY          (1ULL << 8)
 #define KEY_PORT_MIN            (1ULL << 9)
 #define KEY_PORT_MAX            (1ULL << 10)
-#define KEY_PEER_HOSTS          (1ULL << 11)
-#define KEY_CONNECT_TIMEOUT_MS  (1ULL << 12)
-#define KEY_DISCOVERY_TIMEOUT_MS (1ULL << 13)
-#define KEY_SEND_TIMEOUT_MS     (1ULL << 14)
-#define KEY_REQUEST_TIMEOUT_MS  (1ULL << 15)
-#define KEY_REQUEST_RETRIES     (1ULL << 16)
-#define KEY_RECONNECT_MIN_MS    (1ULL << 17)
-#define KEY_RECONNECT_MAX_MS    (1ULL << 18)
-#define KEY_HB_INTERVAL_MS      (1ULL << 19)
-#define KEY_HB_SUSPECT          (1ULL << 20)
-#define KEY_HB_DEAD             (1ULL << 21)
-#define KEY_WORKER_THREADS      (1ULL << 22)
-#define KEY_DISPATCHER_THREADS  (1ULL << 23)
-#define KEY_PAGE_LOCK_STRIPES   (1ULL << 24)
-#define KEY_HOME_SLACK          (1ULL << 25)
-#define KEY_LOCK_TIMEOUT_MS     (1ULL << 26)
-#define KEY_WORKER_QUEUE_CAP    (1ULL << 27)
-#define KEY_LOG_LEVEL           (1ULL << 28)
-#define KEY_RAID_K              (1ULL << 29)
-#define KEY_CHUNK_PAGES         (1ULL << 30)
-#define KEY_WAIT_POOL_ENTRIES   (1ULL << 31)
-#define KEY_OUTPUT_DIR          (1ULL << 32)
-#define KEY_DIST_TIMEOUT_MS     (1ULL << 33)
+#define KEY_CONNECT_TIMEOUT_MS  (1ULL << 11)
+#define KEY_DISCOVERY_TIMEOUT_MS (1ULL << 12)
+#define KEY_SEND_TIMEOUT_MS     (1ULL << 13)
+#define KEY_REQUEST_TIMEOUT_MS  (1ULL << 14)
+#define KEY_REQUEST_RETRIES     (1ULL << 15)
+#define KEY_RECONNECT_MIN_MS    (1ULL << 16)
+#define KEY_RECONNECT_MAX_MS    (1ULL << 17)
+#define KEY_HB_INTERVAL_MS      (1ULL << 18)
+#define KEY_HB_SUSPECT          (1ULL << 19)
+#define KEY_HB_DEAD             (1ULL << 20)
+#define KEY_WORKER_THREADS      (1ULL << 21)
+#define KEY_DISPATCHER_THREADS  (1ULL << 22)
+#define KEY_PAGE_LOCK_STRIPES   (1ULL << 23)
+#define KEY_HOME_SLACK          (1ULL << 24)
+#define KEY_LOCK_TIMEOUT_MS     (1ULL << 25)
+#define KEY_WORKER_QUEUE_CAP    (1ULL << 26)
+#define KEY_LOG_LEVEL           (1ULL << 27)
+#define KEY_CHUNK_PAGES         (1ULL << 28)
+#define KEY_WAIT_POOL_ENTRIES   (1ULL << 29)
+#define KEY_OUTPUT_DIR          (1ULL << 30)
+#define KEY_DIST_TIMEOUT_MS     (1ULL << 31)
+#define KEY_DISCOVERY_GROUP     (1ULL << 32)
+#define KEY_DISCOVERY_PORT      (1ULL << 33)
 
 /* Rol del proceso segun DSM_NODE_MODE; se aplica despues de leer el archivo. */
 static int config_load_mode(dsm_config_t *cfg);
+
+/* Serializa solo las claves que deben coincidir en todos los nodos. El orden
+ * es fijo y cada valor ocupa un ancho constante, de modo que dos archivos con
+ * los mismos valores compartidos producen el mismo CRC32 aunque difieran en
+ * NODE_MEM, rutas, hilos o temporizaciones locales. */
+static uint32_t config_shared_hash(const dsm_config_t *cfg)
+{
+    char canon[512];
+    int n = snprintf(canon, sizeof(canon),
+                     "CLUSTER_ID=%08X;"
+                     "PAGE_SIZE=%u;"
+                     "BASE_ADDR=%016llX;"
+                     "VIEW_SIZE=%016llX;"
+                     "PORT_MIN=%u;"
+                     "PORT_MAX=%u;"
+                     "DISCOVERY_GROUP=%08X;"
+                     "DISCOVERY_PORT=%u;"
+                     "VNODES_PER_MB=%u;"
+                     "HOME_SLACK=%u;"
+                     "REDUNDANCY=%u;",
+                     cfg->cluster_id,
+                     cfg->page_size,
+                     (unsigned long long)cfg->base_addr,
+                     (unsigned long long)cfg->view_size,
+                     cfg->port_min,
+                     cfg->port_max,
+                     cfg->discovery_group,
+                     cfg->discovery_port,
+                     cfg->vnodes_per_mb,
+                     cfg->home_slack_permille,
+                     cfg->redundancy ? 1u : 0u);
+    if (n <= 0 || (size_t)n >= sizeof(canon)) return 0;
+    return dsm_crc32(0, (const uint8_t *)canon, (size_t)n);
+}
 
 int config_load(dsm_config_t *cfg, const char *path)
 {
@@ -208,11 +248,12 @@ int config_load(dsm_config_t *cfg, const char *path)
     cfg->node_mem             = 268435456ULL;
     cfg->max_runtime_nodes    = 256;
     cfg->vnodes_per_mb        = 16;
-    cfg->redundancy_raid5     = false;
-    cfg->raid_k               = 2;
+    cfg->redundancy           = false;
     cfg->chunk_pages          = 1;
     cfg->port_min             = 27600;
     cfg->port_max             = 27699;
+    cfg->discovery_group      = 0xEFFF2A63u;   /* 239.255.42.99 */
+    cfg->discovery_port       = 27699;
     cfg->connect_timeout_ms   = 200;
     cfg->discovery_timeout_ms = 300;
     cfg->send_timeout_ms      = 2000;
@@ -271,9 +312,6 @@ int config_load(dsm_config_t *cfg, const char *path)
     }
     raw_buf[fsize] = '\0';
     fclose(f);
-
-    /* Calcular CRC32 sobre el contenido exacto */
-    cfg->raw_hash = dsm_crc32(0, raw_buf, (size_t)fsize);
 
     /* Procesar linea por linea */
     uint64_t seen_keys = 0;
@@ -339,16 +377,7 @@ int config_load(dsm_config_t *cfg, const char *path)
             parse_err = parse_u32(val, &cfg->vnodes_per_mb);
         } else if (strcasecmp(key, "REDUNDANCY") == 0) {
             mask = KEY_REDUNDANCY;
-            if (strcasecmp(val, "NONE") == 0) {
-                cfg->redundancy_raid5 = false;
-            } else if (strcasecmp(val, "RAID5") == 0) {
-                cfg->redundancy_raid5 = true;
-            } else {
-                parse_err = -1;
-            }
-        } else if (strcasecmp(key, "RAID_K") == 0) {
-            mask = KEY_RAID_K;
-            parse_err = parse_u32(val, &cfg->raid_k);
+            parse_err = parse_bool(val, &cfg->redundancy);
         } else if (strcasecmp(key, "CHUNK_PAGES") == 0) {
             mask = KEY_CHUNK_PAGES;
             parse_err = parse_u32(val, &cfg->chunk_pages);
@@ -358,9 +387,12 @@ int config_load(dsm_config_t *cfg, const char *path)
         } else if (strcasecmp(key, "PORT_MAX") == 0) {
             mask = KEY_PORT_MAX;
             parse_err = parse_u16(val, &cfg->port_max);
-        } else if (strcasecmp(key, "PEER_HOSTS") == 0) {
-            mask = KEY_PEER_HOSTS;
-            parse_err = parse_hosts(val, cfg);
+        } else if (strcasecmp(key, "DISCOVERY_GROUP") == 0) {
+            mask = KEY_DISCOVERY_GROUP;
+            parse_err = parse_ipv4(val, &cfg->discovery_group);
+        } else if (strcasecmp(key, "DISCOVERY_PORT") == 0) {
+            mask = KEY_DISCOVERY_PORT;
+            parse_err = parse_u16(val, &cfg->discovery_port);
         } else if (strcasecmp(key, "CONNECT_TIMEOUT_MS") == 0) {
             mask = KEY_CONNECT_TIMEOUT_MS;
             parse_err = parse_u32(val, &cfg->connect_timeout_ms);
@@ -451,6 +483,7 @@ int config_load(dsm_config_t *cfg, const char *path)
     }
 
     free(raw_buf);
+    cfg->shared_hash = config_shared_hash(cfg);
 
     /* Primero se valida el archivo y despues se resuelve el rol: un archivo
      * invalido falla igual en los dos modos. */
@@ -601,16 +634,15 @@ int config_validate(dsm_config_t *cfg)
         return DSM_ERR_CONFIG;
     }
 
-    if (cfg->raid_k < 2 || cfg->raid_k > 8) {
-        DSM_LOG_ERR("RAID_K debe estar entre 2 y 8");
+    /* El grupo de descubrimiento debe ser una dirección multicast IPv4 y el
+     * puerto un destino válido. */
+    if ((cfg->discovery_group & 0xF0000000u) != 0xE0000000u) {
+        DSM_LOG_ERR("DISCOVERY_GROUP debe ser una dirección multicast IPv4");
         return DSM_ERR_CONFIG;
     }
 
-    /* RAID5 necesita K custodios de datos y al menos una ranura mas para la
-     * paridad; con menos nodos la franja no puede formarse. */
-    if (cfg->redundancy_raid5 && cfg->max_runtime_nodes < cfg->raid_k + 1u) {
-        DSM_LOG_ERR("RAID5 requiere MAX_RUNTIME_NODES >= RAID_K + 1: %u",
-                    cfg->raid_k + 1u);
+    if (cfg->discovery_port == 0) {
+        DSM_LOG_ERR("DISCOVERY_PORT debe ser mayor que cero");
         return DSM_ERR_CONFIG;
     }
 
@@ -677,11 +709,10 @@ void config_dump(const dsm_config_t *cfg)
     DSM_LOG_INFO("  Dirección base                     : 0x%lX", (unsigned long)cfg->base_addr);
     DSM_LOG_INFO("  Tamaño de vista                    : %lu bytes", (unsigned long)cfg->view_size);
     DSM_LOG_INFO("  Memoria por nodo                   : %lu bytes", (unsigned long)cfg->node_mem);
+    DSM_LOG_INFO("  Redundancia                        : %s", cfg->redundancy ? "true" : "false");
     DSM_LOG_INFO("  Rango de puertos                   : %u - %u", cfg->port_min, cfg->port_max);
-    DSM_LOG_INFO("  Equipos vecinos                    : %u", cfg->peer_host_count);
-    for (uint32_t i = 0; i < cfg->peer_host_count; i++) {
-        DSM_LOG_INFO("    Equipo %u : %s", i, cfg->peer_hosts[i]);
-    }
+    DSM_LOG_INFO("  Grupo de descubrimiento            : 0x%08X", cfg->discovery_group);
+    DSM_LOG_INFO("  Puerto de descubrimiento           : %u", cfg->discovery_port);
     DSM_LOG_INFO("  Latidos                            : %u ms", cfg->hb_interval_ms);
     DSM_LOG_INFO("  Sospecha                           : %u", cfg->hb_suspect);
     DSM_LOG_INFO("  Caído                              : %u", cfg->hb_dead);
@@ -689,11 +720,10 @@ void config_dump(const dsm_config_t *cfg)
                  cfg->worker_threads, cfg->dispatcher_threads);
     DSM_LOG_INFO("  Margen de custodio                 : %u.%03u",
                  cfg->home_slack_permille / 1000, cfg->home_slack_permille % 1000);
-    DSM_LOG_INFO("  Páginas de datos por franja        : %u", cfg->raid_k);
     DSM_LOG_INFO("  Páginas por fragmento              : %u", cfg->chunk_pages);
     DSM_LOG_INFO("  Capacidad de particiones distribuidas: %u", cfg->wait_pool_entries);
     DSM_LOG_INFO("  Directorio de salida               : %s", cfg->output_dir);
     DSM_LOG_INFO("  Plazo de ejecución distribuida     : %u ms", cfg->dist_timeout_ms);
     DSM_LOG_INFO("  Modo de proceso                    : %s", cfg->client_mode ? "cliente" : "nodo");
-    DSM_LOG_INFO("  Hash bruto                         : 0x%08X", cfg->raw_hash);
+    DSM_LOG_INFO("  Hash de configuración compartida   : 0x%08X", cfg->shared_hash);
 }

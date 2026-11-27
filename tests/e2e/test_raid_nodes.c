@@ -10,7 +10,7 @@
 
 #define NODE_COUNT  3u
 #define TEST_PAGES  24u
-#define RAID_K      2u
+#define STRIPE_K    2u
 
 #define START_TIMEOUT_MS   90000u
 #define JOIN_TIMEOUT_MS    90000u
@@ -41,13 +41,13 @@ static void write_config(uint16_t port_min, uint16_t port_max)
             "VIEW_SIZE=4294967296\n"
             "MAX_RUNTIME_NODES=256\n"
             "VNODES_PER_MB=16\n"
-            "REDUNDANCY=RAID5\n"
-            "RAID_K=2\n"
+            "REDUNDANCY=true\n"
             "CHUNK_PAGES=4\n"
             "NODE_MEM=16777216\n"
             "PORT_MIN=%u\n"
             "PORT_MAX=%u\n"
-            "PEER_HOSTS=127.0.0.1\n"
+            "DISCOVERY_GROUP=239.255.42.103\n"
+            "DISCOVERY_PORT=27703\n"
             "CONNECT_TIMEOUT_MS=1000\n"
             "DISCOVERY_TIMEOUT_MS=1000\n"
             "SEND_TIMEOUT_MS=5000\n"
@@ -223,9 +223,9 @@ static bool choose_victim(uint16_t port, uint32_t pages,
 
         for (uint32_t p = 0; p < pages; p++) {
             if (home_of_page[p] != slot) continue;
-            uint32_t stripe = p / RAID_K;
-            uint32_t first_page = stripe * RAID_K;
-            uint32_t last_page = first_page + RAID_K;
+            uint32_t stripe = p / STRIPE_K;
+            uint32_t first_page = stripe * STRIPE_K;
+            uint32_t last_page = first_page + STRIPE_K;
             if (last_page > pages) last_page = pages;
             uint32_t count = 0;
             for (uint32_t q = first_page; q < last_page; q++) {
@@ -249,7 +249,7 @@ int main(void)
     setvbuf(stdout, NULL, _IOLBF, 0);
     e2e_prepare("raid");
 
-    printf("=== Integración DSM: RAID5, caída de un nodo y reconstrucción ===\n");
+    printf("=== Integración DSM: paridad, caída de un nodo y reconstrucción ===\n");
 
     uint16_t port_min = 0;
     uint16_t port_max = 0;
@@ -277,9 +277,12 @@ int main(void)
         if (!nodes[i] || nodes[i]->pid <= 0) {
             printf("FAIL: no se pudo iniciar el nodo %u\n", i);
             pass = false;
-            break;
         }
+    }
 
+    /* Los tres nodos arrancan a la vez: con redundancia activa cada uno espera
+     * a que la membresía reúna el mínimo antes de publicar su ranura. */
+    for (uint32_t i = 0; i < NODE_COUNT && pass; i++) {
         char line[512];
         if (!e2e_wait_line(nodes[i], "HOLD_READY", line, sizeof(line),
                            e2e_now_ms() + START_TIMEOUT_MS) ||
@@ -519,7 +522,7 @@ int main(void)
         e2e_stop_child(nodes[i]);
     }
 
-    printf("%s\n", pass ? "PASS: RAID5 conserva los datos tras la caída de un nodo" :
-                         "FAIL: RAID5 no conservó los datos tras la caída");
+    printf("%s\n", pass ? "PASS: paridad conserva los datos tras la caída de un nodo" :
+                         "FAIL: paridad no conservó los datos tras la caída");
     return pass ? 0 : 1;
 }

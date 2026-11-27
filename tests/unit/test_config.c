@@ -9,15 +9,14 @@
  *   3. Overflow numerico en cada anchura (u16/u32/u64), negativos, hex, octal
  *      implicito, sufijos basura y limites exactos.
  *   4. Regla de puertos asignados (bloque 27600..27699 del grupo).
- *   5. raw_hash = CRC32 completo del archivo, con vectores conocidos y
- *      deteccion de diferencias de un solo byte en cualquier posicion.
+ *   5. shared_hash = CRC32 de las claves compartidas; NODE_MEM, rutas, hilos
+ *      y temporizaciones locales no lo alteran.
  *   6. HOME_SLACK: conversion exacta a milesimas enteras y rechazo de valores
  *      con mas de tres decimales significativos o no representables.
  *   7. Validaciones cruzadas (page_size, view_size, alineacion, heartbeats,
- *      hilos, stripes, node_mem, RAID5, retries).
+ *      hilos, stripes, node_mem, paridad, retries).
  *   8. Duplicados, recarga sobre estructura sucia, y ausencia de fugas.
- *   9. Rigor adicional: integridad de raw_hash byte a byte (un byte cambiado,
- *      un espacio final, dos lecturas identicas), limites de sistema uno por
+ *   9. Rigor adicional: estabilidad de shared_hash, limites de sistema uno por
  *      uno con VIEW_SIZE/NODE_MEM coherentes, archivo de 1 MiB exacto y
  *      1 MiB + 1, rutas no regulares, y config_validate() mutada campo a campo.
  *  10. REQUEST_RETRIES: un par que descarta la primera peticion y responde la
@@ -92,7 +91,6 @@ static const char *write_fixture_raw(const char *name, const void *data, size_t 
     "NODE_MEM           = 268435456\n" \
     "PORT_MIN           = 27600\n" \
     "PORT_MAX           = 27699\n" \
-    "PEER_HOSTS         = 127.0.0.1,lab-h01\n"
 
 /* Carga un fixture compuesto y devuelve el codigo de config_load */
 static int load_fixture(const char *name, const char *content, dsm_config_t *cfg)
@@ -121,15 +119,13 @@ static int test_load_repo_config(void)
     CHECK(cfg.node_mem == 268435456ULL);
     CHECK(cfg.max_runtime_nodes == 256);
     CHECK(cfg.vnodes_per_mb == 16);
-    CHECK(cfg.redundancy_raid5 == false);
+    CHECK(cfg.redundancy == false);
 
-    /* Red */
+    /* Red y descubrimiento */
     CHECK(cfg.port_min == 27600);
     CHECK(cfg.port_max == 27699);
-    CHECK(cfg.peer_host_count == 5);
-    CHECK(strcmp(cfg.peer_hosts[0], "127.0.0.1") == 0);
-    CHECK(strcmp(cfg.peer_hosts[1], "lab-h01") == 0);
-    CHECK(strcmp(cfg.peer_hosts[4], "lab-h04") == 0);
+    CHECK(cfg.discovery_group == 0xEFFF2A63u);
+    CHECK(cfg.discovery_port == 27699);
 
     /* Temporizaciones */
     CHECK(cfg.connect_timeout_ms == 200);
@@ -154,24 +150,15 @@ static int test_load_repo_config(void)
     /* Diagnostico */
     CHECK(strcmp(cfg.log_level, "INFO") == 0);
 
-    /* raw_hash == CRC32 exacto del archivo, no un valor cualquiera */
-    FILE *f = fopen("dsm.conf", "rb");
-    REQUIRE(f != NULL);
-    static uint8_t buf[1 << 20];
-    size_t n = fread(buf, 1, sizeof(buf), f);
-    fclose(f);
-    CHECK(n == 2333);
-    CHECK(cfg.raw_hash == dsm_crc32(0, buf, n));
-    CHECK(cfg.raw_hash == 0x9E8EA3ADu);
+    /* El hash se calcula sobre las claves compartidas, no sobre los bytes
+     * del archivo. Dos lecturas del mismo archivo coinciden. */
+    CHECK(cfg.shared_hash != 0);
 
-    /* Dos lecturas identicas del mismo archivo producen el mismo hash exacto.
-     * Esto es la base del handshake HELLO: si dos nodos leen el mismo byte
-     * stream deben coincidir bit a bit, no solo en los campos parseados. */
     dsm_config_t again;
     REQUIRE(config_load(&again, "dsm.conf") == DSM_OK);
-    CHECK(again.raw_hash == cfg.raw_hash);
-    CHECK(memcmp(&again.peer_hosts, &cfg.peer_hosts, sizeof(cfg.peer_hosts)) == 0);
-    CHECK(again.peer_host_count == cfg.peer_host_count);
+    CHECK(again.shared_hash == cfg.shared_hash);
+    CHECK(again.discovery_group == cfg.discovery_group);
+    CHECK(again.discovery_port == cfg.discovery_port);
 
     config_free(&again);
     config_free(&cfg);
@@ -222,11 +209,11 @@ static int test_malformed_edge_inputs(void)
     dsm_config_t cfg;
     char path[256];
 
-    /* Archivo vacio: todos los defaults, debe validar y hashear el vacio */
+    /* Archivo vacio: todos los defaults y hash de las claves compartidas */
     const char *p = write_fixture("empty.conf", "", path);
     REQUIRE(p != NULL);
     CHECK(config_load(&cfg, p) == DSM_OK);
-    CHECK(cfg.raw_hash == 0x00000000u);          /* CRC32 de cero bytes */
+    CHECK(cfg.shared_hash != 0);
     CHECK(cfg.page_size == 4096);                /* default aplicado */
     CHECK(cfg.port_min == 27600);
 
@@ -320,7 +307,7 @@ static int test_numeric_overflow(void)
 
     /* u16: 65536 desborda el tipo; 65535 parsea pero queda fuera del bloque */
     CHECK(load_fixture("u16_max.conf",
-                       "PORT_MIN = 65535\nPORT_MAX = 65535\nPEER_HOSTS = a\n", &cfg)
+                       "PORT_MIN = 65535\nPORT_MAX = 65535\n", &cfg)
           == DSM_ERR_CONFIG);
     CHECK(load_fixture("u16_over.conf", "PORT_MIN = 65536\n", &cfg) == DSM_ERR_CONFIG);
 
@@ -366,7 +353,7 @@ static int test_port_block_rule(void)
     /* El default documentado es exactamente el bloque del grupo */
     dsm_config_t defaults;
     char path[256];
-    const char *p = write_fixture("ports_default.conf", "PEER_HOSTS = a\n", path);
+    const char *p = write_fixture("ports_default.conf", "", path);
     REQUIRE(p != NULL);
     REQUIRE(config_load(&defaults, p) == DSM_OK);
     CHECK(defaults.port_min == 27600);
@@ -375,167 +362,164 @@ static int test_port_block_rule(void)
 
     /* Limites exactos del bloque aceptados */
     CHECK(load_fixture("ports_exact.conf",
-                       "PORT_MIN = 27600\nPORT_MAX = 27699\nPEER_HOSTS = a\n", &cfg) == DSM_OK);
+                       "PORT_MIN = 27600\nPORT_MAX = 27699\n", &cfg) == DSM_OK);
 
     /* Un unico puerto (min == max) es un rango valido de tamano 1 */
     CHECK(load_fixture("ports_single.conf",
-                       "PORT_MIN = 27650\nPORT_MAX = 27650\nPEER_HOSTS = a\n", &cfg) == DSM_OK);
+                       "PORT_MIN = 27650\nPORT_MAX = 27650\n", &cfg) == DSM_OK);
     CHECK(cfg.port_min == 27650 && cfg.port_max == 27650);
 
     /* Invertido: min > max debe rechazarse */
     CHECK(load_fixture("ports_inv.conf",
-                       "PORT_MIN = 27699\nPORT_MAX = 27600\nPEER_HOSTS = a\n", &cfg)
+                       "PORT_MIN = 27699\nPORT_MAX = 27600\n", &cfg)
           == DSM_ERR_CONFIG);
 
     /* Fuera del bloque asignado: no debe aceptarse silenciosamente en el
      * default del grupo. El rango declarado por el grupo es 27600..27699. */
     CHECK(load_fixture("ports_below.conf",
-                       "PORT_MIN = 27500\nPORT_MAX = 27599\nPEER_HOSTS = a\n", &cfg)
+                       "PORT_MIN = 27500\nPORT_MAX = 27599\n", &cfg)
           == DSM_ERR_CONFIG);
     CHECK(load_fixture("ports_above.conf",
-                       "PORT_MIN = 27700\nPORT_MAX = 27799\nPEER_HOSTS = a\n", &cfg)
+                       "PORT_MIN = 27700\nPORT_MAX = 27799\n", &cfg)
           == DSM_ERR_CONFIG);
 
     /* Rango que solapa parcialmente el bloque pero lo excede */
     CHECK(load_fixture("ports_overlap_lo.conf",
-                       "PORT_MIN = 27590\nPORT_MAX = 27699\nPEER_HOSTS = a\n", &cfg)
+                       "PORT_MIN = 27590\nPORT_MAX = 27699\n", &cfg)
           == DSM_ERR_CONFIG);
     CHECK(load_fixture("ports_overlap_hi.conf",
-                       "PORT_MIN = 27600\nPORT_MAX = 27710\nPEER_HOSTS = a\n", &cfg)
+                       "PORT_MIN = 27600\nPORT_MAX = 27710\n", &cfg)
           == DSM_ERR_CONFIG);
 
     /* Subbloque dentro del asignado: aceptado */
     CHECK(load_fixture("ports_sub.conf",
-                       "PORT_MIN = 27610\nPORT_MAX = 27619\nPEER_HOSTS = a\n", &cfg) == DSM_OK);
+                       "PORT_MIN = 27610\nPORT_MAX = 27619\n", &cfg) == DSM_OK);
 
     /* Puerto 0 y puertos privilegiados fuera de rango */
     CHECK(load_fixture("ports_zero.conf",
-                       "PORT_MIN = 0\nPORT_MAX = 0\nPEER_HOSTS = a\n", &cfg) == DSM_ERR_CONFIG);
+                       "PORT_MIN = 0\nPORT_MAX = 0\n", &cfg) == DSM_ERR_CONFIG);
     CHECK(load_fixture("ports_priv.conf",
-                       "PORT_MIN = 80\nPORT_MAX = 90\nPEER_HOSTS = a\n", &cfg) == DSM_ERR_CONFIG);
+                       "PORT_MIN = 80\nPORT_MAX = 90\n", &cfg) == DSM_ERR_CONFIG);
 
     return 0;
 }
 
-/* ----------------------------------------------------------------------------
- * 5. raw_hash: CRC32 completo del archivo
+/* ---------------------------------------------------------------------------
+ * 5. shared_hash: solo las claves que deben coincidir entre nodos
  * ------------------------------------------------------------------------- */
 
-static int test_raw_hash_vectors(void)
+#define SHARED_BASE \
+    "CLUSTER_ID         = 0x534F3031\n" \
+    "PAGE_SIZE          = 4096\n" \
+    "BASE_ADDR          = 0x200000000000\n" \
+    "VIEW_SIZE          = 4294967296\n" \
+    "PORT_MIN           = 27600\n" \
+    "PORT_MAX           = 27699\n" \
+    "REDUNDANCY         = false\n"
+
+static int test_shared_hash_subset(void)
 {
-    dsm_config_t cfg;
-
-    /* Vector canonico CRC32 ("123456789" -> 0xCBF43926) via dsm_crc32 */
-    CHECK(dsm_crc32(0, "123456789", 9) == 0xCBF43926u);
-    CHECK(dsm_crc32(0, "", 0) == 0x00000000u);
-
-    /* El hash debe ser el CRC del CONTENIDO EXACTO, no del parseo */
+    dsm_config_t a;
+    dsm_config_t b;
+    dsm_config_t c;
     char path[256];
-    const char *content = VALID_MIN;
-    const char *p = write_fixture("hash_base.conf", content, path);
-    REQUIRE(p != NULL);
-    REQUIRE(config_load(&cfg, p) == DSM_OK);
-    CHECK(cfg.raw_hash == dsm_crc32(0, content, strlen(content)));
 
-    /* Dos archivos semanticamente equivalentes pero con distinto espaciado
-     * DEBEN tener hashes distintos: el hash es sobre bytes, no sobre
-     * significado. Esto es lo que exige el handshake HELLO. */
-    dsm_config_t cfg_b;
-    char path2[256];
-    char path3[256];
-    const char *p2 = write_fixture("hash_space.conf",
-                                   "CLUSTER_ID=0x534F3031\nPAGE_SIZE=4096\n", path2);
-    REQUIRE(p2 != NULL);
-    const char *p3 = write_fixture("hash_space2.conf",
-                                   "CLUSTER_ID = 0x534F3031\nPAGE_SIZE = 4096\n", path3);
-    REQUIRE(p3 != NULL);
-    REQUIRE(config_load(&cfg, p2) == DSM_OK);
-    REQUIRE(config_load(&cfg_b, p3) == DSM_OK);
-    CHECK(cfg.raw_hash != cfg_b.raw_hash);
+    const char *pa = write_fixture("shared_a.conf",
+        SHARED_BASE
+        "NODE_MEM            = 268435456\n"
+        "OUTPUT_DIR          = reports\n"
+        "DSM_LOG_LEVEL       = INFO\n"
+        "WORKER_THREADS      = 4\n", path);
+    REQUIRE(pa != NULL);
+    REQUIRE(config_load(&a, pa) == DSM_OK);
+
+    const char *pb = write_fixture("shared_b.conf",
+        SHARED_BASE
+        "NODE_MEM            = 67108864\n"
+        "OUTPUT_DIR          = /tmp/reportes_b\n"
+        "DSM_LOG_LEVEL       = DEBUG\n"
+        "WORKER_THREADS      = 2\n"
+        "CONNECT_TIMEOUT_MS  = 900\n", path);
+    REQUIRE(pb != NULL);
+    REQUIRE(config_load(&b, pb) == DSM_OK);
+
+    CHECK(a.node_mem != b.node_mem);
+    CHECK(a.shared_hash == b.shared_hash);
+
+    const char *pc = write_fixture("shared_c.conf",
+        "CLUSTER_ID         = 0x534F3032\n"
+        "PAGE_SIZE          = 4096\n"
+        "BASE_ADDR          = 0x200000000000\n"
+        "VIEW_SIZE          = 4294967296\n"
+        "PORT_MIN           = 27600\n"
+        "PORT_MAX           = 27699\n"
+        "REDUNDANCY         = false\n", path);
+    REQUIRE(pc != NULL);
+    REQUIRE(config_load(&c, pc) == DSM_OK);
+    CHECK(c.shared_hash != a.shared_hash);
+
+    pc = write_fixture("shared_d.conf",
+        "CLUSTER_ID         = 0x534F3031\n"
+        "PAGE_SIZE          = 4096\n"
+        "BASE_ADDR          = 0x200000000000\n"
+        "VIEW_SIZE          = 4294967296\n"
+        "PORT_MIN           = 27600\n"
+        "PORT_MAX           = 27699\n"
+        "REDUNDANCY         = true\n", path);
+    REQUIRE(pc != NULL);
+    REQUIRE(config_load(&c, pc) == DSM_OK);
+    CHECK(c.shared_hash != a.shared_hash);
+
+    pc = write_fixture("shared_e.conf",
+        SHARED_BASE
+        "DISCOVERY_PORT      = 27651\n", path);
+    REQUIRE(pc != NULL);
+    REQUIRE(config_load(&c, pc) == DSM_OK);
+    CHECK(c.shared_hash != a.shared_hash);
 
     return 0;
 }
 
-static int test_raw_hash_single_byte_sensitivity(void)
+static int test_shared_hash_ignores_local(void)
 {
-    /* Construir un archivo valido y verificar que cambiar UN solo byte en
-     * cualquier posicion cambia el raw_hash resultante. */
-    static const char base[] = VALID_MIN;
-    size_t len = strlen(base);
-
-    dsm_config_t ref;
+    dsm_config_t a;
+    dsm_config_t b;
     char path[256];
-    const char *p = write_fixture("hash_sens_base.conf", base, path);
-    REQUIRE(p != NULL);
-    REQUIRE(config_load(&ref, p) == DSM_OK);
 
-    /* Cambios en el cuerpo del archivo: cada posicion debe alterar el hash.
-     * Se excluyen las posiciones cuyo byte alterado haria el archivo invalido
-     * (eso tambien cambia el comportamiento, pero queremos el hash del mismo
-     * tamano). Solo comprobamos que cuando sigue siendo cargable, el hash
-     * cambia; y que si deja de ser cargable, no devuelve OK con el hash viejo. */
-    uint8_t mut[512];
-    REQUIRE(len < sizeof(mut));
+    const char *pa = write_fixture("shared_local_a.conf",
+        SHARED_BASE
+        "NODE_MEM            = 268435456\n"
+        "BASE_ADDR_TSAN      = 0x4000000000\n"
+        "OUTPUT_DIR          = reports\n"
+        "DSM_LOG_LEVEL       = INFO\n"
+        "WORKER_THREADS      = 4\n", path);
+    REQUIRE(pa != NULL);
+    REQUIRE(config_load(&a, pa) == DSM_OK);
 
-    unsigned changed_loadable = 0;
-    unsigned rejected = 0;
+    const char *pb = write_fixture("shared_local_b.conf",
+        "# comentario distinto\n"
+        "CLUSTER_ID = 0x534F3031\n"
+        "PAGE_SIZE = 4096\n"
+        "BASE_ADDR = 0x200000000000\n"
+        "VIEW_SIZE = 4294967296\n"
+        "PORT_MIN = 27600\n"
+        "PORT_MAX = 27699\n"
+        "DISCOVERY_GROUP = 239.255.42.1\n"
+        "REDUNDANCY = false\n"
+        "NODE_MEM = 1073741824\n"
+        "BASE_ADDR_TSAN = 0x4000000000\n"
+        "OUTPUT_DIR = /tmp/otro\n"
+        "DSM_LOG_LEVEL = ERROR\n"
+        "WORKER_THREADS = 1\n"
+        "HB_INTERVAL_MS = 900\n"
+        "REQUEST_TIMEOUT_MS = 8000\n", path);
+    REQUIRE(pb != NULL);
+    REQUIRE(config_load(&b, pb) == DSM_OK);
 
-    for (size_t i = 0; i < len; i++) {
-        memcpy(mut, base, len);
-
-        /* Alterar el byte: si es un digito, cambiar por otro digito;
-         * si es letra, cambiar por otra letra; si es espacio, por otro espacio.
-         * Asi el archivo suele seguir siendo sintacticamente valido. */
-        unsigned char c = mut[i];
-        if (c >= '0' && c <= '9') {
-            mut[i] = (uint8_t)((c == '9') ? '8' : '9');
-        } else if (c >= 'a' && c <= 'z') {
-            mut[i] = (uint8_t)((c == 'z') ? 'y' : 'z');
-        } else if (c >= 'A' && c <= 'Z') {
-            mut[i] = (uint8_t)((c == 'Z') ? 'Y' : 'Z');
-        } else if (c == ' ') {
-            mut[i] = '\t';
-        } else {
-            mut[i] = (uint8_t)((c == '=') ? ':' : '=');
-        }
-
-        if (mut[i] == (uint8_t)c) {
-            continue; /* sin cambio efectivo */
-        }
-
-        char mpath[256];
-        const char *mp = write_fixture_raw("hash_sens_mut.conf", mut, len, mpath);
-        REQUIRE(mp != NULL);
-
-        dsm_config_t m;
-        int rc = config_load(&m, mp);
-        if (rc == DSM_OK) {
-            changed_loadable++;
-            CHECK(m.raw_hash != ref.raw_hash);
-        } else {
-            rejected++;
-            /* Rechazo explicito: significa que el byte alterado rompio el
-             * parseo, lo cual tambien es una diferencia detectable. */
-            CHECK(rc == DSM_ERR_CONFIG);
-        }
-    }
-
-    /* Debe haber mutaciones que sigan siendo cargables y cambien el hash:
-     * de lo contrario no estamos probando sensibilidad real. */
-    CHECK(changed_loadable > 0);
-    CHECK(changed_loadable + rejected == len);
-
-    /* Byte final agregado: mismo contenido logico, hash distinto */
-    char extra[600];
-    size_t elen = len;
-    memcpy(extra, base, len);
-    extra[elen++] = '\n';
-    char epath[256];
-    const char *ep = write_fixture_raw("hash_sens_extra.conf", extra, elen, epath);
-    REQUIRE(ep != NULL);
-    dsm_config_t e;
-    REQUIRE(config_load(&e, ep) == DSM_OK);
-    CHECK(e.raw_hash != ref.raw_hash);
+    CHECK(a.node_mem != b.node_mem);
+    CHECK(strcmp(a.output_dir, b.output_dir) != 0);
+    CHECK(a.worker_threads != b.worker_threads);
+    CHECK(a.shared_hash == b.shared_hash);
 
     return 0;
 }
@@ -565,7 +549,7 @@ static int test_home_slack_conversion(void)
     for (size_t i = 0; i < sizeof(ok_cases)/sizeof(ok_cases[0]); i++) {
         if (ok_cases[i].expected == 0) continue; /* se prueba como rechazo abajo */
 
-        snprintf(conf, sizeof(conf), "HOME_SLACK = %s\nPEER_HOSTS = a\n",
+        snprintf(conf, sizeof(conf), "HOME_SLACK = %s\n",
                  ok_cases[i].literal);
         int rc = load_fixture("slack_ok.conf", conf, &cfg);
         CHECK(rc == DSM_OK);
@@ -576,63 +560,63 @@ static int test_home_slack_conversion(void)
 
     /* Prefijo alternativo: HOME_SLACK con espacios internos alrededor del '=' */
     REQUIRE(load_fixture("slack_spaces.conf",
-                         "HOME_SLACK   =    1.25\nPEER_HOSTS = a\n", &cfg) == DSM_OK);
+                         "HOME_SLACK   =    1.25\n", &cfg) == DSM_OK);
     CHECK(cfg.home_slack_permille == 1250);
 
     /* Decimales con ceros de relleno: 1.250 es exactamente 1250 */
-    REQUIRE(load_fixture("slack_pad.conf", "HOME_SLACK = 1.250\nPEER_HOSTS = a\n", &cfg)
+    REQUIRE(load_fixture("slack_pad.conf", "HOME_SLACK = 1.250\n", &cfg)
             == DSM_OK);
     CHECK(cfg.home_slack_permille == 1250);
-    REQUIRE(load_fixture("slack_pad2.conf", "HOME_SLACK = 1.2500\nPEER_HOSTS = a\n", &cfg)
+    REQUIRE(load_fixture("slack_pad2.conf", "HOME_SLACK = 1.2500\n", &cfg)
             == DSM_OK);
     CHECK(cfg.home_slack_permille == 1250);
 
     /* Mas de tres decimales SIGNIFICATIVOS: rechazo */
-    CHECK(load_fixture("slack_4dec.conf", "HOME_SLACK = 1.2501\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_4dec.conf", "HOME_SLACK = 1.2501\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_4dec_b.conf", "HOME_SLACK = 1.2345\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_4dec_b.conf", "HOME_SLACK = 1.2345\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_4dec_c.conf", "HOME_SLACK = 1.0001\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_4dec_c.conf", "HOME_SLACK = 1.0001\n", &cfg)
           == DSM_ERR_CONFIG);
 
     /* Menor que 1.0: rechazo */
-    CHECK(load_fixture("slack_below.conf", "HOME_SLACK = 0.999\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_below.conf", "HOME_SLACK = 0.999\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_zero.conf", "HOME_SLACK = 0\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_zero.conf", "HOME_SLACK = 0\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_neg.conf", "HOME_SLACK = -1.25\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_neg.conf", "HOME_SLACK = -1.25\n", &cfg)
           == DSM_ERR_CONFIG);
 
     /* Sintaxis no soportada: exponente, coma decimal, signo, punto suelto */
-    CHECK(load_fixture("slack_exp.conf", "HOME_SLACK = 1e0\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_exp.conf", "HOME_SLACK = 1e0\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_exp2.conf", "HOME_SLACK = 1.25e2\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_exp2.conf", "HOME_SLACK = 1.25e2\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_comma.conf", "HOME_SLACK = 1,25\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_comma.conf", "HOME_SLACK = 1,25\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_plus.conf", "HOME_SLACK = +1.25\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_plus.conf", "HOME_SLACK = +1.25\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_dot.conf", "HOME_SLACK = 1.\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_dot.conf", "HOME_SLACK = 1.\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_dotlead.conf", "HOME_SLACK = .25\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_dotlead.conf", "HOME_SLACK = .25\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_text.conf", "HOME_SLACK = mucho\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_text.conf", "HOME_SLACK = mucho\n", &cfg)
           == DSM_ERR_CONFIG);
-    CHECK(load_fixture("slack_empty.conf", "HOME_SLACK =\nPEER_HOSTS = a\n", &cfg)
+    CHECK(load_fixture("slack_empty.conf", "HOME_SLACK =\n", &cfg)
           == DSM_ERR_CONFIG);
 
     /* Desbordamiento: entero gigantesco */
     CHECK(load_fixture("slack_overflow.conf",
-                       "HOME_SLACK = 4294967.296\nPEER_HOSTS = a\n", &cfg)
+                       "HOME_SLACK = 4294967.296\n", &cfg)
           == DSM_ERR_CONFIG);
     CHECK(load_fixture("slack_overflow2.conf",
-                       "HOME_SLACK = 99999999999\nPEER_HOSTS = a\n", &cfg)
+                       "HOME_SLACK = 99999999999\n", &cfg)
           == DSM_ERR_CONFIG);
 
     /* Conversion determinista: la misma cadena siempre da el mismo entero,
      * lo cual es el requisito del calculo de capacidad distribuido. */
     for (int i = 0; i < 5; i++) {
-        REQUIRE(load_fixture("slack_det.conf", "HOME_SLACK = 1.333\nPEER_HOSTS = a\n",
+        REQUIRE(load_fixture("slack_det.conf", "HOME_SLACK = 1.333\n",
                              &cfg) == DSM_OK);
         CHECK(cfg.home_slack_permille == 1333);
     }
@@ -704,13 +688,12 @@ static int test_cross_validation_rules(void)
     EXPECT_OK("MAX_RUNTIME_NODES = 1\n");
     EXPECT_OK("MAX_RUNTIME_NODES = 256\n");
 
-    /* RAID5 con K dentro de [2, 8] */
-    EXPECT_OK("REDUNDANCY = RAID5\n");
-    EXPECT_OK("REDUNDANCY = RAID5\nRAID_K = 8\n");
-    EXPECT_BAD("cv_raid5_k1.conf", "REDUNDANCY = RAID5\nRAID_K = 1\n");
-    EXPECT_BAD("cv_raid5_k9.conf", "REDUNDANCY = RAID5\nRAID_K = 9\n");
-    EXPECT_OK("REDUNDANCY = NONE\n");
-    EXPECT_OK("REDUNDANCY = none\n");       /* case-insensitive */
+    /* REDUNDANCY solo admite booleanos */
+    EXPECT_OK("REDUNDANCY = true\n");
+    EXPECT_OK("REDUNDANCY = false\n");
+    EXPECT_OK("REDUNDANCY = 1\n");
+    EXPECT_OK("REDUNDANCY = 0\n");
+    EXPECT_BAD("cv_red_texto.conf", "REDUNDANCY = paridad\n");
 
     /* REQUEST_RETRIES >= 1 y acotado por DSM_MAX_REQUEST_RETRIES */
     EXPECT_BAD("cv_retries_zero.conf", "REQUEST_RETRIES = 0\n");
@@ -725,35 +708,15 @@ static int test_cross_validation_rules(void)
     /* HOME_SLACK < 1.0 mediante el entero ya convertido */
     EXPECT_BAD("cv_slack_small.conf", "HOME_SLACK = 0.5\n");
 
-    /* PEER_HOSTS: al menos un host, lista con huecos se normaliza */
-    EXPECT_BAD("cv_hosts_empty.conf", "PEER_HOSTS =\n");
-    EXPECT_BAD("cv_hosts_commas.conf", "PEER_HOSTS = ,,,\n");
-    EXPECT_OK("PEER_HOSTS = a,,b\n");
-    CHECK(cfg.peer_host_count == 2);
-    CHECK(strcmp(cfg.peer_hosts[0], "a") == 0);
-    CHECK(strcmp(cfg.peer_hosts[1], "b") == 0);
-
-    /* Demasiados hosts: > DSM_MAX_PEER_HOSTS (16) */
-    {
-        char many[1024];
-        int n = snprintf(many, sizeof(many), "PEER_HOSTS = ");
-        for (int i = 0; i < 17; i++) {
-            n += snprintf(many + n, sizeof(many) - (size_t)n, "h%02d%s",
-                          i, (i < 16) ? "," : "\n");
-        }
-        CHECK(load_fixture("cv_hosts_17.conf", many, &cfg) == DSM_ERR_CONFIG);
-
-        /* Exactamente 16 si debe aceptarse */
-        char sixteen[1024];
-        n = snprintf(sixteen, sizeof(sixteen), "PEER_HOSTS = ");
-        for (int i = 0; i < 16; i++) {
-            n += snprintf(sixteen + n, sizeof(sixteen) - (size_t)n, "h%02d%s",
-                          i, (i < 15) ? "," : "\n");
-        }
-        CHECK(load_fixture("cv_hosts_16.conf", sixteen, &cfg) == DSM_OK);
-        CHECK(cfg.peer_host_count == 16);
-        CHECK(strcmp(cfg.peer_hosts[15], "h15") == 0);
-    }
+    /* DISCOVERY_GROUP debe ser multicast IPv4 y DISCOVERY_PORT > 0 */
+    EXPECT_BAD("cv_disc_unicast.conf", "DISCOVERY_GROUP = 192.168.1.1\n");
+    EXPECT_BAD("cv_disc_zero.conf", "DISCOVERY_GROUP = 0.0.0.0\n");
+    EXPECT_BAD("cv_disc_broadcast.conf", "DISCOVERY_GROUP = 255.255.255.255\n");
+    EXPECT_BAD("cv_disc_badip.conf", "DISCOVERY_GROUP = 239.255.x.1\n");
+    EXPECT_BAD("cv_disc_port_zero.conf", "DISCOVERY_PORT = 0\n");
+    EXPECT_OK("DISCOVERY_GROUP = 239.255.42.99\nDISCOVERY_PORT = 27699\n");
+    CHECK(cfg.discovery_group == 0xEFFF2A63u);
+    CHECK(cfg.discovery_port == 27699);
 
 #undef EXPECT_OK
 #undef EXPECT_BAD
@@ -780,11 +743,12 @@ static int test_reload_and_null_safety(void)
     /* Ensuciar la estructura y recargar: todo debe quedar en defaults+archivo,
      * sin residuos de la carga anterior. */
     memset(&cfg, 0xA5, sizeof(cfg));
-    cfg.peer_host_count = 99;
-    cfg.raw_hash = 0xDEADBEEF;
+    cfg.shared_hash = 0xDEADBEEF;
     REQUIRE(config_load(&cfg, "dsm.conf") == DSM_OK);
-    CHECK(cfg.peer_host_count == 5);
-    CHECK(cfg.raw_hash == 0x9E8EA3ADu);
+    CHECK(cfg.discovery_group == 0xEFFF2A63u);
+    dsm_config_t ref;
+    REQUIRE(config_load(&ref, "dsm.conf") == DSM_OK);
+    CHECK(cfg.shared_hash == ref.shared_hash);
     CHECK(cfg.page_size == 4096);
 
     /* config_free es idempotente y tolera NULL */
@@ -812,15 +776,10 @@ static int test_reload_and_null_safety(void)
     bad.hb_suspect = bad.hb_dead;
     CHECK(config_validate(&bad) == DSM_ERR_CONFIG);
     bad = cfg;
-    bad.redundancy_raid5 = true;
+    bad.redundancy = true;
     CHECK(config_validate(&bad) == DSM_OK);
-    bad = cfg;
-    bad.raid_k = 1;
-    CHECK(config_validate(&bad) == DSM_ERR_CONFIG);
-    bad = cfg;
-    bad.redundancy_raid5 = true;
-    bad.raid_k = 9;
-    CHECK(config_validate(&bad) == DSM_ERR_CONFIG);
+    bad.redundancy = false;
+    CHECK(config_validate(&bad) == DSM_OK);
 
     return 0;
 }
@@ -843,7 +802,7 @@ static int test_stress_many_configs(void)
                  "PAGE_SIZE = %u\n"
                  "VIEW_SIZE = 4294967296\n"
                  "NODE_MEM = 268435456\n"
-                 "PEER_HOSTS = a\n", ps);
+                 "", ps);
         snprintf(name, sizeof(name), "stress_ps_%u.conf", ps);
         int rc = load_fixture(name, conf, &cfg);
         CHECK(rc == DSM_OK || rc == DSM_ERR_CONFIG);
@@ -860,7 +819,7 @@ static int test_stress_many_configs(void)
 
     /* Barrido de HOME_SLACK en pasos de 1/1000 con digitos controlados */
     for (uint32_t millis = 900; millis <= 2100; millis += 37) {
-        snprintf(conf, sizeof(conf), "HOME_SLACK = %u.%03u\nPEER_HOSTS = a\n",
+        snprintf(conf, sizeof(conf), "HOME_SLACK = %u.%03u\n",
                  millis / 1000, millis % 1000);
         snprintf(name, sizeof(name), "stress_slack_%u.conf", millis);
         int rc = load_fixture(name, conf, &cfg);
@@ -872,20 +831,20 @@ static int test_stress_many_configs(void)
         }
     }
 
-    /* 200 archivos con un byte final distinto: todos hashes distintos */
+    /* 200 archivos con distinto CLUSTER_ID: todos hashes distintos */
     {
         uint32_t hashes[200];
         for (int i = 0; i < 200; i++) {
             static char body[512];
             size_t blen = (size_t)snprintf(body, sizeof(body),
+                                           "CLUSTER_ID = %d\n"
                                            "PAGE_SIZE = 4096\n"
-                                           "PEER_HOSTS = a\n"
-                                           "# relleno %03d\n", i);
+                                           "", i);
             char path[256];
             const char *p = write_fixture_raw("stress_hash.conf", body, blen, path);
             REQUIRE(p != NULL);
             REQUIRE(config_load(&cfg, p) == DSM_OK);
-            hashes[i] = cfg.raw_hash;
+            hashes[i] = cfg.shared_hash;
         }
         for (int i = 0; i < 200; i++) {
             for (int j = i + 1; j < 200; j++) {
@@ -901,77 +860,53 @@ static int test_stress_many_configs(void)
 }
 
 /* ----------------------------------------------------------------------------
- * 10. raw_hash: integridad del archivo real byte a byte
+ * 10. shared_hash: estabilidad y separacion de claves compartidas
  * ------------------------------------------------------------------------- */
 
-static int test_rig_raw_hash_integridad(void)
+static int test_rig_shared_hash_integridad(void)
 {
-    dsm_config_t a, b;
+    dsm_config_t a;
+    dsm_config_t b;
     char path[256];
-    static const char base[] = VALID_MIN;
-    size_t len = strlen(base);
 
-    const char *p = write_fixture_raw("rig_hash_base.conf", base, len, path);
-    REQUIRE(p != NULL);
-    REQUIRE(config_load(&a, p) == DSM_OK);
+    const char *pa = write_fixture("rig_shared_a.conf",
+        SHARED_BASE
+        "NODE_MEM = 268435456\n", path);
+    REQUIRE(pa != NULL);
+    REQUIRE(config_load(&a, pa) == DSM_OK);
 
-    /* Dos lecturas consecutivas sin tocar el archivo: hash identico y
-     * reproducible contra el CRC de los bytes exactos. */
-    REQUIRE(config_load(&b, p) == DSM_OK);
-    CHECK(b.raw_hash == a.raw_hash);
-    CHECK(a.raw_hash == dsm_crc32(0, base, len));
+    /* Dos lecturas consecutivas producen el mismo hash. */
+    REQUIRE(config_load(&b, pa) == DSM_OK);
+    CHECK(b.shared_hash == a.shared_hash);
 
-    /* Cambiar EXACTAMENTE un byte dentro del valor de PEER_HOSTS mantiene el
-     * archivo sintacticamente valido y del mismo tamano, pero cambia el hash:
-     * 127.0.0.1 -> 127.0.0.2. */
-    static uint8_t mut[512];
-    REQUIRE(len < sizeof(mut));
-    memcpy(mut, base, len);
-    mut[len] = '\0';
-    char *host = strstr((char *)mut, "127.0.0.1");
-    REQUIRE(host != NULL);
-    size_t off = (size_t)(host - (char *)mut);
-    mut[off + 8] = '2';
+    /* Un comentario distinto o un cambio de NODE_MEM no altera el hash. */
+    const char *pb = write_fixture("rig_shared_b.conf",
+        "# otra firma\n"
+        "CLUSTER_ID = 0x534F3031\n"
+        "PAGE_SIZE = 4096\n"
+        "BASE_ADDR = 0x200000000000\n"
+        "VIEW_SIZE = 4294967296\n"
+        "PORT_MIN = 27600\n"
+        "PORT_MAX = 27699\n"
+        "REDUNDANCY = false\n"
+        "NODE_MEM = 134217728\n", path);
+    REQUIRE(pb != NULL);
+    REQUIRE(config_load(&b, pb) == DSM_OK);
+    CHECK(b.shared_hash == a.shared_hash);
 
-    size_t diffs = 0;
-    for (size_t i = 0; i < len; i++) {
-        if (mut[i] != (uint8_t)base[i]) diffs++;
-    }
-    CHECK(diffs == 1);
-
-    const char *mp = write_fixture_raw("rig_hash_1byte.conf", mut, len, path);
-    REQUIRE(mp != NULL);
-    REQUIRE(config_load(&b, mp) == DSM_OK);
-    CHECK(strcmp(b.peer_hosts[0], "127.0.0.2") == 0);   /* el cambio se aplico */
-    CHECK(b.raw_hash != a.raw_hash);
-    CHECK(b.raw_hash == dsm_crc32(0, mut, len));
-
-    /* Un espacio anadido al final no altera ninguna clave, pero si el hash:
-     * el handshake HELLO compara bytes de archivo, no configuracion resuelta. */
-    static uint8_t extra[512];
-    memcpy(extra, base, len);
-    extra[len] = ' ';
-    const char *ep = write_fixture_raw("rig_hash_space.conf", extra, len + 1, path);
-    REQUIRE(ep != NULL);
-    REQUIRE(config_load(&b, ep) == DSM_OK);
-    CHECK(b.raw_hash != a.raw_hash);
-    CHECK(b.raw_hash == dsm_crc32(0, extra, len + 1));
-
-    /* Cambiar un byte de un comentario (que el parser descarta) tambien
-     * cambia el hash: cubre el archivo completo, no solo las claves. */
-    static const char con_comentario[] = VALID_MIN "# firma A\n";
-    static const char otro_comentario[] = VALID_MIN "# firma B\n";
-    char path2[256];
-    const char *cp = write_fixture_raw("rig_hash_coment_a.conf",
-                                       con_comentario, strlen(con_comentario), path2);
-    REQUIRE(cp != NULL);
-    REQUIRE(config_load(&a, cp) == DSM_OK);
-    cp = write_fixture_raw("rig_hash_coment_b.conf",
-                           otro_comentario, strlen(otro_comentario), path2);
-    REQUIRE(cp != NULL);
-    REQUIRE(config_load(&b, cp) == DSM_OK);
-    CHECK(a.raw_hash != b.raw_hash);
-    CHECK(a.peer_host_count == b.peer_host_count);  /* misma configuracion util */
+    /* Un cambio en HOME_SLACK si altera el hash. */
+    const char *pc = write_fixture("rig_shared_c.conf",
+        "CLUSTER_ID = 0x534F3031\n"
+        "PAGE_SIZE = 4096\n"
+        "BASE_ADDR = 0x200000000000\n"
+        "VIEW_SIZE = 4294967296\n"
+        "PORT_MIN = 27600\n"
+        "PORT_MAX = 27699\n"
+        "REDUNDANCY = false\n"
+        "HOME_SLACK = 1.50\n", path);
+    REQUIRE(pc != NULL);
+    REQUIRE(config_load(&b, pc) == DSM_OK);
+    CHECK(b.shared_hash != a.shared_hash);
 
     return 0;
 }
@@ -1089,13 +1024,11 @@ static int test_rig_limites_sistema(void)
 
     /* --- Duplicados y claves desconocidas --- */
     RIG_BAD("rig_dup_slack.conf",
-            "HOME_SLACK = 1.25\nHOME_SLACK = 1.30\nPEER_HOSTS = a\n");
-    RIG_BAD("rig_dup_hosts.conf",
-            "PEER_HOSTS = a\nPEER_HOSTS = b\n");
-    RIG_BAD("rig_unknown_port.conf", "PORT_M1N = 27600\nPEER_HOSTS = a\n");
-    RIG_BAD("rig_unknown_foo.conf", "FOO_BAR = 1\nPEER_HOSTS = a\n");
+            "HOME_SLACK = 1.25\nHOME_SLACK = 1.30\n");
+    RIG_BAD("rig_unknown_port.conf", "PORT_M1N = 27600\n");
+    RIG_BAD("rig_unknown_foo.conf", "FOO_BAR = 1\n");
     RIG_BAD("rig_unknown_prefix.conf",
-            "PAGE_SIZE_EXTRA = 4096\nPEER_HOSTS = a\n");
+            "PAGE_SIZE_EXTRA = 4096\n");
 
 #undef RIG_BAD
 #undef RIG_OK
@@ -1122,7 +1055,6 @@ static int test_rig_archivo_enorme_y_no_regular(void)
     REQUIRE(p != NULL);
     CHECK(config_load(&cfg, p) == DSM_OK);
     CHECK(cfg.page_size == 4096);
-    CHECK(cfg.raw_hash == dsm_crc32(0, buf, exact));
 
     /* Un byte mas supera el limite: rechazo por tamano, antes de parsear. */
     uint8_t *big = malloc(exact + 1);
@@ -1224,11 +1156,7 @@ static int test_rig_validacion_directa(void)
     RIG_MUT(reconnect_min_ms, base.reconnect_max_ms + 1u);
     RIG_MUT_OK(reconnect_min_ms, base.reconnect_max_ms);
     RIG_MUT(max_runtime_nodes, (uint32_t)MAX_NODES + 1u);
-    RIG_MUT_OK(redundancy_raid5, true);
-    RIG_MUT(raid_k, 1u);
-    RIG_MUT(raid_k, 9u);
-    RIG_MUT_OK(raid_k, 2u);
-    RIG_MUT_OK(raid_k, 8u);
+    RIG_MUT_OK(redundancy, true);
 
     /* Los defaults del archivo canonico son validos y no se mutan al validar. */
     dsm_config_t copia = base;
@@ -1241,11 +1169,10 @@ static int test_rig_validacion_directa(void)
 }
 
 /* ----------------------------------------------------------------------------
- * 14. raw_hash disponible incluso cuando el parseo rechaza el archivo
+ * 14. shared_hash solo existe para configuraciones validas
  *
- * Un nodo que recibe un dsm.conf con una clave desconocida debe poder
- * reportar contra que hash fallo: el hash es del byte stream, no del
- * resultado del parseo, asi que se calcula antes de procesar las lineas.
+ * Un archivo que no se puede parsear no publica un hash parcial: el campo
+ * queda en cero y el error de configuracion es el unico resultado.
  * ------------------------------------------------------------------------- */
 
 static int test_rig_hash_sobrevive_al_rechazo(void)
@@ -1253,55 +1180,24 @@ static int test_rig_hash_sobrevive_al_rechazo(void)
     dsm_config_t cfg;
     char path[256];
 
-    /* Clave desconocida en la linea 3: parseo rechazado, hash presente. */
-    const char *bad_unknown =
-        "PAGE_SIZE = 4096\n"
-        "\n"
-        "CLAVE_INVENTADA = 7\n";
+    /* Un parseo rechazado no publica un hash parcial. */
+    const char *bad_unknown = "CLAVE_INVENTADA = 7\n";
     const char *p = write_fixture("hash_reject_unknown.conf", bad_unknown, path);
     REQUIRE(p != NULL);
     memset(&cfg, 0, sizeof(cfg));
     CHECK(config_load(&cfg, p) == DSM_ERR_CONFIG);
-    CHECK(cfg.raw_hash == dsm_crc32(0, bad_unknown, strlen(bad_unknown)));
+    CHECK(cfg.shared_hash == 0);
 
-    /* Linea sin '=': mismo contrato. */
     const char *bad_syntax = "PORT_MIN 27600\n";
     p = write_fixture("hash_reject_syntax.conf", bad_syntax, path);
     REQUIRE(p != NULL);
     memset(&cfg, 0, sizeof(cfg));
     CHECK(config_load(&cfg, p) == DSM_ERR_CONFIG);
-    CHECK(cfg.raw_hash == dsm_crc32(0, bad_syntax, strlen(bad_syntax)));
+    CHECK(cfg.shared_hash == 0);
 
-    /* Valor invalido: idem. */
-    const char *bad_value = "PAGE_SIZE = cuatro mil\n";
-    p = write_fixture("hash_reject_value.conf", bad_value, path);
-    REQUIRE(p != NULL);
-    memset(&cfg, 0, sizeof(cfg));
-    CHECK(config_load(&cfg, p) == DSM_ERR_CONFIG);
-    CHECK(cfg.raw_hash == dsm_crc32(0, bad_value, strlen(bad_value)));
-
-    /* Dos archivos distintos que fallan en la misma linea tienen hashes
-     * distintos: el hash identifica el contenido, no el tipo de error. */
-    const char *bad_a = "PAGE_SIZE = 4096\nFOO = 1\n";
-    const char *bad_b = "PAGE_SIZE = 4096\nBAR = 1\n";
-    dsm_config_t ca;
-    dsm_config_t cb;
-    memset(&ca, 0, sizeof(ca));
-    memset(&cb, 0, sizeof(cb));
-    p = write_fixture("hash_reject_a.conf", bad_a, path);
-    REQUIRE(p != NULL);
-    CHECK(config_load(&ca, p) == DSM_ERR_CONFIG);
-    p = write_fixture("hash_reject_b.conf", bad_b, path);
-    REQUIRE(p != NULL);
-    CHECK(config_load(&cb, p) == DSM_ERR_CONFIG);
-    CHECK(ca.raw_hash == dsm_crc32(0, bad_a, strlen(bad_a)));
-    CHECK(cb.raw_hash == dsm_crc32(0, bad_b, strlen(bad_b)));
-    CHECK(ca.raw_hash != cb.raw_hash);
-
-    /* Un archivo inexistente no tiene bytes: no hay hash que reportar. */
     memset(&cfg, 0, sizeof(cfg));
     CHECK(config_load(&cfg, FIXTURE_DIR "/hash_reject_missing.conf") == DSM_ERR_CONFIG);
-    CHECK(cfg.raw_hash == 0);
+    CHECK(cfg.shared_hash == 0);
 
     return 0;
 }
@@ -1590,13 +1486,13 @@ int main(void)
     RUN_TEST(test_duplicate_key_detection);
     RUN_TEST(test_numeric_overflow);
     RUN_TEST(test_port_block_rule);
-    RUN_TEST(test_raw_hash_vectors);
-    RUN_TEST(test_raw_hash_single_byte_sensitivity);
+    RUN_TEST(test_shared_hash_subset);
+    RUN_TEST(test_shared_hash_ignores_local);
     RUN_TEST(test_home_slack_conversion);
     RUN_TEST(test_cross_validation_rules);
     RUN_TEST(test_reload_and_null_safety);
     RUN_TEST(test_stress_many_configs);
-    RUN_TEST(test_rig_raw_hash_integridad);
+    RUN_TEST(test_rig_shared_hash_integridad);
     RUN_TEST(test_rig_limites_sistema);
     RUN_TEST(test_rig_archivo_enorme_y_no_regular);
     RUN_TEST(test_rig_validacion_directa);

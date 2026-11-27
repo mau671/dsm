@@ -103,12 +103,13 @@ release: $(BUILD)/lib/release/libdsm.a \
          $(BUILD)/bin/release/dsm $(BUILD)/bin/release/dsmctl \
          $(BUILD)/bin/release/filtro_video $(BUILD)/bin/release/juego_vida \
          $(BUILD)/bin/release/dsm_dist_demo $(BUILD)/bin/release/dsm_raid_demo \
-         $(BUILD)/bin/release/video_pack
+         $(BUILD)/bin/release/matmul_dsm $(BUILD)/bin/release/video_pack
 debug:   $(BUILD)/lib/debug/libdsm.a \
          $(BUILD)/bin/debug/dsm $(BUILD)/bin/debug/dsmctl \
          $(BUILD)/bin/debug/test_basico $(BUILD)/bin/debug/filtro_video \
          $(BUILD)/bin/debug/juego_vida $(BUILD)/bin/debug/dsm_dist_demo \
-         $(BUILD)/bin/debug/dsm_raid_demo $(BUILD)/bin/debug/video_pack
+         $(BUILD)/bin/debug/dsm_raid_demo $(BUILD)/bin/debug/matmul_dsm \
+         $(BUILD)/bin/debug/video_pack
 asan:    $(BUILD)/lib/asan/libdsm.a \
          $(BUILD)/bin/asan/dsm $(BUILD)/bin/asan/dsmctl
 tsan:    $(BUILD)/lib/tsan/libdsm.a \

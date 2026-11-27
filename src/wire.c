@@ -158,7 +158,7 @@ bool wire_payload_ok(uint16_t type, uint8_t flags, uint32_t len, uint32_t page_s
 {
     switch (type) {
     case MSG_HELLO:
-        return len == 20u; /* uuid[16] + raw_hash[4] */
+        return len == 20u; /* uuid[16] + shared_hash[4] */
     case MSG_WELCOME:
         return len >= 32u && len <= DSM_MAX_PAYLOAD;
     case MSG_JOIN:
@@ -166,7 +166,10 @@ bool wire_payload_ok(uint16_t type, uint8_t flags, uint32_t len, uint32_t page_s
     case MSG_JOIN_ACK:
         return len == 0;
     case MSG_HEARTBEAT:
-        return len == 12u; /* incarnation[8] + free_pages[4] */
+        /* Base: incarnation[8] + free_pages[4]. Extendido: la misma cabecera
+         * seguida de la membresía del emisor para aprender una ranura nueva. */
+        return len == DSM_HEARTBEAT_WIRE_LEN ||
+               len == DSM_HEARTBEAT_ID_WIRE_LEN;
     case MSG_LEAVE:
     case MSG_NODE_DOWN:
         return len == 0 || len == 28u;
@@ -247,6 +250,39 @@ size_t dsm_pack_membership(const membership_wire_t *m, uint8_t out[DSM_MEMBERSHI
     put_u64(out + 24, m->incarnation);
     put_u32(out + 32, m->mem_pages);
     return DSM_MEMBERSHIP_WIRE_LEN;
+}
+
+size_t dsm_pack_discovery(const discovery_wire_t *d, uint8_t out[DSM_DISCOVERY_WIRE_LEN])
+{
+    memset(out, 0, DSM_DISCOVERY_WIRE_LEN);
+    put_u32(out + 0, d->magic);
+    put_u16(out + 4, d->proto_version);
+    put_u32(out + 6, d->cluster_id);
+    put_u32(out + 10, d->shared_hash);
+    memcpy(out + 14, d->uuid, 16);
+    memcpy(out + 30, d->name, 32);
+    put_u32(out + 62, d->ip);
+    put_u16(out + 66, d->port);
+    put_u32(out + 68, d->mem_pages);
+    put_u32(out + 72, d->slot);
+    out[76] = d->role;
+    return DSM_DISCOVERY_WIRE_LEN;
+}
+
+void dsm_unpack_discovery(const uint8_t in[DSM_DISCOVERY_WIRE_LEN], discovery_wire_t *d)
+{
+    d->magic         = get_u32(in + 0);
+    d->proto_version = get_u16(in + 4);
+    d->cluster_id    = get_u32(in + 6);
+    d->shared_hash   = get_u32(in + 10);
+    memcpy(d->uuid, in + 14, 16);
+    memcpy(d->name, in + 30, 32);
+    d->ip            = get_u32(in + 62);
+    d->port          = get_u16(in + 66);
+    d->mem_pages     = get_u32(in + 68);
+    d->slot          = get_u32(in + 72);
+    d->role          = in[76];
+    memset(d->reserved, 0, sizeof(d->reserved));
 }
 
 void dsm_unpack_membership(const uint8_t in[DSM_MEMBERSHIP_WIRE_LEN], membership_wire_t *m)

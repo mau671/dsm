@@ -45,7 +45,7 @@
  *
  * El rango de puertos se elige en tiempo de ejecucion dentro del bloque
  * asignado al grupo. El descubrimiento recorre exactamente PORT_MIN..PORT_MAX y
- * aborta con DSM_ERR_CONFIG si encuentra un nodo con otro raw_hash, de modo que
+ * aborta con DSM_ERR_CONFIG si encuentra un nodo con otro shared_hash, de modo que
  * un tramo propio y libre deja el escaneo limitado a los dos nodos de la prueba.
  * Como el tramo puede ser ocupado por otro proceso entre la comprobacion y el
  * arranque, ese caso se reintenta con otro tramo y no se cuenta como fallo.
@@ -171,11 +171,10 @@ static void write_conf(const char *path, uint16_t port_min, uint16_t port_max)
             "VIEW_SIZE=4294967296\n"
             "MAX_RUNTIME_NODES=256\n"
             "VNODES_PER_MB=16\n"
-            "REDUNDANCY=NONE\n"
+            "REDUNDANCY=false\n"
             "NODE_MEM=67108864\n"
             "PORT_MIN=%u\n"
             "PORT_MAX=%u\n"
-            "PEER_HOSTS=127.0.0.1\n"
             "CONNECT_TIMEOUT_MS=1000\n"
             "DISCOVERY_TIMEOUT_MS=1000\n"
             "SEND_TIMEOUT_MS=4000\n"
@@ -506,7 +505,7 @@ static void run_child(const char *conf_b, int status_fd, int cmd_fd)
  * Un tramo se considera ajeno cuando, tras un fallo de arranque, alguno de sus
  * puertos ya no se puede tomar. Cubre dos casos: otro proceso se quedó con el
  * puerto, o hay un nodo de otro cluster escuchando en el tramo y el HELLO se
- * rechaza por raw_hash distinto.
+ * rechaza por shared_hash distinto.
  */
 static int window_taken_by_other(uint16_t port_min, uint16_t port_max)
 {

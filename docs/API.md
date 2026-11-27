@@ -16,6 +16,19 @@ implementación. Toda la información corresponde al código actual de `src/`.
   custodio de páginas, mientras que `client` usa la memoria del clúster sin
   aportar ninguna y nunca es custodio. Un cliente no cuenta en
   `dsm_node_count` ni en `dsm_global_size`.
+- `NODE_MEM` pertenece a cada PC y puede variar entre nodos. El `shared_hash`
+  se calcula solo sobre las claves que deben coincidir: `CLUSTER_ID`,
+  `PAGE_SIZE`, `BASE_ADDR`, `VIEW_SIZE`, `PORT_MIN`, `PORT_MAX`,
+  `DISCOVERY_GROUP`, `DISCOVERY_PORT`, `VNODES_PER_MB`, `HOME_SLACK` y
+  `REDUNDANCY`. Un archivo con distinto `NODE_MEM` y el resto igual se acepta.
+- El descubrimiento es descentralizado: cada nodo anuncia su UUID, nombre, IP,
+  puerto TCP, rol y páginas por UDP en `DISCOVERY_GROUP:DISCOVERY_PORT`, con
+  broadcast como respaldo. No hay lista de equipos. Los anuncios válidos se
+  convierten en sondas TCP `HELLO`/`WELCOME` y en `JOIN`; se rechazan si el
+  `cluster_id` o el `shared_hash` no coinciden.
+- `REDUNDANCY` es un booleano (`true`/`false` o `1`/`0`). Cuando está activo,
+  la unión exige al menos tres nodos vivos y el número de páginas de datos por
+  franja se deriva de la membresía: `K = nodos vivos - 1`, acotado a `[2, 8]`.
 - La columna **Estado** distingue:
   - **Implementada**: la función realiza la operación descrita.
   - **Implementada (parcial)**: la función ejecuta parte de la operación y el
@@ -29,10 +42,10 @@ implementación. Toda la información corresponde al código actual de `src/`.
 | Código | Valor | Significado | Devuelto por el API pública |
 |---|---:|---|---|
 | `DSM_OK` | 0 | Operación exitosa | Sí |
-| `DSM_ERR_CONFIG` | -1 | Error de configuración: archivo ausente, no regular, mayor a 1 MiB, línea o valor inválido, o discrepancia de `raw_hash` con un par | `dsm_init` |
+| `DSM_ERR_CONFIG` | -1 | Error de configuración: archivo ausente, no regular, mayor a 1 MiB, línea o valor inválido, discrepancia de la configuración compartida con un par, o `REDUNDANCY=true` con menos de tres nodos vivos | `dsm_init` |
 | `DSM_ERR_NOT_INIT` | -2 | El subsistema no está inicializado en este proceso | Todas salvo `dsm_init`, `dsm_is_initialized`, `dsm_strerror` |
 | `DSM_ERR_MEM` | -3 | Fallo de asignación de memoria, de hilos, de semáforos, de `memfd_create`/`mmap`/`ftruncate` o de instalación de SIGSEGV | `dsm_init`, `dsm_thread_attach` |
-| `DSM_ERR_NET` | -4 | Sin puerto libre, fallo de `listen`, conexión rechazada o socket caído | `dsm_init`, `dsm_alloc`, `dsm_free`, `dsm_lock`, `dsm_unlock`, `dsm_barrier`, `dsm_dist_launch`, `dsm_dist_collect`, `dsm_dist_verify`, `dsm_pages_global`, `dsm_html_report` |
+| `DSM_ERR_NET` | -4 | Sin puerto libre, fallo de `listen`, conexión rechazada, socket caído o apertura fallida del socket UDP de descubrimiento | `dsm_init`, `dsm_alloc`, `dsm_free`, `dsm_lock`, `dsm_unlock`, `dsm_barrier`, `dsm_dist_launch`, `dsm_dist_collect`, `dsm_dist_verify`, `dsm_pages_global`, `dsm_html_report` |
 | `DSM_ERR_TIMEOUT` | -5 | Tiempo de espera agotado (`request_timeout_ms`, `LOCK_TIMEOUT_MS` o `DIST_TIMEOUT_MS`) | `dsm_lock`, `dsm_barrier`, `dsm_dist_collect`, `dsm_dist_verify` |
 | `DSM_ERR_NO_SPACE` | -6 | Vista compartida sin páginas libres o sin ranuras de nodo | `dsm_init`, `dsm_alloc`, `dsm_free`, `dsm_lock`, `dsm_barrier`, `dsm_dist_register`, `dsm_dist_launch`, `dsm_pages_global`, `dsm_html_report` |
 | `DSM_ERR_INVALID` | -7 | Puntero de salida NULL, tamaño cero o índice fuera de rango | `dsm_init`, `dsm_alloc`, `dsm_free`, `dsm_lock`, `dsm_unlock`, `dsm_barrier`, `dsm_dist_register`, `dsm_dist_launch`, `dsm_dist_collect`, `dsm_dist_verify`, `dsm_node_id`, `dsm_node_count`, `dsm_global_size`, `dsm_stats`, `dsm_pages_global`, `dsm_html_report` |
@@ -47,8 +60,8 @@ implementación. Toda la información corresponde al código actual de `src/`.
 
 | Función | Firma | Descripción | Parámetros | Retorno | Errores | Estado |
 |---|---|---|---|---|---|---|
-| `dsm_init` | `dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)` | Carga y valida la configuración, eleva el límite de descriptores, ignora SIGPIPE, inicializa cola de fallos, membresía, red, directorio MSI y memoria virtual (vista en la dirección base más alias RW sobre el mismo memfd), instala el manejador de SIGSEGV, arranca listener, workers y despachadores, y ejecuta descubrimiento y unión al cluster. Si no hay pares, un nodo asume la ranura 0 con época 1, mientras que un cliente falla con `DSM_ERR_NO_SPACE` porque no puede aportar la memoria que ninguna página tendría como custodio. Si ya está inicializado, no hace nada y devuelve `DSM_OK`. | `conf_path`: ruta a `dsm.conf`, `NULL` para `"dsm.conf"`.<br>`node_mem_override`: bytes de memoria física a aportar; 0 usa `NODE_MEM` del archivo, >0 lo reemplaza y valida de nuevo. Un cliente ignora este valor. | `DSM_OK` si el nodo quedó inicializado. En error, los recursos ya adquiridos se liberan y el subsistema queda sin inicializar. | `DSM_ERR_CONFIG`, `DSM_ERR_MEM`, `DSM_ERR_NET`, `DSM_ERR_PROTO`, `DSM_ERR_NO_SPACE`, `DSM_ERR_INVALID` | Implementada |
-| `dsm_finalize` | `dsm_status_t dsm_finalize(void)` | Detiene el ciclo de ejecución, anuncia LEAVE, detiene heartbeat, despachadores y workers, cierra listener y conexiones, restaura el manejador de SIGSEGV previo, desmapea la memoria y destruye los módulos. Después, `dsm_is_initialized()` devuelve `false` y el subsistema puede inicializarse de nuevo. | Ninguno | `DSM_OK` si se finalizó. | `DSM_ERR_NOT_INIT` | Implementada |
+| `dsm_init` | `dsm_status_t dsm_init(const char *conf_path, uint64_t node_mem_override)` | Carga y valida la configuración, eleva el límite de descriptores, ignora SIGPIPE, inicializa cola de fallos, membresía, red, directorio MSI y memoria virtual (vista en la dirección base más alias RW sobre el mismo memfd), instala el manejador de SIGSEGV, arranca listener, workers, despachadores y el hilo de anuncios UDP, y ejecuta descubrimiento y unión al cluster. Sin redundancia, si no hay pares, un nodo asume la ranura 0 con época 1, mientras que un cliente falla con `DSM_ERR_NO_SPACE` porque no puede aportar la memoria que ninguna página tendría como custodio. Con `REDUNDANCY=true` la unión espera y exige al menos tres nodos vivos que aporten memoria; si no los reúne, falla con `DSM_ERR_CONFIG` y la paridad usa `K = nodos vivos - 1`, acotado a `[2, 8]`. Si ya está inicializado, no hace nada y devuelve `DSM_OK`. | `conf_path`: ruta a `dsm.conf`, `NULL` para `"dsm.conf"`.<br>`node_mem_override`: bytes de memoria física a aportar; 0 usa `NODE_MEM` del archivo, >0 lo reemplaza y valida de nuevo. Un cliente ignora este valor. | `DSM_OK` si el nodo quedó inicializado. En error, los recursos ya adquiridos se liberan y el subsistema queda sin inicializar. | `DSM_ERR_CONFIG`, `DSM_ERR_MEM`, `DSM_ERR_NET`, `DSM_ERR_PROTO`, `DSM_ERR_NO_SPACE`, `DSM_ERR_INVALID` | Implementada |
+| `dsm_finalize` | `dsm_status_t dsm_finalize(void)` | Detiene el ciclo de ejecución, cierra el socket y el hilo de descubrimiento UDP, anuncia LEAVE, detiene heartbeat, despachadores y workers, cierra listener y conexiones, restaura el manejador de SIGSEGV previo, desmapea la memoria y destruye los módulos. Después, `dsm_is_initialized()` devuelve `false` y el subsistema puede inicializarse de nuevo. | Ninguno | `DSM_OK` si se finalizó. | `DSM_ERR_NOT_INIT` | Implementada |
 | `dsm_is_initialized` | `bool dsm_is_initialized(void)` | Indica si existe contexto DSM activo en el proceso. | Ninguno | `true` entre un `dsm_init` exitoso y `dsm_finalize`; `false` en otro caso. | Ninguno | Implementada |
 
 ## Gestión de hilos de aplicación
@@ -143,7 +156,7 @@ valores de retorno del API pública.
 | `DSM_ST_BUSY` | 5 | Recurso ocupado por otra operación. |
 | `DSM_ST_SLOT_TAKEN` | 6 | La ranura ya está asignada a otro nodo. |
 | `DSM_ST_NO_SPACE` | 7 | Sin páginas o ranuras disponibles. |
-| `DSM_ST_CONFIG_MISMATCH` | 8 | `raw_hash` distinto entre pares. |
+| `DSM_ST_CONFIG_MISMATCH` | 8 | `shared_hash` distinto entre pares. |
 | `DSM_ST_NODE_DOWN` | 9 | El dueño de una copia modificada murió antes de devolverla; el estado es terminal hasta que la recuperación reasigne la página. |
 | `DSM_ST_INVALID` | 10 | Un participante anunció un parámetro distinto del fijado por el custodio. |
 
@@ -209,6 +222,30 @@ Las cargas fijas se serializan campo por campo y la cabecera conserva sus 56 byt
 | `DSM_WAIT_NONE` | `0xFFFFFFFF` | Sin entrada en cola de espera. |
 | `DSM_MAX_PAYLOAD` | 1 MiB | Payload máximo de un mensaje. |
 | `DSM_FAULTQ_CAP` | 4096 | Capacidad de la cola interna de fallos. |
+
+## Aplicación de ejemplo: multiplicación de matrices
+
+`apps/matmul_dsm.c` es una aplicación completa que usa el API como cualquier otro
+programa: reserva A, B y C con `dsm_alloc`, llena A y B con un patrón determinista,
+lanza H hilos que calculan filas de C, llama a `dsm_sync` y verifica el resultado contra
+una referencia secuencial en memoria local. Todo el acceso a las matrices se hace con los
+punteros de la vista; la referencia usa `malloc`.
+
+La aplicación se ejecuta como cliente, así que necesita al menos un nodo en marcha:
+
+```sh
+make release
+DSM_NODE_TAG=n1 ./build/bin/release/dsm dsm.conf   # terminal 1
+
+./build/bin/release/matmul_dsm 256 --conf dsm.conf --hilos 4
+./build/bin/release/matmul_dsm 64 --hilos 8
+```
+
+Argumentos: `[N] [--conf <archivo>] [--hilos H]`. `N` es el lado de las matrices
+cuadradas (256 por defecto, máximo 2048) y `H` el número de hilos (4 por defecto). Sin
+`--conf` se usa la carga por defecto de `dsm_init(NULL, 0)`, que lee `dsm.conf`. La salida
+incluye dimensiones, hilos, tiempo de cálculo, tiempo de `dsm_sync`, checksum,
+diferencia máxima y `VERIFICACION: OK` o `VERIFICACION: FALLO`.
 
 ## Ejemplo de uso
 

@@ -9,7 +9,7 @@
 #define PAGE_BYTES 4096u
 
 /*
- * Demostración de la redundancia RAID5. El productor se ejecuta como cliente
+ * Demostración de la redundancia con paridad. El productor se ejecuta como cliente
  * del clúster, reserva un bloque de la vista y escribe un patrón conocido. Tras
  * dsm_sync el contenido queda en los custodios y la paridad en sus franjas. El
  * cliente termina, de modo que ninguna copia local sobrevive. Los procesos

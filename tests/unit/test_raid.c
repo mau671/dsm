@@ -1,5 +1,5 @@
 /* ==============================================================================
- * test_raid.c — Suite de pruebas de la reconstruccion XOR de RAID5 (src/raid.c).
+ * test_raid.c — Suite de pruebas de la reconstruccion XOR de paridad (src/raid.c).
  *
  * Cobertura: identidad de reconstruccion con perdida de un dato, contradiccion
  * con la reconstruccion que omite la paridad, reconstruccion de la paridad y

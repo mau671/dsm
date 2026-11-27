@@ -116,11 +116,10 @@ static void write_conf(const char *path, uint16_t port_min, uint16_t port_max)
             "VIEW_SIZE=4294967296\n"
             "MAX_RUNTIME_NODES=256\n"
             "VNODES_PER_MB=16\n"
-            "REDUNDANCY=NONE\n"
+            "REDUNDANCY=false\n"
             "NODE_MEM=67108864\n"
             "PORT_MIN=%u\n"
             "PORT_MAX=%u\n"
-            "PEER_HOSTS=127.0.0.1\n"
             "CONNECT_TIMEOUT_MS=1000\n"
             "DISCOVERY_TIMEOUT_MS=1000\n"
             "SEND_TIMEOUT_MS=4000\n"
@@ -382,7 +381,7 @@ static int run_scenario(uint16_t port_min, uint16_t port_max)
             /*
              * Un tramo ocupado por otro proceso no es un fallo del reparto:
              * puede ser un puerto ya tomado o un nodo de otro cluster que
-             * rechaza el HELLO por raw_hash distinto. En ambos casos la
+             * rechaza el HELLO por shared_hash distinto. En ambos casos la
              * corrida se reintenta con otro tramo.
              */
             if (res[i].rc == DSM_ERR_CONFIG || res[i].rc == DSM_ERR_NET ||
