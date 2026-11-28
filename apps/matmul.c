@@ -243,9 +243,9 @@ int main(int argc, char **argv)
 
     dsm_status_t st = dsm_init(conf, 0);
     if (st != DSM_OK) {
-        fprintf(stderr, "matmul_dsm: dsm_init falló: %s\n", dsm_strerror(st));
+        fprintf(stderr, "matmul: dsm_init falló: %s\n", dsm_strerror(st));
         if (st == DSM_ERR_NO_SPACE) {
-            fprintf(stderr, "matmul_dsm: inicie al menos un nodo del clúster "
+            fprintf(stderr, "matmul: inicie al menos un nodo del clúster "
                             "antes de ejecutar la aplicación\n");
         }
         return 1;
@@ -253,7 +253,7 @@ int main(int argc, char **argv)
 
     st = dsm_thread_attach();
     if (st != DSM_OK) {
-        fprintf(stderr, "matmul_dsm: dsm_thread_attach falló: %s\n",
+        fprintf(stderr, "matmul: dsm_thread_attach falló: %s\n",
                 dsm_strerror(st));
         goto fin_dsm;
     }
@@ -273,7 +273,7 @@ int main(int argc, char **argv)
            (double)total / (1024.0 * 1024.0));
 
     if (total != 0 && 3u * bytes > total) {
-        fprintf(stderr, "matmul_dsm: A, B y C necesitan %.2f MiB y el clúster "
+        fprintf(stderr, "matmul: A, B y C necesitan %.2f MiB y el clúster "
                         "ofrece %.2f MiB; reduzca N o aumente NODE_MEM\n",
                 3.0 * (double)bytes / (1024.0 * 1024.0),
                 (double)total / (1024.0 * 1024.0));
@@ -282,17 +282,17 @@ int main(int argc, char **argv)
 
     st = dsm_alloc(bytes, &mem_a);
     if (st != DSM_OK) {
-        fprintf(stderr, "matmul_dsm: dsm_alloc de A falló: %s\n", dsm_strerror(st));
+        fprintf(stderr, "matmul: dsm_alloc de A falló: %s\n", dsm_strerror(st));
         goto fin_dsm;
     }
     st = dsm_alloc(bytes, &mem_b);
     if (st != DSM_OK) {
-        fprintf(stderr, "matmul_dsm: dsm_alloc de B falló: %s\n", dsm_strerror(st));
+        fprintf(stderr, "matmul: dsm_alloc de B falló: %s\n", dsm_strerror(st));
         goto fin_a;
     }
     st = dsm_alloc(bytes, &mem_c);
     if (st != DSM_OK) {
-        fprintf(stderr, "matmul_dsm: dsm_alloc de C falló: %s\n", dsm_strerror(st));
+        fprintf(stderr, "matmul: dsm_alloc de C falló: %s\n", dsm_strerror(st));
         goto fin_b;
     }
 
@@ -302,7 +302,7 @@ int main(int argc, char **argv)
     ids = calloc(hilos, sizeof(*ids));
     trabajos = calloc(hilos, sizeof(*trabajos));
     if (!ids || !trabajos) {
-        fprintf(stderr, "matmul_dsm: sin memoria local para %u hilos\n", hilos);
+        fprintf(stderr, "matmul: sin memoria local para %u hilos\n", hilos);
         goto fin_c;
     }
 
@@ -318,7 +318,7 @@ int main(int argc, char **argv)
     uint64_t inicio = instante_ns();
     for (uint32_t i = 0; i < hilos; i++) {
         if (pthread_create(&ids[i], NULL, hilo_multiplicacion, &trabajos[i]) != 0) {
-            fprintf(stderr, "matmul_dsm: no se pudo crear el hilo %u\n", i);
+            fprintf(stderr, "matmul: no se pudo crear el hilo %u\n", i);
             break;
         }
         lanzados++;
@@ -332,7 +332,7 @@ int main(int argc, char **argv)
     uint64_t fin = instante_ns();
 
     if (fallo) {
-        fprintf(stderr, "matmul_dsm: algún hilo no pudo calcular su bloque de filas\n");
+        fprintf(stderr, "matmul: algún hilo no pudo calcular su bloque de filas\n");
         goto fin_c;
     }
 
@@ -351,7 +351,7 @@ int main(int argc, char **argv)
     b_local = malloc((size_t)bytes);
     fila = malloc((size_t)n * sizeof(double));
     if (!a_local || !b_local || !fila) {
-        fprintf(stderr, "matmul_dsm: sin memoria local para la referencia "
+        fprintf(stderr, "matmul: sin memoria local para la referencia "
                         "secuencial de %.2f MiB\n",
                 2.0 * (double)bytes / (1024.0 * 1024.0));
         goto fin_c;
@@ -387,7 +387,7 @@ fin_c:
     if (mem_c != NULL) {
         dsm_status_t fr = dsm_free(mem_c, bytes);
         if (fr != DSM_OK) {
-            fprintf(stderr, "matmul_dsm: dsm_free de C falló: %s\n",
+            fprintf(stderr, "matmul: dsm_free de C falló: %s\n",
                     dsm_strerror(fr));
             rc = 1;
         }
@@ -396,7 +396,7 @@ fin_b:
     if (mem_b != NULL) {
         dsm_status_t fr = dsm_free(mem_b, bytes);
         if (fr != DSM_OK) {
-            fprintf(stderr, "matmul_dsm: dsm_free de B falló: %s\n",
+            fprintf(stderr, "matmul: dsm_free de B falló: %s\n",
                     dsm_strerror(fr));
             rc = 1;
         }
@@ -405,7 +405,7 @@ fin_a:
     if (mem_a != NULL) {
         dsm_status_t fr = dsm_free(mem_a, bytes);
         if (fr != DSM_OK) {
-            fprintf(stderr, "matmul_dsm: dsm_free de A falló: %s\n",
+            fprintf(stderr, "matmul: dsm_free de A falló: %s\n",
                     dsm_strerror(fr));
             rc = 1;
         }

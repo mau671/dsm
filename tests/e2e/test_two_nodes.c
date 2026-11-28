@@ -1,6 +1,6 @@
 #include "e2e_harness.h"
 
-#define TEST_APP "./build/bin/debug/test_basico"
+#define TEST_APP "./build/bin/debug/demo"
 
 #define PORT_BASE 27664u
 #define PORT_SPAN 32u
@@ -54,7 +54,7 @@ static void write_config(uint16_t port_min, uint16_t port_max)
 }
 
 /* Exige que cada clave aparezca en la línea de estadísticas con un valor
- * mayor que cero. El formato lo produce print_stats() de apps/test_basico.c. */
+ * mayor que cero. El formato lo produce msi_print_stats() de apps/demo.c. */
 static bool stats_positive(const char *line, const char *const *keys,
                            size_t nkeys)
 {
@@ -98,7 +98,7 @@ int main(void)
     char line[512] = "";
     char va[64] = "";
 
-    char *a_argv[] = { TEST_APP, "A", e2e_state.conf_path, NULL };
+    char *a_argv[] = { TEST_APP, "msi", "a", e2e_state.conf_path, NULL };
     e2e_child_t *node_a = e2e_start_child("two_nodes_a", NULL, NULL, a_argv);
     if (!node_a || node_a->pid <= 0) {
         printf("FAIL: no se pudo iniciar nodo A\n");
@@ -133,7 +133,8 @@ int main(void)
 
     e2e_child_t *node_b = NULL;
     if (pass) {
-        char *b_argv[] = { TEST_APP, "B", e2e_state.conf_path, va, NULL };
+        char *b_argv[] = { TEST_APP, "msi", "b", e2e_state.conf_path, va,
+                           NULL };
         node_b = e2e_start_child("two_nodes_b", NULL, NULL, b_argv);
         if (!node_b || node_b->pid <= 0) {
             printf("FAIL: no se pudo iniciar nodo B\n");

@@ -110,11 +110,11 @@ ninguna, así que ejecutarlas no agrega un nodo. Solo necesitan un clúster en m
 ./build/bin/release/juego_vida --imagen datos/tablero_192.gray --verificar 192 192 30 4
 
 # Multiplicación de matrices cuadradas sobre la vista distribuida
-./build/bin/release/matmul_dsm 256 --hilos 4
-./build/bin/release/matmul_dsm 256 --conf dsm.conf --hilos 8
+./build/bin/release/matmul 256 --hilos 4
+./build/bin/release/matmul 256 --conf dsm.conf --hilos 8
 ```
 
-`matmul_dsm` reserva A, B y C con `dsm_alloc`, llena A y B con un patrón determinista,
+`matmul` reserva A, B y C con `dsm_alloc`, llena A y B con un patrón determinista,
 reparte las filas de C entre los hilos y llama a `dsm_sync`. Después calcula el checksum
 de C y lo compara elemento por elemento contra una referencia secuencial en memoria local,
 e imprime `VERIFICACION: OK` o `VERIFICACION: FALLO`. `N` vale 256 por defecto y cada
@@ -132,6 +132,26 @@ secuencia RGB24 cruda.
 
 `--verificar` repite la simulación en memoria normal y compara el tablero final celda por
 celda contra el que se ejecutó sobre DSM.
+
+`demo` reúne las demostraciones de coherencia, ejecución distribuida y paridad:
+
+```sh
+# Coherencia MSI entre dos procesos
+./build/bin/release/demo msi a dsm.conf          # publica la dirección de la página
+./build/bin/release/demo msi b dsm.conf <dir>    # lee y escribe la página de a
+
+# Ejecución distribuida: coordinador y trabajador
+./build/bin/release/demo dist coord dsm.conf
+./build/bin/release/demo dist worker dsm.conf
+
+# Paridad: tres nodos que custodian y un productor cliente
+./build/bin/release/demo raid hold dsm.conf
+./build/bin/release/demo raid produce dsm.conf 24 3
+```
+
+Los roles `dist coord` y `raid produce` leen órdenes por la entrada estándar; las pruebas de
+extremo a extremo los controlan así. `raid hold` mantiene el proceso vivo como custodio y
+`raid produce` termina tras sincronizar y verificar el patrón.
 
 ### Escribir una aplicación
 
@@ -185,7 +205,7 @@ int main(void)
 | Perfil | Contenido |
 | --- | --- |
 | `make release` | `-O2 -DNDEBUG` |
-| `make debug` | `-g3 -O0`, incluye `test_basico` |
+| `make debug` | `-g3 -O0`, con símbolos para depuración |
 | `make asan` | AddressSanitizer + UBSan |
 | `make tsan` | ThreadSanitizer |
 
@@ -202,7 +222,7 @@ make test-e2e    # escenarios con procesos reales por la API pública
 ```
 include/     cabeceras; dsm.h es la única que una aplicación necesita
 src/         núcleo: config, wire, net, util, discovery, mem, msi, ring, raid, dist, report, sigsegv, sync, worker
-apps/        dsm (nodo), test_basico, filtro_video, juego_vida, dsm_dist_demo, dsm_raid_demo, matmul_dsm
+apps/        dsm (nodo), demo, matmul, filtro_video, juego_vida
 tools/       dsmctl y video_pack
 tests/       unit/ y e2e/ (flujo MSI, ejecución distribuida y reconstrucción con paridad)
 docs/        API.md e informes compilados

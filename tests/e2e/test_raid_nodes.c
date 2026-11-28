@@ -1,7 +1,7 @@
 #include "e2e_harness.h"
 #include "dsm_types.h"
 
-#define RAID_APP   "./build/bin/debug/dsm_raid_demo"
+#define RAID_APP   "./build/bin/debug/demo"
 #define DSMCTL_APP "./build/bin/debug/dsmctl"
 
 #define PORT_BASE   27632u
@@ -272,7 +272,7 @@ int main(void)
         snprintf(name, sizeof(name), "raid_hold_%u", i);
         snprintf(tag, sizeof(tag), "e2e_raid_hold_%ld_%u", (long)getpid(), i);
 
-        char *argv[] = { RAID_APP, "hold", e2e_state.conf_path, NULL };
+        char *argv[] = { RAID_APP, "raid", "hold", e2e_state.conf_path, NULL };
         nodes[i] = e2e_start_child(name, tag, NULL, argv);
         if (!nodes[i] || nodes[i]->pid <= 0) {
             printf("FAIL: no se pudo iniciar el nodo %u\n", i);
@@ -337,8 +337,8 @@ int main(void)
         char tag[64];
         snprintf(tag, sizeof(tag), "e2e_raid_producer_%ld", (long)getpid());
 
-        char *argv[] = { RAID_APP, "produce", e2e_state.conf_path, pages_text,
-                         nodes_text, NULL };
+        char *argv[] = { RAID_APP, "raid", "produce", e2e_state.conf_path,
+                         pages_text, nodes_text, NULL };
         producer = e2e_start_child("raid_producer", tag, "client", argv);
         if (!producer || producer->pid <= 0) {
             printf("FAIL: no se pudo iniciar el productor\n");

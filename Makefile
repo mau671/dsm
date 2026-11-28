@@ -82,14 +82,6 @@ $$(BUILD)/bin/$(1)/dsmctl: tools/dsmctl.c $$(BUILD)/lib/$(1)/libdsm.a | $$(BUILD
 $$(BUILD)/bin/$(1)/video_pack: tools/video_pack.c | $$(BUILD)/bin/$(1)
 	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< \
 	      $$(LDFLAGS_COMMON) $$(LDFLAGS_$(2)) -o $$@
-
-$$(BUILD)/bin/$(1)/dsm_dist_demo: apps/dsm_dist_demo.c $$(BUILD)/lib/$(1)/libdsm.a | $$(BUILD)/bin/$(1)
-	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< -L$$(BUILD)/lib/$(1) -ldsm \
-	      $$(LDFLAGS_COMMON) $$(LDFLAGS_$(2)) -o $$@
-
-$$(BUILD)/bin/$(1)/dsm_raid_demo: apps/dsm_raid_demo.c $$(BUILD)/lib/$(1)/libdsm.a | $$(BUILD)/bin/$(1)
-	$$(CC) $$(CFLAGS_COMMON) $$(CFLAGS_$(2)) $$< -L$$(BUILD)/lib/$(1) -ldsm \
-	      $$(LDFLAGS_COMMON) $$(LDFLAGS_$(2)) -o $$@
 endef
 
 profile_release := OPT
@@ -102,13 +94,12 @@ $(foreach p,$(PROFILES),$(eval $(call build_profile,$(p),$(profile_$(p)))))
 release: $(BUILD)/lib/release/libdsm.a \
          $(BUILD)/bin/release/dsm $(BUILD)/bin/release/dsmctl \
          $(BUILD)/bin/release/filtro_video $(BUILD)/bin/release/juego_vida \
-         $(BUILD)/bin/release/dsm_dist_demo $(BUILD)/bin/release/dsm_raid_demo \
-         $(BUILD)/bin/release/matmul_dsm $(BUILD)/bin/release/video_pack
+         $(BUILD)/bin/release/demo $(BUILD)/bin/release/matmul \
+         $(BUILD)/bin/release/video_pack
 debug:   $(BUILD)/lib/debug/libdsm.a \
          $(BUILD)/bin/debug/dsm $(BUILD)/bin/debug/dsmctl \
-         $(BUILD)/bin/debug/test_basico $(BUILD)/bin/debug/filtro_video \
-         $(BUILD)/bin/debug/juego_vida $(BUILD)/bin/debug/dsm_dist_demo \
-         $(BUILD)/bin/debug/dsm_raid_demo $(BUILD)/bin/debug/matmul_dsm \
+         $(BUILD)/bin/debug/filtro_video $(BUILD)/bin/debug/juego_vida \
+         $(BUILD)/bin/debug/demo $(BUILD)/bin/debug/matmul \
          $(BUILD)/bin/debug/video_pack
 asan:    $(BUILD)/lib/asan/libdsm.a \
          $(BUILD)/bin/asan/dsm $(BUILD)/bin/asan/dsmctl

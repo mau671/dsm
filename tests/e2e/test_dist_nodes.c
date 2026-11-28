@@ -1,6 +1,6 @@
 #include "e2e_harness.h"
 
-#define PRODUCER_APP "./build/bin/debug/dsm_dist_demo"
+#define PRODUCER_APP "./build/bin/debug/demo"
 
 #define PORT_BASE   27600u
 #define PORT_SPAN   32u
@@ -78,8 +78,10 @@ int main(void)
     write_config(port_min, port_max);
     printf("  Puertos: %u-%u\n", (unsigned)port_min, (unsigned)port_max);
 
-    char *coord_argv[] = { PRODUCER_APP, "coord", e2e_state.conf_path, NULL };
-    char *worker_argv[] = { PRODUCER_APP, "worker", e2e_state.conf_path, NULL };
+    char *coord_argv[] = { PRODUCER_APP, "dist", "coord",
+                           e2e_state.conf_path, NULL };
+    char *worker_argv[] = { PRODUCER_APP, "dist", "worker",
+                            e2e_state.conf_path, NULL };
 
     bool pass = true;
     e2e_child_t *coord = e2e_start_child("dist_coord", tag_coord, NULL,

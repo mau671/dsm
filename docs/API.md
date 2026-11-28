@@ -225,7 +225,7 @@ Las cargas fijas se serializan campo por campo y la cabecera conserva sus 56 byt
 
 ## Aplicación de ejemplo: multiplicación de matrices
 
-`apps/matmul_dsm.c` es una aplicación completa que usa el API como cualquier otro
+`apps/matmul.c` es una aplicación completa que usa el API como cualquier otro
 programa: reserva A, B y C con `dsm_alloc`, llena A y B con un patrón determinista,
 lanza H hilos que calculan filas de C, llama a `dsm_sync` y verifica el resultado contra
 una referencia secuencial en memoria local. Todo el acceso a las matrices se hace con los
@@ -237,8 +237,8 @@ La aplicación se ejecuta como cliente, así que necesita al menos un nodo en ma
 make release
 DSM_NODE_TAG=n1 ./build/bin/release/dsm dsm.conf   # terminal 1
 
-./build/bin/release/matmul_dsm 256 --conf dsm.conf --hilos 4
-./build/bin/release/matmul_dsm 64 --hilos 8
+./build/bin/release/matmul 256 --conf dsm.conf --hilos 4
+./build/bin/release/matmul 64 --hilos 8
 ```
 
 Argumentos: `[N] [--conf <archivo>] [--hilos H]`. `N` es el lado de las matrices
