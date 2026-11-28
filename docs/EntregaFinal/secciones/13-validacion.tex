@@ -1,0 +1,133 @@
+\section{Validación experimental}\label{sec:validacion}
+
+\subsection{Entorno y metodología}
+
+La validación combina pruebas de extremo a extremo con corridas de las aplicaciones sobre la vista distribuida. El objetivo no es medir el rendimiento máximo de la máquina, sino comprobar que la coherencia, la reconstrucción y la ejecución remota producen resultados idénticos a una referencia secuencial cuando el clúster trabaja con memoria que ningún proceso contiene por completo. Cada escenario arranca procesos reales, con binarios compilados en el perfil que corresponde, y compara la salida del sistema contra un cálculo local independiente. Un escenario se declara exitoso solo si la comparación es exacta y, en los casos de tolerancia a fallos, si la operación afectada sigue disponible después de la baja.
+
+Los cuatro perfiles de compilación se construyen con \texttt{make release}, \texttt{make debug}, \texttt{make asan} y \texttt{make tsan}. Los perfiles comparten \texttt{-Wall -Wextra -Wpedantic -Werror}, de modo que una advertencia impide generar el binario; las cuatro construcciones terminan sin avisos. Las pruebas de extremo a extremo usan los binarios de \texttt{debug} para conservar símbolos, mientras que las mediciones de las aplicaciones se hacen con \texttt{release}. Esa separación permite que un fallo de la prueba se depure con nombres y líneas, sin mezclar el costo de las comprobaciones de depuración con los tiempos que se reportan.
+
+La prueba de extremo a extremo crea un archivo de configuración temporal con un identificador de clúster propio y un bloque de puertos libre, elige un grupo de descubrimiento distinto para no interferir con otras corridas y lanza los procesos con etiquetas únicas. La espera no se basa en dormir un tiempo fijo: el arnés lee la salida de cada proceso hasta encontrar un marcador, con un plazo amplio, y falla si el marcador no aparece o si el proceso termina antes. Los escenarios cubren el flujo MSI entre dos nodos, la ejecución distribuida entre un coordinador y un trabajador, y la caída de un custodio en un clúster con paridad. La orden \texttt{make test-e2e} ejecuta los tres y reporta un resultado por escenario.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    font=\footnotesize,
+    box/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, minimum width=2.9cm, minimum height=1.15cm},
+    pc/.style={draw=bordergreen, fill=softgreen, thick, rounded corners, align=center, minimum width=3.0cm, minimum height=1.15cm},
+    cli/.style={draw=borderorange, fill=softorange, thick, rounded corners, align=center, minimum width=3.0cm, minimum height=1.15cm},
+    sw/.style={draw=purple!60!black, fill=softpurple, thick, rounded corners, align=center, minimum width=3.3cm, minimum height=1.15cm},
+    link/.style={{Latex[length=2mm]}-{Latex[length=2mm]}, thick, draw=black!55},
+    flow/.style={-{Latex[length=2mm]}, thick, draw=black!55},
+    note/.style={font=\scriptsize, text=black!65, align=center}
+]
+
+\node[cli] (cli) at (0.8,0) {\textbf{Cliente}\\ \texttt{matmul}, \texttt{demo}\\ no aporta memoria};
+\node[sw] (sw) at (4.9,0) {\textbf{Switch}\\ TCP 27600--27699\\ UDP \texttt{239.255.42.99}};
+
+\node[pc] (p0) at (9.4,2.35) {\textbf{PC 0}\\ 256 MiB\\ ranura 0};
+\node[pc] (p1) at (12.9,2.35) {\textbf{PC 1}\\ 128 MiB\\ ranura 1};
+\node[pc] (p2) at (9.4,-2.35) {\textbf{PC 2}\\ 128 MiB\\ ranura 2};
+\node[pc] (p3) at (12.9,-2.35) {\textbf{PC 3}\\ 128 MiB\\ ranura 3};
+
+\draw[link] (cli.east) -- node[above, font=\scriptsize] {TCP} (sw.west);
+\draw[link, dashed] (cli.south) to[bend right=12] node[below, font=\scriptsize] {anuncio UDP} (sw.south);
+
+\draw[flow] (sw.east) -- (p0.west);
+\draw[flow] (sw.east) -- (p1.west);
+\draw[flow] (sw.east) -- (p2.west);
+\draw[flow] (sw.east) -- (p3.west);
+
+\node[note, above=0.28cm of sw] {configuración compartida\\ \texttt{NODE\_MEM} local};
+\end{tikzpicture}
+\caption{Montaje de validación del clúster físico con cuatro equipos y un cliente.}
+\label{fig:montaje-validacion}
+\end{figure}
+
+La figura~\ref{fig:montaje-validacion} resume el montaje del clúster del laboratorio. Los cuatro equipos aportan memoria y se descubren por anuncios UDP en el mismo grupo; el cliente se conecta al clúster, usa la vista y no aporta páginas, de modo que ejecutar una aplicación no altera el tamaño ni la composición de la membresía. La configuración compartida debe coincidir en todos los procesos, mientras que \texttt{NODE\_MEM} puede variar y de hecho varía en el montaje físico, donde un equipo aporta el doble que los otros tres. Esa heterogeneidad es deliberada: comprueba que el anillo ponderado y el reparto de páginas aceptan capacidades distintas sin exigir la misma memoria en cada máquina.
+
+Las corridas locales usan un solo equipo con varios procesos. El clúster local de referencia tiene cuatro nodos de 64 MiB, es decir, 256 MiB de capacidad agregada, con \texttt{REDUNDANCY=false}. La prueba de paridad usa tres nodos de 16 MiB con \texttt{REDUNDANCY=true} y un productor cliente, porque la redundancia exige al menos tres nodos vivos y deriva el número de datos por franja de la membresía. Las aplicaciones de medición se ejecutan como clientes, así que sus fallos de página se contabilizan en el proceso de la aplicación y no en los nodos que custodian las páginas, un detalle que conviene recordar al leer las estadísticas de \texttt{dsmctl}.
+
+\subsection{Coherencia MSI entre dos nodos}
+
+El primer escenario comprueba el camino completo de una página entre dos procesos. El proceso A se une al clúster, reserva una página, escribe un valor y publica la dirección virtual que recibió de \texttt{dsm\_alloc}. El proceso B se une después, recibe esa dirección y lee la página; la lectura falla porque B no tiene copia, el despachador consulta al custodio y la página llega con permiso de lectura. B escribe entonces un valor distinto, lo que obliga a invalidar o degradar la copia de A, y A vuelve a leer la página para confirmar que observa el valor escrito por B.
+
+La prueba no exige que A reciba un mensaje de invalidación. Cuando B se une, el anillo puede cambiar y convertir a B en el nuevo custodio de la página; en ese caso A entrega su copia al nuevo custodio durante la sonda de traspaso y la suelta sin que haya una invalidación explícita que contar. La garantía observable es más fuerte que un contador: A debe volver a fallar para leer el valor de B, y la línea de estadísticas de A muestra \texttt{read\_faults} y \texttt{faults\_serviced} mayores que cero. El escenario termina con \texttt{PASS} y confirma que la coherencia no depende de que el custodio original permanezca en el mismo nodo.
+
+El flujo ejercita las tres transiciones que sostienen el modelo. La lectura desde \texttt{I} instala una copia en \texttt{S}. La escritura desde \texttt{S} asciende a \texttt{M} después de invalidar las demás copias y esperar sus acuses. La lectura posterior desde una copia invalidada vuelve a \texttt{I} y repite la solicitud. Los estados transitorios aparecen en medio de cada una de esas transiciones, y el hecho de que el escenario termine sin bloqueos indica que el despachador y los trabajadores se coordinan sin que el manejador de la señal espere por la red.
+
+\subsection{Multiplicación de matrices en el clúster}
+
+La multiplicación de matrices es la prueba de carga con resultado numérico más directa. \texttt{matmul} reserva tres matrices de $N \times N$ elementos \texttt{double} con \texttt{dsm\_alloc}, llena A y B con un patrón determinista, reparte las filas de C entre los hilos y llama a \texttt{dsm\_sync} antes de verificar. La verificación calcula el checksum de C y compara cada elemento contra una referencia secuencial en memoria local, de modo que un solo valor distinto cambia el conteo de diferencias y el veredicto final.
+
+La corrida de referencia usa $N=256$, cuatro hilos y el clúster local de cuatro nodos con 64 MiB por nodo. Cada matriz ocupa 0.5 MiB y las tres juntas 1.5 MiB, una carga pequeña frente a los 256 MiB aportados, pero suficiente para que las páginas se materialicen en custodios distintos y para que los hilos compitan por páginas compartidas. El resultado es un checksum de 41107839280, idéntico al de la referencia, con 0 de 65536 elementos distintos. La sincronización tarda 0.519 s, el cálculo 0.253 s y la referencia secuencial 0.048 s.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}r r r r r r r Y@{}}
+\toprule
+\textbf{N} & \textbf{Hilos} & \textbf{Nodos} & \textbf{Memoria} & \textbf{\texttt{dsm\_sync}} & \textbf{Cálculo} & \textbf{Distintos} & \textbf{Resultado} \\
+\midrule
+256 & 4 & 4 & 256 MiB & 0.519 s & 0.253 s & 0 de 65536 & Checksum correcto \\
+256 & --- & 4 & 640 MiB & --- & --- & 0 de 65536 & Checksum verificado \\
+\bottomrule
+\end{tabularx}
+\caption{Corridas de \texttt{matmul} sobre la vista distribuida. El guion indica un dato que la corrida no registra; la verificación del checksum no depende de esas marcas.}
+\label{tab:corridas}
+\end{table}
+
+La tabla~\ref{tab:corridas} reúne las dos configuraciones medidas. La primera es homogénea y permite descomponer el tiempo; la segunda es el clúster físico heterogéneo de la subsección~\ref{sec:cluster-fisico}, donde la corrida confirma el checksum pero no conserva los tiempos parciales. La comparación relevante no es el tiempo absoluto, que depende de la máquina y de la carga del laboratorio, sino la igualdad del resultado y la proporción entre cálculo y sincronización. El cálculo sobre la vista queda por encima de la referencia secuencial porque cada primer acceso a una página dispara un fallo, una transición MSI y, cuando la página es remota, un intercambio por TCP. La sincronización es la partida dominante porque recorre las páginas modificadas y las persiste en el custodio, un costo que la referencia local no paga.
+
+\subsection{Juego de la vida y filtro de video}
+
+Las dos aplicaciones de prueba someten al sistema a patrones de acceso distintos. El filtro de video convierte un archivo RGB24 en escala de grises y escribe un byte por píxel; cada hilo toma un bloque contiguo de cuadros y la primera escritura sobre cada página de salida produce un fallo. El juego de la vida mantiene dos tableros y alterna entre ellos en cada generación; cada celda lee sus ocho vecinas, así que las filas del borde de un bloque tocan páginas que otro hilo puede estar modificando. El primer caso presiona la escritura densa y el segundo la lectura con fronteras entre bloques.
+
+El filtro se ejecuta sobre el video versionado en \texttt{data/video\_128x96.rgb} con cuatro hilos. Una comprobación externa compara la salida byte por byte contra una conversión secuencial que aplica la misma fórmula de luminancia entera, de modo que una diferencia solo puede provenir de la coherencia y no de la convención de redondeo. La comparación recorre todos los píxeles y no encuentra discrepancias, y el programa informa los fallos de escritura atendidos junto con el rendimiento. La ejecución confirma que la vista compartida sirve para un flujo de datos que supera la memoria de un nodo cuando el clúster aporta páginas suficientes, sin que la aplicación tenga que copiar el archivo completo a memoria local.
+
+El autómata se ejecuta sobre la fotografía versionada en \texttt{data/tablero\_192.gray}, con el tablero de 192 por 192 celdas, 30 generaciones y cuatro hilos. La opción \texttt{--verificar} repite la simulación en memoria normal con la misma semilla y la misma convención de borde toroidal, y compara el tablero final celda por celda. El programa informa una coincidencia exacta y, cuando hay una diferencia, la fila y la columna de la primera celda distinta. La prueba cubre un patrón de acceso con dependencias entre filas y columnas, distinto de la multiplicación de matrices, donde cada hilo escribe filas completas de C sin leer lo que escriben los demás.
+
+Las dos aplicaciones usan la API como cualquier programa externo: \texttt{dsm\_init}, \texttt{dsm\_thread\_attach} en cada hilo que toca la vista, \texttt{dsm\_alloc} para las regiones y \texttt{dsm\_finalize} al terminar. Ninguna llama a \texttt{read} o \texttt{write} directamente sobre la vista, porque el kernel no puede resolver un fallo de página del DSM desde el contexto de una llamada al sistema; las dos copian a través de un búfer intermedio y dejan que el \texttt{memcpy} dispare el fallo que el despachador sí atiende. Esa restricción es parte del contrato de uso y aparece en las dos aplicaciones sin excepciones.
+
+\subsection{Ejecución distribuida entre procesos}
+
+El escenario distribuido arranca un coordinador y un trabajador como procesos independientes, cada uno con su propia conexión al clúster y su propia tabla de kernels. El coordinador registra el kernel de demostración, reserva un bloque en la vista y espera la orden \texttt{LAUNCH} con la ranura del trabajador. Al recibirla, divide el trabajo en ocho particiones y las reparte por turno entre los dos procesos; cuatro se ejecutan en el trabajador remoto y cuatro en el coordinador. El trabajador registra el mismo \texttt{kernel\_id} antes de recibir la orden, porque el registro es local y el coordinador no transporta código.
+
+Cada partición se describe con direcciones de la vista, no con direcciones del montón de un proceso. El trabajador construye el descriptor, ejecuta el kernel en el hilo que atendió el mensaje y calcula el CRC32 del rango de salida. El resultado viaja en \texttt{DIST\_DONE} con el estado, la cantidad de elementos, el CRC, la duración y los contadores de fallos de lectura y escritura. El coordinador guarda cada resultado, rechaza un identificador repetido o fuera de rango y espera a que lleguen todas las particiones. La verificación compara el XOR de los CRC32 de las particiones con el valor esperado, de modo que el resultado agregado no depende del orden de llegada.
+
+La corrida termina con \texttt{DIST PASS remote=4 total=8 verify=ok lectura=ok}. El campo \texttt{remote=4} confirma que la mitad de las particiones se ejecutó en el otro proceso; \texttt{total=8} confirma que no se perdió ninguna; \texttt{verify=ok} confirma que el CRC agregado coincide; \texttt{lectura=ok} confirma que el trabajador pudo leer el rango compartido que el coordinador había escrito. La prueba no se limita a comprobar que los mensajes llegaron: exige que el resultado numérico sea el correcto y que al menos una partición haya cruzado la red. Ese último requisito evita que un reparto que ejecuta todo localmente se declare exitoso.
+
+El escenario también muestra que la ejecución distribuida se apoya en el mismo camino de fallos que las aplicaciones. Antes de invocar el kernel, el trabajador registra la pila alternativa del hilo, de modo que un acceso a una página que no tiene se resuelve por \texttt{SIGSEGV} y por el despachador, igual que en un hilo de aplicación. La partición puede leer y escribir la vista sin conocer si la página es local o remota. La diferencia está en el costo: una partición remota paga los fallos de página y los mensajes de coherencia, mientras que una local los resuelve contra su propio custodio cuando coincide con la ranura.
+
+\subsection{Caída de nodo y reconstrucción con paridad}
+
+La prueba de paridad arranca tres nodos con \texttt{REDUNDANCY=true}, un productor cliente y un bloque de 24 páginas. El productor escribe un patrón verificable, llama a \texttt{dsm\_sync} y termina; al cerrarse, sus copias locales desaparecen y el contenido queda en los custodios y en la paridad. La prueba consulta el directorio global para elegir una víctima y, sobre todo, para elegir páginas cuya franja conserve la compañera y la paridad. Una franja con dos páginas de datos en el mismo nodo pierde dos incógnitas cuando ese nodo cae, así que esas páginas no se pueden reconstruir y la prueba no las elige.
+
+Después de la sincronización, la prueba derriba uno de los nodos custodios con \texttt{SIGKILL}. La detección de la baja no es instantánea: el detector espera los latidos perdidos, declara el nodo muerto, actualiza la membresía y encola la reconstrucción. El hilo de reconstrucción recorre las franjas afectadas, elige un líder entre las ranuras vivas y reúne la paridad y los datos supervivientes con \texttt{STRIPE\_READ}. Para cada franja calcula el bloque faltante por XOR y lo entrega al nuevo custodio. La prueba espera a que el contador de franjas reconstruidas deje de crecer antes de leer, porque una lectura que llega mientras la franja aún se reconstruye es terminal para el hilo.
+
+La corrida reconstruye 6 franjas y verifica 5 páginas cuyo dato custodiaba el nodo caído. Las páginas se leen una por una desde un nodo superviviente y cada lectura debe devolver el patrón correcto; la primera lectura de cada página ejerce la reconstrucción. El resultado es \texttt{PASS}: la paridad conserva los datos tras la caída de un nodo. La diferencia entre las 6 franjas reconstruidas y las 5 páginas verificadas se explica porque algunas franjas contienen páginas que la prueba no elige para lectura, sea porque la página no pertenecía a la víctima o porque la franja tenía una segunda página de datos en el mismo nodo. La reconstrucción se ejecuta igual, pero la verificación se concentra en las páginas que la prueba puede leer con garantía.
+
+El escenario deja explícito el alcance de la tolerancia. La paridad es de una pieza por franja, no de un nodo completo. Si dos páginas de datos de la misma franja viven en el mismo nodo, la caída de ese nodo elimina dos incógnitas y la reconstrucción no alcanza. El diseño evita que la paridad comparta nodo con un dato, pero no reparte los datos para que cada uno viva en una ranura distinta; esa colocación depende del anillo. La prueba elige solo las franjas recuperables y por eso puede afirmar que las páginas verificadas son correctas, sin ocultar que otras franjas del mismo bloque no habrían sobrevivido.
+
+\subsection{Clúster físico de cuatro nodos}\label{sec:cluster-fisico}
+
+El montaje físico reúne cuatro equipos del laboratorio conectados al mismo switch. Los equipos aportan 640 MiB en total: 256 MiB el primero y 128 MiB cada uno de los otros tres. La configuración compartida coincide en las once claves que entran en el hash, mientras que \texttt{NODE\_MEM} es distinto en cada archivo local. El descubrimiento por multicast encuentra a los pares sin una lista de equipos, y cada nodo toma el primer puerto libre del bloque asignado. La membresía se estabiliza con las cuatro ranuras y el reporte HTML se genera para los cuatro nodos.
+
+La corrida de \texttt{matmul} con $N=256$ sobre el clúster físico verifica el checksum y reporta 0 de 65536 elementos distintos. El resultado es el mismo que en el clúster local, aunque la memoria aportada y la distribución de custodios son distintas. Esa igualdad es la evidencia más fuerte de que la coherencia no depende de una configuración particular: el mismo programa, el mismo archivo compartido y memorias desiguales producen el mismo valor. La corrida también confirma que el anillo ponderado asigna más páginas al equipo de 256 MiB y que el resto se reparte entre los tres equipos de 128 MiB sin que ninguno quede fuera.
+
+El reporte HTML del clúster físico muestra las cuatro ranuras en estado \texttt{ALIVE}, con la memoria aportada por cada una y la dirección de escucha. La tabla global de páginas queda vacía porque la aplicación libera sus reservas al terminar, pero el archivo por nodo conserva la descripción de la vista y las estadísticas del proceso. La generación del reporte no requiere un servidor HTTP ni unirse al clúster: \texttt{dsmctl} abre una conexión efímera, pide la tabla y escribe los archivos en el sistema de archivos del nodo consultado.
+
+La heterogeneidad del montaje también prueba el hash de configuración. Un archivo con distinto \texttt{NODE\_MEM} y el resto igual se acepta, porque la memoria local no forma parte del contrato compartido; un archivo con distinto \texttt{CLUSTER\_ID} o distinto tamaño de página se rechaza con \texttt{DSM\_ST\_CONFIG\_MISMATCH}. Esa separación es la que permite que un equipo con más memoria se una al mismo clúster sin obligar a los demás a declarar una capacidad que no tienen. La validación física confirma que la regla funciona en máquinas distintas y no solo en procesos de la misma máquina.
+
+\subsection{Análisis de los resultados}
+
+Las pruebas de corrección son consistentes entre sí. La coherencia MSI entre dos nodos termina en \texttt{PASS}; la multiplicación de matrices coincide en dos configuraciones distintas, con 0 de 65536 elementos diferentes; el filtro de video no encuentra discrepancias byte por byte; el autómata coincide celda por celda; la ejecución distribuida verifica el CRC agregado con cuatro particiones remotas de ocho; y la paridad reconstruye 6 franjas y permite leer 5 páginas después de la caída. Cada prueba compara contra una referencia independiente, no contra la salida del propio sistema, de modo que un error de coherencia que se repitiera en la referencia no podría pasar desapercibido.
+
+Los tiempos de \texttt{matmul} muestran que la sincronización domina el costo. El cálculo sobre la vista tarda 0.253 s frente a 0.048 s de la referencia secuencial, y \texttt{dsm\_sync} tarda 0.519 s. La diferencia del cálculo se explica por los fallos de página y las transiciones MSI: cada página de A, B y C se materializa una vez, y las filas de C que comparten página entre hilos provocan invalidaciones y ascensos de permiso. La sincronización recorre las páginas modificadas y las persiste en el custodio; es el precio de que el contenido sobreviva a la caída del dueño, no un costo del algoritmo de multiplicación. La referencia secuencial no paga ninguna de las dos cosas porque trabaja en memoria local y no ofrece durabilidad distribuida.
+
+La comparación entre el clúster local y el físico confirma que el resultado no depende de la homogeneidad. El clúster local tiene cuatro nodos iguales de 64 MiB; el físico tiene un nodo de 256 MiB y tres de 128 MiB. En ambos el checksum coincide y el conteo de diferencias es cero. La igualdad del valor no implica que la distribución de páginas sea la misma: el anillo ponderado asigna más vnodes al nodo de 256 MiB, y la ubicación de cada página cambia con la membresía. Lo que se conserva es la regla de coherencia, no una colocación fija.
+
+La figura~\ref{fig:html-global} de la sección~\ref{sec:reportes-html} muestra el reporte global de una corrida local con cinco nodos de 64 MiB; uno de ellos ejecuta la aplicación de prueba. La tabla de nodos lista las cinco ranuras en estado \texttt{ALIVE}, cada una con 16\,384 páginas, y la tabla de páginas registra la página 0 en estado \texttt{M}, con el proceso que la materializó, su orden dentro del bloque y la franja de paridad. El reporte por nodo, en la figura~\ref{fig:html-nodo}, agrega las estadísticas locales y permite ver los fallos de lectura y escritura, los mensajes enviados y recibidos y las particiones distribuidas. Esa evidencia es la que hace observable el estado interno sin detener el clúster ni instrumentar la aplicación.
+
+Las cifras de latidos perdidos completan el cuadro. En el clúster local de cuatro nodos, \texttt{hb\_missed} vale cero en las cuatro ranuras. El contador sube una sola vez por transición a \texttt{SUSPECT} y otra por transición a \texttt{DEAD}, no por cada intervalo de retraso, de modo que un cero significa que ningún par se declaró sospechoso ni muerto durante la corrida. Esa estabilidad es importante para interpretar los tiempos: si el detector hubiera marcado bajas falsas, la reconstrucción y el reajuste del anillo habrían introducido pausas que no pertenecen al algoritmo.
+
+La validación tiene condiciones de operación que conviene explicitar. Las corridas se hacen en un laboratorio con los equipos conectados al mismo switch, sin particiones de red y con el modelo de fallos de parada: un nodo que falla deja de responder y no envía mensajes incorrectos. La prueba de paridad derriba un nodo con \texttt{SIGKILL}, que es el caso más limpio de ese modelo. Los tiempos dependen de la carga de las máquinas y del arranque del descubrimiento, así que se reportan como una medición puntual y no como un límite de rendimiento. La igualdad del checksum, en cambio, no depende de la carga y es la propiedad que sostiene las conclusiones.

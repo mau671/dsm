@@ -1,0 +1,172 @@
+\section{Arquitectura general}\label{sec:arquitectura}
+
+\subsection{Biblioteca, nodo, cliente y herramientas}
+
+{\setlength{\intextsep}{2pt}
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    proc/.style={draw=bordergreen, fill=softgreen, thick, rounded corners, align=center, font=\footnotesize, minimum width=4.2cm, minimum height=0.95cm},
+    core/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\footnotesize, minimum width=13.4cm, minimum height=1.0cm},
+    net/.style={draw=borderorange, fill=softorange, thick, rounded corners, align=center, font=\footnotesize, minimum width=13.4cm, minimum height=0.7cm},
+    arr/.style={-{Latex[length=2mm]}, thick, draw=black!65, shorten >=3pt}
+]
+
+\node[proc] (nodo) {\textbf{Proceso nodo}\\aporta \texttt{NODE\_MEM}\\y custodia páginas};
+\node[proc, right=0.6cm of nodo] (cli) {\textbf{Proceso cliente}\\usa la vista\\sin aportar memoria};
+\node[proc, right=0.6cm of cli] (ctl) {\textbf{\texttt{dsmctl}}\\consulta de solo lectura\\sin unirse al clúster};
+
+\node[core, below=0.45cm of cli] (lib) {\textbf{Biblioteca \texttt{libdsm.a}} --- API \texttt{dsm.h}\\[2pt]
+vista y marcos $\cdot$ coherencia MSI $\cdot$ membresía $\cdot$ sincronización\\[1pt]
+paridad y reconstrucción $\cdot$ ejecución distribuida $\cdot$ reportes};
+
+\node[net, below=0.35cm of lib] (red) {TCP en 27600--27699 con cabecera de 56 B $\cdot$ anuncio UDP en 239.255.42.99:27699};
+
+\draw[arr] (nodo.south) -- (lib.north -| nodo.south);
+\draw[arr] (cli.south) -- (lib.north);
+\draw[arr] (ctl.south) -- (lib.north -| ctl.south);
+\draw[arr] (lib.south) -- (red.north);
+
+\end{tikzpicture}
+\caption{Componentes del sistema y responsabilidades de la biblioteca, los procesos y la red.}
+\label{fig:componentes}
+\end{figure}
+}
+
+La figura~\ref{fig:componentes} resume los componentes y la responsabilidad de cada uno. El sistema se distribuye como una biblioteca estática, \texttt{libdsm.a}, y un conjunto de ejecutables que la enlazan. La cabecera \texttt{dsm.h} es la única que una aplicación necesita: declara el ciclo de vida, la reserva de bloques, las primitivas de sincronización, la ejecución distribuida y las consultas. El resto de las cabeceras describe mecanismos internos y no forma parte del contrato con el usuario. Todos los ejecutables compilan contra la misma biblioteca y comparten el formato de los mensajes, la tabla de membresía y el código de coherencia.
+
+No existe un proceso servidor separado: cada proceso que llama a \texttt{dsm\_init} se convierte en participante del clúster y ejecuta los hilos que necesite para atender su propio tráfico. Esa decisión mantiene una sola imagen de código y evita que la caída de un demonio central detenga al resto, a costa de que cada proceso cargue con el costo de sus estructuras de directorio y de sus hilos de servicio.
+
+Un nodo es el participante que aporta memoria física. El binario \texttt{dsm} carga la configuración, proyecta la vista, reserva el respaldo de sus marcos, abre el listener, se anuncia por UDP, se une al clúster y permanece en espera de señales mientras los hilos internos atienden las solicitudes. Su aporte se declara con \texttt{NODE\_MEM} y puede diferir del de los demás equipos. Además de usar la vista como cualquier proceso, un nodo custodia las páginas que el anillo le asigna y responde por ellas.
+
+Un cliente es un participante que usa la memoria del clúster sin aportar ninguna. Las aplicaciones de prueba se ejecutan así: proyectan la vista, reservan bloques, provocan fallos de página y leen o escriben a través del protocolo, pero no reservan marcos de respaldo ni aparecen en el anillo. El rol se toma de la variable \texttt{DSM\_NODE\_MODE}; un valor distinto de \texttt{node} o \texttt{client} es un error de configuración y no un modo por omisión. En las consultas, un cliente figura en una fila aparte y no altera el conteo de nodos ni la capacidad agregada.
+
+Las herramientas complementan la operación sin alterar el estado. \texttt{dsmctl} abre una conexión efímera contra un nodo, formula una consulta de solo lectura y presenta la respuesta; no se une a la membresía ni necesita una ranura. \texttt{video\_pack} prepara secuencias RGB24 para el filtro de video. El reporte HTML se genera dentro de un nodo, sea por una llamada de la API o por una consulta de la herramienta, y produce un archivo por nodo presente más un resumen global.
+
+
+
+\subsection{Procesos, hilos y modelo de ejecución}
+
+Cada participante es un proceso con su propio espacio de direcciones. La vista compartida se proyecta en ese espacio, pero el objeto que la respalda es un \texttt{memfd} privado del proceso: lo que se comparte es la dirección virtual y el protocolo, no la tabla de páginas. Un proceso no puede leer la memoria de otro sin pasar por una solicitud, y esa restricción es la que hace observable la coherencia.
+
+Dentro del proceso conviven varios grupos de hilos con responsabilidades separadas. El camino de señal no es un hilo propio: el manejador de \texttt{SIGSEGV} se ejecuta sobre el hilo de la aplicación que sufrió el fallo. Su única tarea es identificar la página y el tipo de acceso, depositar una ranura en una cola de tamaño fijo y dormir al hilo en un futex hasta que alguien marque la ranura como resuelta. No toma cerrojos, no reserva memoria y no abre sockets, porque cualquiera de esas operaciones podría bloquearse o reingresar en el propio manejador. Si la cola está llena, el proceso termina en lugar de esperar dentro de la señal.
+
+Los despachadores son hilos independientes, en cantidad \texttt{DISPATCHER\_THREADS}, que extraen ranuras de esa cola y resuelven cada fallo con el protocolo de coherencia. Un despachador puede esperar por la red sin detener a los demás ni al manejador, y al terminar instala el contenido, ajusta el permiso de la página y despierta al hilo bloqueado. Los trabajadores, en cantidad \texttt{WORKER\_THREADS}, consumen la cola de mensajes que deja el listener y ejecutan la lógica de cada tipo: solicitudes de página, datos, concesiones, invalidaciones, escrituras al custodio, cerrojos, barreras y kernels distribuidos. Ningún trabajador espera una respuesta de otro nodo; cuando una operación necesita esperar, la espera ocurre en el hilo que la pidió y la respuesta se correlaciona por identificador de solicitud.
+
+El listener, creado al abrir el puerto de escucha, acepta conexiones y atiende cada trama en su propio hilo: lee la cabecera, valida el CRC y la longitud de la carga, responde en línea los saludos de membresía y encola el resto para los trabajadores. La clasificación no ejecuta el protocolo de coherencia, así que un mensaje que necesita espera por red ocupa un trabajador y no al hilo que acepta conexiones. A este conjunto se suman un hilo de latidos, un hilo de descubrimiento UDP y un hilo de reconstrucción de franjas. Los hilos de la aplicación no son hilos del sistema: cada uno debe llamar a \texttt{dsm\_thread\_attach} antes de tocar la vista, porque esa llamada le asigna la ranura de fallo y la pila alternativa que el manejador necesita.
+
+Las colas son acotadas y el productor no se bloquea indefinidamente. La cola de fallos tiene capacidad fija y falla rápido cuando se agota; la cola de mensajes usa dos semáforos, uno de elementos y otro de espacio, y su mutex nunca se sostiene mientras se procesa un mensaje. La tabla de membresía se protege con un candado de lectura y escritura, y las páginas usan cerrojos particionados por franjas para que dos fallos sobre páginas distintas no compitan por el mismo candado.
+
+\subsection{Topología lógica y despliegue físico}
+
+La topología lógica es una malla completa bajo demanda. Un nodo abre un enlace TCP hacia otro cuando necesita enviarle algo y lo conserva para los envíos posteriores; si el descriptor deja de estar vivo, lo reabre con retroceso. No hay un nodo raíz ni una malla que todos deban establecer al arrancar: los enlaces aparecen según el tráfico y la tabla de membresía proporciona las direcciones de destino. El descubrimiento usa un grupo multicast con alcance de un salto y, cuando la interfaz no devuelve los datagramas o el entorno no enruta multicast, recurre al broadcast.
+
+Físicamente, el clúster vive en equipos conectados al mismo conmutador. Cada equipo conserva su propio \texttt{dsm.conf} y su propio archivo de identidad; lo que comparten es el conjunto de claves estructurales, no el archivo ni el disco. Un nodo aporta la memoria que declara su configuración local y toma un puerto de escucha del bloque asignado al grupo, mientras el canal de descubrimiento ocupa el último puerto de ese bloque, el 27699. Las aplicaciones cliente pueden ejecutarse en cualquiera de los equipos o en uno adicional, siempre que alcancen a un nodo con memoria.
+
+La figura~\ref{fig:despliegue} muestra el despliegue del clúster de validación. Cuatro equipos aportan 256, 128, 128 y 128 MiB, para un total de 640 MiB, y un proceso cliente ejecuta una aplicación de prueba sobre esa capacidad. El cliente no aparece en el anillo ni en el conteo de nodos, pero sí en las consultas y en el reporte global.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    sw/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\footnotesize, minimum width=4.6cm, minimum height=0.75cm},
+    host/.style={draw=bordergreen, fill=softgreen, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.0cm, minimum height=1.45cm},
+    cli/.style={draw=borderorange, fill=softorange, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.6cm, minimum height=1.1cm},
+    link/.style={thick, draw=black!55}
+]
+
+\node[sw] (sw) at (0,0) {Conmutador del laboratorio};
+\node[host] (n1) at (-5.4,-2.2) {\textbf{Nodo 0}\\256 MiB\\ranura 0};
+\node[host] (n2) at (-1.8,-2.2) {\textbf{Nodo 1}\\128 MiB\\ranura 1};
+\node[host] (n3) at (1.8,-2.2) {\textbf{Nodo 2}\\128 MiB\\ranura 2};
+\node[host] (n4) at (5.4,-2.2) {\textbf{Nodo 3}\\128 MiB\\ranura 3};
+\node[cli] (pc) at (0,-4.1) {\textbf{Proceso cliente}\\aplicación de prueba\\en el equipo del nodo 1};
+
+\draw[link] (n1.north) -- (sw.south);
+\draw[link] (n2.north) -- (sw.south);
+\draw[link] (n3.north) -- (sw.south);
+\draw[link] (n4.north) -- (sw.south);
+\draw[link, dashed] (pc.north) -- (n2.south);
+
+\end{tikzpicture}
+\caption{Despliegue del clúster de validación. Los cuatro nodos aportan memoria heterogénea y el cliente ejecuta una aplicación sobre la vista compartida sin sumar capacidad.}
+\label{fig:despliegue}
+\end{figure}
+
+La cercanía física impone un límite al despliegue: el anuncio multicast se emite con TTL uno, por lo que no cruza un enrutador, y el broadcast tampoco se propaga fuera del segmento. Para cruzar redes distintas haría falta un proxy de descubrimiento o una lista de semillas. Dentro del laboratorio, la misma restricción evita que dos clústeres de equipos distintos se descubran por accidente, siempre que usen identificadores de clúster diferentes.
+
+\subsection{Ciclo de vida de un nodo}
+
+La inicialización sigue un orden fijo, y cada paso deshace lo anterior si falla. \texttt{dsm\_init} carga y valida el archivo de configuración, aplica un reemplazo de memoria si el llamador lo pide, ignora \texttt{SIGPIPE}, eleva el límite de descriptores y marca el contexto como activo. Después inicializa la cola de fallos, la membresía, la red, el directorio, la sincronización, el distribuidor y la memoria: crea el \texttt{memfd}, lo trunca al tamaño de la vista, proyecta la vista y el alias e instala el manejador de \texttt{SIGSEGV}. A continuación arranca trabajadores y despachadores, y solo entonces entra al descubrimiento.
+
+El descubrimiento carga o crea el identificador del proceso, reserva el primer puerto libre del bloque, abre el listener y el socket UDP, y toma un cerrojo local que serializa la unión de varios procesos del mismo equipo. Con el listener ya activo, sondea a los pares anunciados, fusiona sus tablas, elige una ranura, envía el \texttt{JOIN} y confirma el reparto con los demás miembros. En cuanto la ranura queda reclamada enciende el hilo de latidos, resuelve el reparto con los pares, espera a que la vista local converja con la de ellos y, si la redundancia está activa, comprueba que existan al menos tres nodos con memoria y ajusta el tamaño de la franja. La sección~\ref{sec:configuracion} detalla cada intercambio.
+
+En operación, el proceso nodo no tiene un bucle de trabajo propio: el binario \texttt{dsm} espera señales de terminación y los hilos internos atienden la red, los fallos y los latidos. Las aplicaciones cliente, en cambio, ejecutan su lógica entre \texttt{dsm\_init} y \texttt{dsm\_finalize}, y sus hilos tocan la vista como si fuera memoria ordinaria. Un nodo que se apaga de forma ordenada envía \texttt{LEAVE} a los miembros presentes, detiene el descubrimiento y los latidos, marca su ranura como cerrada y libera los recursos en orden inverso al de la inicialización. Un nodo que muere sin avisar deja de responder y los demás lo declaran caído tras seis latidos perdidos.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    fase/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.15cm, minimum height=1.05cm},
+    svc/.style={draw=bordergreen, fill=softgreen, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.15cm, minimum height=1.05cm},
+    end/.style={draw=borderorange, fill=softorange, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.15cm, minimum height=1.05cm},
+    arr/.style={-{Latex[length=2mm]}, thick, draw=black!65}
+]
+
+\node[fase] (a1) {Carga y validación\\de \texttt{dsm.conf}};
+\node[fase, right=0.5cm of a1] (a2) {\texttt{memfd}, vista,\\alias y señales};
+\node[svc, right=0.5cm of a2] (a3) {Trabajadores\\y despachadores};
+\node[svc, right=0.5cm of a3] (a4) {Listener TCP\\y anuncio UDP};
+\node[svc, below=0.85cm of a4] (a5) {Sondeo, asentamiento\\y fusión de tablas};
+\node[svc, left=0.5cm of a5] (a6) {\texttt{JOIN}, ranura\\y época};
+\node[svc, left=0.5cm of a6] (a7) {Latidos, custodia\\y operación};
+\node[end, left=0.5cm of a7] (a8) {\texttt{LEAVE} y\\apagado ordenado};
+
+\draw[arr] (a1) -- (a2);
+\draw[arr] (a2) -- (a3);
+\draw[arr] (a3) -- (a4);
+\draw[arr] (a4) -- (a5);
+\draw[arr] (a5) -- (a6);
+\draw[arr] (a6) -- (a7);
+\draw[arr] (a7) -- (a8);
+
+\end{tikzpicture}
+\caption{Ciclo de vida de un nodo, desde la carga de la configuración hasta la salida ordenada. El descubrimiento y el \texttt{JOIN} ocupan el tramo central y los latidos sostienen la membresía durante la operación.}
+\label{fig:ciclo-vida}
+\end{figure}
+
+\subsection{Decisiones de diseño y compromisos}
+
+\paragraph{Una vista y un alias interno.} La aplicación ve una sola proyección con permisos por página, mientras el código de red escribe por un segundo mapeo del mismo \texttt{memfd} que siempre es legible y escribible. Sin el alias, instalar una página obligaría a abrir el permiso de escritura sobre la vista y otros hilos del proceso podrían observar el contenido a medio copiar. El precio es un mapeo adicional por proceso y la disciplina de no usar el alias desde la aplicación.
+
+\paragraph{Coherencia por página con custodio.} El directorio de una página vive en su custodio y no se replica en todos los nodos. Esa elección reduce el estado y hace que una escritura tenga un único punto de serialización, a cambio de que el primer acceso a una página remota siempre cueste un viaje al custodio. La granularidad de página simplifica el protocolo y el uso de \texttt{mprotect}, pero castiga a dos variables independientes que compartan página con invalidaciones mutuas.
+
+\paragraph{Sin coordinador, con un asignador pequeño.} La coherencia, la custodia y la membresía se resuelven de forma distribuida con reglas deterministas. La excepción es el mapa global de bloques reservados, que coordina el nodo vivo de menor ranura y se replica en los saludos; la reserva es una operación poco frecuente y concentrarla evita un acuerdo por cada llamada a \texttt{dsm\_alloc}. Si ese nodo cae, otro toma el mapa replicado y continúa.
+
+\paragraph{Membresía blanda con época y desempate por identificador.} La tabla no se congela: cada nodo fusiona la vista que recibe y aplica las mismas reglas. La época identifica la generación más reciente y el identificador lexicográficamente menor decide entre dos reclamos de la misma ranura. El resultado converge sin árbitro, aunque durante unos segundos dos nodos puedan tener vistas distintas y el directorio quede desfasado.
+
+\paragraph{Resolver los fallos fuera del contexto de señal.} El manejador solo registra y duerme; la red y los cerrojos quedan en los despachadores. Esa frontera es la que hace que el camino del fallo siempre termine, incluso si la red está lenta o un par no responde. La contrapartida es una cola más y una latencia adicional de un cambio de contexto por cada página que se materializa.
+
+\paragraph{Puertos fijos y anuncios en lugar de listas.} El bloque de puertos es exclusivo del grupo y el descubrimiento no depende de una lista de equipos. Un nodo nuevo solo necesita el mismo archivo y una etiqueta distinta; no hay que actualizar un inventario cuando cambia la máquina. El costo es que el descubrimiento depende del multicast o del broadcast del segmento y que el bloque debe estar libre en todos los equipos.
+
+\paragraph{Cliente sin memoria y franja derivada.} Separar el rol de cliente permite ejecutar aplicaciones y herramientas sin alterar la membresía ni la capacidad. La cantidad de páginas de datos por franja se deriva de los nodos vivos, y el clúster se adapta a su tamaño sin una clave que alguien deba recalcular. La rigidez aparece en los extremos: con redundancia se exigen al menos tres nodos y el valor de $K$ queda acotado entre dos y ocho.
+
+\subsection{Organización del código fuente}
+
+\paragraph{Núcleo y API.} \texttt{dsm.c} contiene el contexto global, la secuencia de inicialización y finalización, el ciclo de vida de los hilos de aplicación, el asignador global de bloques y las funciones públicas que no pertenecen a otro módulo. \texttt{log.c} implementa el registro con niveles y marcas de tiempo, y es la única salida de diagnóstico del núcleo.
+
+\paragraph{Configuración y utilidades.} \texttt{config.c} analiza el archivo, valida las restricciones cruzadas y calcula el hash compartido. \texttt{util.c} reúne las operaciones que no son de red ni de protocolo pero que ambos necesitan: escritura y lectura completas con plazo, conexión con tiempo límite, conversión de enteros de 64 bits y persistencia del identificador del nodo.
+
+\paragraph{Memoria y fallos.} \texttt{mem.c} crea el objeto compartido, proyecta la vista y el alias, administra los marcos del respaldo y aplica los permisos por página. \texttt{sigsegv.c} instala el manejador, mantiene la cola de fallos y define la ranura por hilo que conecta al hilo víctima con su despachador.
+
+\paragraph{Coherencia y custodia.} \texttt{msi.c} implementa los estados, el directorio del custodio, las transacciones por página y los manejadores de los mensajes de datos. \texttt{ring.c} construye el anillo de dispersión consistente y responde cuál es el custodio de una página.
+
+\paragraph{Sincronización.} \texttt{sync.c} ofrece cerrojos y barreras distribuidos, con un custodio determinista por identificador, colas de espera acotadas y migración del estado cuando cambia la membresía.
+
+\paragraph{Redundancia y ejecución distribuida.} \texttt{raid.c} forma las franjas, acumula deltas, calcula la paridad y reconstruye una página o un marco perdido. \texttt{dist.c} registra los kernels de cada proceso, reparte particiones, envía las órdenes y reúne los resultados; los kernels se ejecutan en los trabajadores que ya existen.
+
+\paragraph{Red.} \texttt{wire.c} empaqueta y desempaqueta la cabecera y las cargas fijas, y calcula el CRC32. \texttt{net.c} mantiene el listener, los enlaces salientes, la tabla de solicitudes pendientes y las funciones de envío y de llamada remota. \texttt{worker.c} contiene la cola de mensajes, los trabajadores y los despachadores de fallos.
+
+\paragraph{Membresía.} \texttt{discovery.c} reúne el anuncio UDP, el sondeo, la tabla de miembros, la asignación de ranuras, los latidos y la recuperación posterior a una caída. Es el módulo de mayor tamaño porque concentra las reglas que mantienen la vista del clúster.
+
+\paragraph{Reportes.} \texttt{report.c} recorre la membresía, el directorio y las páginas locales para producir el HTML por nodo y el resumen global, sin bloquear la operación más que el tiempo de copiar cada registro.
+
+Alrededor del núcleo, \texttt{apps/} contiene el nodo y las aplicaciones de prueba, \texttt{tools/} las herramientas de diagnóstico y de preparación de datos, \texttt{tests/} las suites de módulo y de extremo a extremo, \texttt{include/} las cabeceras y \texttt{data/} el material real que consumen las aplicaciones. La dirección de dependencia es deliberada: \texttt{wire.c} no conoce sockets, \texttt{net.c} conoce el formato pero no la coherencia, y los módulos de protocolo usan la red sin construir cabeceras a mano.

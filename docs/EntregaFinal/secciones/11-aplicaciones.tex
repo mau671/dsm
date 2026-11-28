@@ -1,0 +1,199 @@
+\section{Aplicaciones sobre la vista distribuida}\label{sec:aplicaciones}
+
+Las aplicaciones de \texttt{apps/} trabajan sobre regiones cuyo tamaño se elige y que, en el extremo, superan la memoria de un nodo. Cada una resuelve un problema concreto y produce un resultado que admite una comparación independiente: una referencia secuencial, una segunda simulación o una conversión byte por byte con la misma fórmula. Esa propiedad es la que convierte la ejecución en una prueba de coherencia y no en una simple demostración de que el programa termina. Las tres se unen al clúster como clientes, usan la API pública de \texttt{include/dsm.h} y reparten el trabajo entre hilos del mismo proceso; la memoria distribuida aporta capacidad y resuelve las páginas, mientras que el paralelismo de cálculo ocurre dentro del proceso.
+
+La multiplicación de matrices concentra el acceso en escrituras densas y lecturas repetidas de una misma matriz; el juego de la vida obliga a leer las vecinas de cada celda y a separar generaciones con una barrera; el filtro de video recorre dos regiones grandes con un patrón de flujo y devuelve el resultado a disco. Los tres casos usan páginas de 4 KiB, pero la relación entre filas, páginas e hilos cambia en cada uno, y esa relación explica tanto el número de fallos como la forma de sincronizar.
+
+\subsection{Multiplicación de matrices}\label{sec:matmul}
+
+El programa \texttt{matmul} calcula el producto de dos matrices cuadradas de tipo \texttt{double}, $C = A \cdot B$, con
+\begin{equation}
+C[i][j] = \sum_{k=0}^{N-1} A[i][k]\,B[k][j].
+\end{equation}
+El lado $N$ va de 1 a 2048 y vale 256 por omisión. Con $N=256$ cada matriz ocupa $256^2 \times 8 = 524\,288$ bytes, es decir 0.5 MiB, y las tres suman 1.5 MiB; con $N=2048$ cada una ocupa 32 MiB y las tres 96 MiB. Ese último tamaño es el que justifica la vista distribuida: un nodo pequeño no reúne las tres matrices, pero el clúster sí puede custodiar sus páginas y traerlas conforme los hilos las tocan. La aplicación no lee archivos ni genera datos al azar: llena A y B con patrones deterministas,
+\begin{equation}
+A[i][j] = (31i + 17j) \bmod 100, \qquad B[i][j] = (13i + 7j) \bmod 100,
+\end{equation}
+de modo que la referencia local reproduce exactamente la misma entrada y cualquier diferencia en C proviene de la coherencia o de la aritmética, no de una semilla distinta.
+
+El reparto de trabajo sigue las filas de C: el programa divide $N$ entre $H$ hilos en bloques contiguos, con una fila extra para los primeros $N \bmod H$ bloques, y limita $H$ a $N$ porque un hilo sin filas solo agregaría trabajo de creación. Cada hilo llama a \texttt{dsm\_thread\_attach}, recorre sus filas y para cada una ejecuta \texttt{multiplicar\_fila}. Ese recorrido usa $k$ como bucle exterior y $j$ como bucle interior: por cada valor de $k$ lee un escalar de A y una fila completa de B, y acumula sobre la fila de C que está calculando. La fila de C, de 2 KiB con $N=256$, permanece como conjunto de trabajo mientras B se recorre por filas completas; el orden evita recorrer B por columnas y mantiene un patrón espacial predecible sobre las páginas.
+
+La figura~\ref{fig:matmul-layout} muestra la disposición de las tres reservas. A, B y C son bloques independientes de \texttt{dsm\_alloc}; el asignador global no garantiza que queden contiguos, aunque el programa los solicita en ese orden. Con $N=256$ cada matriz ocupa 128 páginas y cada fila mide 2 KiB, así que dos filas consecutivas comparten una página de 4 KiB. Con $N=2048$ cada matriz ocupa 8192 páginas y cada fila mide 16 KiB, que son cuatro páginas exactas. Las filas de C se reparten en bandas contiguas, una por hilo, y cada banda se escribe sin tocar las demás.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    font=\footnotesize,
+    every node/.style={transform shape},
+    >=Latex,
+    hilo/.style={draw=borderorange, thick, rounded corners=2pt, fill=softorange, align=center, minimum width=2.2cm, minimum height=0.5cm, font=\scriptsize},
+    nota/.style={draw=black!35, rounded corners=2pt, fill=white, align=left, inner sep=3pt, font=\scriptsize}
+]
+\draw[dashed, draw=black!45, rounded corners=4pt] (-0.2,-3.35) rectangle (5.9,4.3);
+\node[anchor=south west, font=\scriptsize\bfseries] at (-0.05,4.34) {vista virtual};
+
+\fill[softblue] (0.0,2.6) rectangle (5.7,3.8);
+\draw[borderblue, thick, rounded corners=2pt] (0.0,2.6) rectangle (5.7,3.8);
+\node[align=center] at (2.85,3.2) {\textbf{A}\\ $N\times N$ \texttt{double}, $N^2\cdot 8$ B};
+
+\fill[softgreen] (0.0,0.9) rectangle (5.7,2.1);
+\draw[borderblue, thick, rounded corners=2pt] (0.0,0.9) rectangle (5.7,2.1);
+\node[align=center] at (2.85,1.5) {\textbf{B}\\ $N\times N$ \texttt{double}, $N^2\cdot 8$ B};
+
+\node[align=center, font=\scriptsize] at (2.85,0.45) {\textbf{C}\\ $N\times N$ \texttt{double}, $N^2\cdot 8$ B};
+\fill[softorange] (0.0,-2.8) rectangle (5.7,-0.2);
+\draw[borderorange, thick, rounded corners=2pt] (0.0,-2.8) rectangle (5.7,-0.2);
+\foreach \y in {-0.85,-1.5,-2.15} \draw[borderorange!70] (0.0,\y) -- (5.7,\y);
+\node[font=\scriptsize, align=center, fill=softorange, inner sep=2pt] at (2.85,-1.175) {filas de C entre hilos};
+\foreach \y/\n in {-0.525/0,-1.175/1,-1.825/2,-2.475/3} {
+    \draw[->, thick, draw=black!55] (5.75,\y) -- (6.9,\y);
+    \node[hilo] at (8.0,\y) {hilo \n};
+}
+
+\node[nota, text width=3.6cm] at (11.3,3.15) {Cada hilo calcula un bloque contiguo de filas de C. Lee todas las filas de B y solo las filas de A que necesita.};
+\node[nota, text width=3.6cm] at (11.3,1.45) {Con $N=256$ cada matriz ocupa 128 p\'aginas y una fila mide 2 KiB; dos filas comparten p\'agina.};
+\node[nota, text width=3.6cm] at (11.3,-2.45) {$C[i][j] \mathrel{+}= A[i][k]\cdot B[k][j]$\\[2pt] una fila de B por cada $k$};
+
+\end{tikzpicture}
+\caption{Disposición de A, B y C en la vista y reparto de las filas de C entre cuatro hilos para $N=256$. Cada matriz ocupa 128 páginas de 4 KiB; una fila de 2 KiB comparte página con la siguiente.}
+\label{fig:matmul-layout}
+\end{figure}
+
+La creación de los hilos sincroniza con el llenado de A y B: el hilo principal escribe ambas matrices antes de llamar a \texttt{pthread\_create}, de modo que cada trabajador encuentra las páginas ya instaladas y no compite por llenarlas. Durante el cálculo no hay cerrojos entre hilos porque las filas de C son disjuntas; la única sincronización es \texttt{pthread\_join}. Si un hilo no logra enlazarse con el DSM, marca su estructura de trabajo como fallida y el proceso no continúa hacia la verificación. Al terminar todos, \texttt{dsm\_sync} recorre la tabla local y persiste las páginas en estado \texttt{M}; en esta aplicación son las páginas de C y las de A y B que el proceso aún conserva modificadas. Solo después de esa persistencia el programa construye la referencia y compara.
+
+La verificación no confía en el checksum como única señal. El programa reserva A y B locales con \texttt{malloc}, las llena con las mismas fórmulas, calcula cada fila con la misma función \texttt{multiplicar\_fila} y compara elemento por elemento contra C en la vista. Acumula el checksum de ambos lados en el mismo orden, la diferencia máxima y la cantidad de elementos cuya diferencia absoluta supera $10^{-6}$. La suma se acepta si la diferencia absoluta no excede $10^{-6}(1+|\text{suma de referencia}|)$, una tolerancia relativa que absorbe el redondeo de la suma sin ocultar un valor mal calculado. El resultado se imprime como \texttt{VERIFICACION: OK} o \texttt{VERIFICACION: FALLO}.
+
+En el clúster local de cuatro nodos con 64 MiB por nodo, \texttt{matmul 256 -{}-hilos 4} produce el checksum $41\,107\,839\,280$, idéntico al de la referencia, con 0 de 65\,536 elementos distintos. \texttt{dsm\_sync} tarda 0.519 s, el cálculo 0.253 s y la referencia secuencial 0.048 s. En el clúster físico de cuatro equipos, con 640 MiB aportados (256 MiB, 128 MiB, 128 MiB y 128 MiB), la misma corrida verifica el checksum y no encuentra diferencias. La diferencia entre el tiempo de cálculo y el de la referencia muestra el costo de resolver las páginas durante el cálculo, y el tiempo de \texttt{dsm\_sync} muestra el de persistirlas; ninguna de las dos cifras mide por sí sola el rendimiento de la red, porque la corrida incluye el descubrimiento y la escritura hacia los custodios.
+
+\subsection{Juego de la vida}\label{sec:vida}
+
+El autómata celular de Conway evoluciona un tablero de celdas vivas y muertas con dos reglas: una celda nace si tiene exactamente tres vecinas vivas y sobrevive si tiene dos; en cualquier otro caso queda muerta. Cada generación se calcula completa a partir de la anterior y no se puede escribir en sitio, porque una celda ya actualizada alteraría el cálculo de sus vecinas. \texttt{juego\_vida} reserva dos tableros del mismo tamaño y alterna el de origen y el de destino por paridad de la generación, sin copiar el contenido. Un tablero usa un byte por celda; con el máximo de $65\,536 \times 65\,536$ celdas ocupa 4 GiB, de modo que el par necesita 8 GiB y cada tablero se reparte en 1\,048\,576 páginas de 4 KiB.
+
+El tablero se siembra de tres formas. \texttt{-{}-imagen} lee una imagen en escala de grises del tamaño exacto del tablero y marca como viva cada celda cuyo píxel alcanza 128; el archivo versionado \texttt{data/tablero\_192.gray} mide 36\,864 bytes, que corresponden a $192 \times 192$ celdas. \texttt{-{}-patron} centra un patrón clásico (\texttt{block}, \texttt{blinker} o \texttt{glider}). Sin imagen ni patrón se usa un generador congruencial lineal con semilla fija \texttt{0x5EED1234} y una densidad del 30\%, de modo que la misma entrada produce siempre el mismo tablero. El borde es toroidal: la última fila es vecina de la primera y la última columna es vecina de la primera. La simulación de referencia usa la misma convención, así que la comparación mide coherencia y no una diferencia de bordes.
+
+Las filas se reparten en bloques contiguos, uno por hilo, y el número de hilos se reduce a la cantidad de filas cuando la supera. Cada hilo recorre sus filas para cada generación: lee la fila de arriba, la propia y la de abajo, y escribe la fila correspondiente en el tablero de destino. Los hilos de los extremos de un bloque tocan filas que pertenecen a otro hilo, y por eso la barrera es obligatoria: nadie lee el tablero de destino hasta que todos terminaron de escribirlo. La figura~\ref{fig:vida-tablero} resume el doble búfer y la vecindad de ocho celdas que usa cada posición.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    font=\footnotesize,
+    every node/.style={transform shape},
+    >=Latex
+]
+\draw[borderblue, thick, fill=softblue!35] (0,0) rectangle (4.2,4.2);
+\foreach \x in {0.42,0.84,...,3.78} \draw[black!14] (\x,0) -- (\x,4.2);
+\foreach \y in {0.42,0.84,...,3.78} \draw[black!14] (0,\y) -- (4.2,\y);
+\foreach \x/\y in {1/8,2/8,3/8,2/9,2/7,6/6,6/7,7/6} {
+    \fill[borderblue!75] (0.42*\x,0.42*\y) rectangle ++(0.42,0.42);
+}
+\node[above, align=center] at (2.1,4.2) {\textbf{tablero A}\\ origen si $g$ es par};
+
+\draw[borderblue, thick, fill=softgreen!35] (6.6,0) rectangle (10.8,4.2);
+\foreach \x in {0.42,0.84,...,3.78} \draw[black!14] (6.6+\x,0) -- (6.6+\x,4.2);
+\foreach \y in {0.42,0.84,...,3.78} \draw[black!14] (6.6,\y) -- (10.8,\y);
+\foreach \x/\y in {2/8,2/9,2/7,3/8,7/5,6/6,7/6,8/5} {
+    \fill[bordergreen!75] (6.6+0.42*\x,0.42*\y) rectangle ++(0.42,0.42);
+}
+\node[above, align=center] at (8.7,4.2) {\textbf{tablero B}\\ origen si $g$ es impar};
+
+\draw[->, thick, draw=black!65] (4.35,3.25) to[bend left=28] (6.45,3.25);
+\draw[->, thick, draw=black!65] (6.45,0.85) to[bend left=28] (4.35,0.85);
+
+\draw[->, dashed, draw=black!45] (10.9,2.7) -- (11.45,2.7);
+\begin{scope}[shift={(11.6,1.8)}]
+    \foreach \x in {0,0.6,1.2} {
+        \foreach \y in {0,0.6,1.2} {
+            \draw[black!35] (\x,\y) rectangle ++(0.6,0.6);
+        }
+    }
+    \foreach \x/\y in {0/0,0.6/0,1.2/0,0/0.6,1.2/0.6,0/1.2,0.6/1.2,1.2/1.2} {
+        \fill[softteal] (\x,\y) rectangle ++(0.6,0.6);
+    }
+    \fill[softorange] (0.6,0.6) rectangle ++(0.6,0.6);
+    \node[font=\scriptsize] at (0.9,0.9) {$x$};
+\end{scope}
+\node[above, align=center, font=\scriptsize] at (12.5,3.6) {vecindad de $x$\\ ocho vecinas};
+
+\node[anchor=north west, align=left, font=\scriptsize, text width=13.2cm] at (0,-0.55) {Cada tablero ocupa $W \times H$ bytes: con $192 \times 192$ son 36\,864 B, 9 páginas por tablero y 18 en el par. La barrera separa generaciones y el borde toroidal conecta la última fila con la primera.};
+\end{tikzpicture}
+\caption{Tablero doble del juego de la vida. Cada generación lee un tablero y escribe el otro; la paridad de la generación decide cuál se lee y una barrera impide que un hilo lea filas que otro todavía escribe.}
+\label{fig:vida-tablero}
+\end{figure}
+
+La reserva usa dos llamadas a \texttt{dsm\_alloc} del mismo tamaño y, con $192 \times 192$, cada tablero ocupa 36\,864 bytes, que son 9 páginas; el par ocupa 18 páginas y una página contiene 21 filas completas más 64 celdas de la siguiente. En el extremo opuesto, con 65\,536 columnas cada fila ocupa 16 páginas y el tablero completo 1\,048\,576 páginas. Antes de reservar, el programa consulta \texttt{dsm\_global\_size} y comprueba que el clúster aporte al menos el doble del tablero; si no alcanza, informa cuántos MiB se necesitan y cuántos aporta el clúster, en lugar de fallar en la segunda reserva con un mensaje ambiguo. \texttt{dsm\_alloc} por sí solo controla el espacio de la vista, que es mucho mayor que la memoria física aportada.
+
+Los hilos se crean después de sembrar el primer tablero. Una compuerta con mutex y variable de condición impide que un hilo empiece a recorrer generaciones antes de que existan todos los participantes de la barrera; si algún hilo no se crea, la compuerta se abre en modo abortar y los hilos ya lanzados salen sin esperar una barrera incompleta. Un hilo que no logra \texttt{dsm\_thread\_attach} no puede tocar la vista, pero sigue llegando a la barrera durante todas las generaciones: si abandonara, los demás quedarían bloqueados esperando un participante que ya no existe. La barrera reúne a los hilos trabajadores; el hilo principal espera en \texttt{pthread\_join}.
+
+El reparto ocurre entre hilos del mismo proceso, así que las barreras y cerrojos distribuidos de la API coordinan nodos y no hacen falta para dividir filas dentro de un nodo; la coherencia MSI se encarga de traer las páginas que el proceso no tiene y de invalidar copias cuando otro proceso las modifica. Al terminar las generaciones, el estado final queda en el tablero B si el número de generaciones es impar y en A si es par. La aplicación no escribe un archivo de salida y no llama a \texttt{dsm\_sync}: lee el tablero final a través de la misma vista y, si se pidió verificación, lo compara en ese momento.
+
+\texttt{-{}-verificar} repite la simulación en memoria normal con dos tableros locales, la misma función de siembra y el mismo borde toroidal, y aplica \texttt{paso\_secuencial} durante las mismas generaciones. Después compara el tablero final del DSM con la referencia celda por celda, informa la cantidad de celdas distintas sobre el total y la fila y columna de la primera diferencia, con el valor en el DSM y en la referencia. Si no hay diferencias imprime \texttt{Coincidencia exacta}. La comparación ubica el error sin volcar el tablero completo, que en un caso real sería de gigabytes; el modo de verificación admite hasta $2^{28}$ celdas porque la referencia secuencial necesita dos tableros completos en memoria local.
+
+La ejecución imprime el tamaño del tablero, la reserva total en MiB, las celdas vivas iniciales y finales, las generaciones, el tiempo total, el rendimiento en celdas por segundo (y en Mcel/s), los MiB por generación y las estadísticas del DSM: fallas de lectura y escritura, páginas locales en \texttt{M}, \texttt{S} e \texttt{I}, latencia promedio por fallo y mensajes enviados y recibidos. En una ejecución de un solo nodo el tráfico entre nodos es cero y las fallas de escritura equivalen a las páginas del par de tableros; en una ejecución con varios nodos, la diferencia entre fallas locales y mensajes enviados muestra qué parte del tablero se resolvió por coherencia remota.
+
+\subsection{Filtro de video y empaquetado de secuencias}\label{sec:filtro}
+
+\texttt{filtro\_video} convierte una secuencia RGB24 en escala de grises. Cada píxel de salida depende solo de los tres canales del mismo píxel de entrada, con la fórmula entera de BT.601,
+\begin{equation}
+Y = \frac{299R + 587G + 114B + 500}{1000},
+\end{equation}
+donde el término $+500$ implementa el redondeo al entero más cercano y la división es entera. La operación no tiene dependencias entre píxeles ni entre cuadros, y esa independencia permite repartirla sin comunicación durante el cálculo. El costo está en el volumen: un video de $1920 \times 1080$ con 3000 cuadros ocupa aproximadamente 18.7 GB de entrada y 6.2 GB de salida. Cargar ese archivo una sola vez en la vista compartida y dejar que cualquier hilo o nodo procese un rango de cuadros es el problema real que la aplicación resuelve.
+
+El archivo de entrada tiene una cabecera de tres enteros de 32 bits en orden nativo (ancho, alto y cantidad de cuadros) seguida de \texttt{ancho} $\times$ \texttt{alto} $\times$ \texttt{cuadros} píxeles RGB24 intercalados. La salida repite la cabecera y contiene un byte de luminancia por píxel. El programa valida lados entre 1 y 65\,536, hasta $2^{32}$ píxeles por cuadro, hasta 16\,777\,216 cuadros y hasta 16 GiB por archivo, y comprueba que el tamaño real del archivo coincida con el que declara la cabecera. Si la entrada declarada no existe, genera en esa misma ruta un video sintético de $640 \times 480$ con 30 cuadros, de modo que la prueba corre sin datos externos; si existe pero la cabecera no coincide, aborta en lugar de procesar datos truncados. El video versionado \texttt{data/video\_128x96.rgb} tiene 128 columnas, 96 filas y 48 cuadros: 1\,769\,472 bytes de píxeles y 589\,824 bytes de salida.
+
+El hilo principal carga la entrada completa en la región DSM y después lanza $H$ hilos, cuatro por omisión y hasta 256. Cada hilo llama a \texttt{dsm\_thread\_attach}, toma un bloque contiguo de cuadros (\texttt{cuadros} / $H$, con el resto repartido entre los primeros) y escribe su rango en la salida. Como los cuadros son independientes, no hay barrera entre ellos; la única sincronización es \texttt{pthread\_join}. Al terminar todos, el programa llama a \texttt{dsm\_sync} para que las páginas en estado \texttt{M} queden en el respaldo de su custodio y solo entonces abre el archivo de salida y vuelca la región.
+
+La disposición de memoria sigue el formato. Con $640 \times 480$ cada cuadro de entrada ocupa 921\,600 bytes, que son 225 páginas; 30 cuadros ocupan 6750 páginas. Cada cuadro de salida ocupa 307\,200 bytes, 75 páginas, y 30 cuadros ocupan 2250 páginas. Con el video real de $128 \times 96$, cada cuadro de entrada ocupa 36\,864 bytes (9 páginas) y cada cuadro de salida 12\,288 bytes (3 páginas); los 48 cuadros suman 432 páginas de entrada y 144 de salida. La región de entrada se llena con \texttt{memcpy} desde un búfer intermedio de 64 KiB y la de salida se vuelca con otro búfer del mismo tamaño. La razón es precisa: una llamada \texttt{read(2)} o \texttt{write(2)} directa sobre la vista falla con \texttt{EFAULT} en las páginas que todavía no están presentes, porque el kernel no puede resolver un fallo de página del DSM desde el contexto de una llamada al sistema; el \texttt{memcpy} sobre la vista sí dispara \texttt{SIGSEGV} y el despachador instala la página antes de reintentar la instrucción.
+
+Esa mecánica explica un número que a primera vista sorprende. En el video sintético de $640 \times 480$ con 30 cuadros, la aplicación registra 9000 fallas de escritura con uno, dos o cuatro hilos. El total no depende de la cantidad de hilos porque el fallo ocurre en la primera escritura de cada página y la tabla de páginas es única para el proceso: 6750 páginas de entrada que se llenan con \texttt{memcpy} más 2250 páginas de salida que escriben los hilos. Con $1280 \times 720$ y 30 cuadros, la entrada ocupa 20\,250 páginas y la salida 6750, y las fallas de escritura son 27\,000. Los hilos reparten el trabajo, pero no multiplican las fallas: comparten las páginas ya instaladas.
+
+La verificación compara la salida con una conversión secuencial del mismo archivo que aplica la misma fórmula entera. Un script de Python recorrió los 9\,216\,000 píxeles del video sintético de $640 \times 480$ con 30 cuadros y encontró 0 discrepancias. La comparación es sensible a la coherencia y no a la convención de redondeo, porque ambos lados usan los mismos coeficientes y el mismo $+500$. En la máquina de prueba con un solo nodo de 256 MiB, el filtrado tarda 1.580 s con un hilo, 1.031 s con dos y entre 0.519 s y 0.631 s con cuatro; el rendimiento pasa de 22.26 MiB/s a 55.7--67.7 MiB/s y las fallas de escritura se mantienen en 9000. Con $1280 \times 720$ y 30 cuadros, cuatro hilos tardan 2.099 s, alcanzan 50.24 MiB/s y registran 27\,000 fallas de escritura. El rendimiento se calcula sobre entrada más salida y no incluye la escritura final a disco, que el programa informa por separado.
+
+\texttt{video\_pack} prepara material real para el filtro. Toma una secuencia RGB24 cruda, como la que produce \texttt{ffmpeg}, comprueba que su tamaño sea múltiplo de un cuadro de \texttt{ancho} $\times$ \texttt{alto} $\times$ 3 bytes, calcula la cantidad de cuadros y antepone la cabecera de 12 bytes. No reordena ni convierte los píxeles: solo empaqueta. Los lados deben estar entre 1 y 65\,535, y la salida ocupa 12 bytes más el tamaño de la entrada. La secuencia de preparación de un video real es la siguiente.
+
+\begin{lstlisting}[language=bash, caption={Preparación de una secuencia RGB24 para \texttt{filtro\_video}.}, label={lst:video-pack}]
+ffmpeg -i origen.webm -t 0.8 -vf scale=128:96 -pix_fmt rgb24 -f rawvideo crudo.rgb
+./build/bin/release/video_pack crudo.rgb data/video_128x96.rgb 128 96
+./build/bin/release/filtro_video data/video_128x96.rgb /tmp/gris.gris 4
+\end{lstlisting}
+
+El primer comando extrae 0.8 s del video, lo escala a $128 \times 96$ y lo deja como RGB24 sin cabecera; el segundo agrega la cabecera que espera la aplicación; el tercero filtra con cuatro hilos. Los archivos de \texttt{data/} son material real versionado en el repositorio, convertido con \texttt{ffmpeg}, no datos sintéticos generados al vuelo; la cadena anterior muestra cómo se prepara una secuencia equivalente con la cabecera que espera el filtro.
+
+\subsection{Uso del API y disposición de memoria en cada aplicación}\label{sec:uso-api}
+
+Las tres aplicaciones comparten el mismo ciclo de vida. Fijan \texttt{DSM\_NODE\_MODE} en \texttt{client} antes de \texttt{dsm\_init}, enlazan el hilo principal con \texttt{dsm\_thread\_attach}, reservan las regiones con \texttt{dsm\_alloc}, acceden con punteros normales y cierran con \texttt{dsm\_thread\_detach} y \texttt{dsm\_finalize}. Cada hilo que toca la vista repite el enlace y el desenlace; el hilo principal también lo hace porque siembra o carga datos antes de crear a los trabajadores. El rol de cliente es deliberado: las aplicaciones usan la memoria del clúster sin aportar páginas ni custodiar ninguna, de modo que lanzarlas no agrega un nodo a la membresía, no cambia \texttt{dsm\_node\_count} y no altera \texttt{dsm\_global\_size}.
+
+\begin{lstlisting}[language=C, caption={Ciclo común de una aplicación cliente sobre la vista distribuida.}, label={lst:ciclo-app}]
+setenv("DSM_NODE_MODE", "client", 1);
+dsm_init(conf, 0);
+dsm_thread_attach();
+
+dsm_alloc(bytes, &region);
+/* accesos con punteros normales; el fallo de pagina lo resuelve el DSM */
+dsm_sync();
+
+dsm_free(region, bytes);
+dsm_thread_detach();
+dsm_finalize();
+\end{lstlisting}
+
+\texttt{dsm\_alloc} redondea el tamaño a páginas completas, busca primero en los huecos que dejaron liberaciones anteriores y después avanza la marca de agua, y devuelve una dirección alineada a página dentro de la vista. Las tres reservas de \texttt{matmul} son bloques separados; las dos del juego de la vida y las dos del filtro también. El asignador no promete contigüidad entre bloques, y el programa no la necesita. Para compartir un bloque, los demás procesos deben usar la dirección virtual que devolvió el creador y no una reserva propia, porque una segunda reserva recibe otro rango. Ninguna de las tres aplicaciones comparte un bloque con otro proceso de aplicación: todas reparten el trabajo entre hilos del mismo proceso. La dirección compartida sí es central en \texttt{demo}, donde \texttt{msi b} recibe por argumento la dirección que publicó \texttt{msi a}.
+
+La vista se crea con \texttt{PROT\_NONE}. El primer acceso a una página dispara \texttt{SIGSEGV}; el manejador obtiene la dirección con \texttt{siginfo\_t.si\_addr}, identifica la página y encola el fallo, y un despachador la resuelve por el protocolo MSI, aplica el permiso de lectura o de lectura y escritura y despierta al hilo. El hilo reintenta la instrucción y continúa como si la página hubiera estado siempre ahí. En \texttt{matmul}, A y B se llenan con escrituras y se leen después del llenado, y C se escribe en modo modificado; en el juego de la vida, el tablero de origen se lee y el de destino se escribe en cada generación; en el filtro, la entrada se lee y la salida se escribe. Ninguna aplicación llama a \texttt{read(2)} o \texttt{write(2)} sobre la vista: usan búferes intermedios y dejan que el \texttt{memcpy} sea el que toca la página.
+
+Las páginas que ocupa cada aplicación se derivan del tamaño de sus regiones y no de una cuota fija. \texttt{matmul} con $N=256$ reserva 128 páginas por matriz y 384 en total; con $N=2048$, 8192 por matriz y 24\,576 en total. El juego de la vida con $192 \times 192$ reserva 9 páginas por tablero y 18 en total; con $65\,536 \times 65\,536$, 1\,048\,576 por tablero y 2\,097\,152 en total, que son 8 GiB. El filtro con el video real reserva 432 páginas de entrada y 144 de salida; con el sintético de $640 \times 480$ y 30 cuadros, 6750 y 2250. \texttt{dsm\_alloc} no reserva memoria física en ese momento: aparta páginas de la vista y el respaldo se materializa cuando los accesos las traen. Por eso una reserva puede tener éxito y el procesamiento agotar el respaldo más tarde. El juego de la vida evita ese caso al comparar el doble del tablero contra \texttt{dsm\_global\_size} antes de reservar, y \texttt{matmul} hace la comprobación equivalente con las tres matrices y rechaza la corrida si no caben, con un mensaje que indica los MiB necesarios y los que aporta el clúster.
+
+El cierre sigue el orden inverso al de las reservas. \texttt{dsm\_free} retira cada página del protocolo, la deja en ceros, con \texttt{PROT\_NONE} y estado \texttt{I}, y devuelve el rango al mapa global; una reserva posterior no observa el contenido anterior. Las aplicaciones liberan C, B y A en ese orden en \texttt{matmul}, el segundo tablero y el primero en el juego de la vida, y la salida y la entrada en el filtro. Los errores de \texttt{dsm\_alloc}, de \texttt{dsm\_sync} y de enlace de hilos se informan con \texttt{dsm\_strerror} y el proceso sale con un código distinto de cero; las etiquetas de limpieza liberan solo lo que llegó a reservarse y, cuando la inicialización tuvo éxito, llaman a \texttt{dsm\_finalize}.
+
+\subsection{Concurrencia y verificación de resultados}\label{sec:concurrencia-apps}
+
+Hay dos niveles de concurrencia que conviene separar. El primero es el reparto entre hilos del mismo proceso: \texttt{matmul} divide filas de C, el juego de la vida divide filas del tablero y el filtro divide cuadros. El segundo es la coherencia entre procesos y nodos: cuando dos procesos tienen la misma página, el protocolo MSI decide quién conserva la copia válida, quién la comparte en lectura y a quién hay que invalidar antes de permitir una escritura. Las tres aplicaciones ejercitan el segundo nivel porque sus páginas se materializan a través de custodios, pero solo el primero explica el paralelismo de cálculo.
+
+La forma de sincronizar cambia con el patrón de acceso. \texttt{matmul} no necesita barrera entre filas: cada hilo escribe filas que ningún otro toca y el \texttt{pthread\_join} final es la única espera. El juego de la vida sí necesita una barrera por generación porque cada fila lee la de arriba y la de abajo, y esas filas pueden pertenecer a otro hilo; la compuerta de arranque evita que un hilo empiece antes de que existan todos los participantes. El filtro no necesita barrera porque los cuadros son independientes y cada hilo escribe su propio rango; basta el \texttt{join} para los hilos y \texttt{dsm\_sync} para persistir. En los tres casos, las páginas que comparten hilos del mismo proceso no pasan por MSI: la coherencia actúa entre procesos, no entre hilos que comparten la misma tabla de páginas.
+
+\texttt{dsm\_sync} tiene un papel distinto en cada aplicación. \texttt{matmul} lo llama antes de construir la referencia y el filtro antes de abrir el archivo de salida, porque en ambos casos quiere que las páginas modificadas queden persistidas en su custodio. El juego de la vida no lo llama: no produce un archivo y lee el tablero final a través de la misma vista, así que no necesita una persistencia adicional antes de verificar o liberar. La función solo toca páginas en estado \texttt{M}: si el nodo es el custodio, copia el contenido al marco de respaldo; si no, envía un \texttt{WRITEBACK} y espera la confirmación. Las páginas \texttt{S} e \texttt{I} no se tocan, y el primer fallo de persistencia se reporta como error en lugar de declarar éxito.
+
+La verificación sigue el mismo criterio en las tres aplicaciones: una referencia independiente que reproduce la entrada y el algoritmo. \texttt{matmul} compara elemento por elemento con tolerancia $10^{-6}$, cuenta los distintos, mide la diferencia máxima y acumula un checksum en el mismo orden; el juego de la vida compara celda por celda con una simulación secuencial que usa la misma semilla y el mismo borde toroidal, e informa la primera diferencia; el filtro compara byte por byte con la misma fórmula entera. En los tres casos, una discrepancia solo puede venir de la coherencia, porque la entrada, el orden de las operaciones y la convención de redondeo son idénticos en la referencia y en la vista.
+
+Los números medidos confirman que la comparación no es decorativa. En el clúster local de cuatro nodos, \texttt{matmul 256 -{}-hilos 4} coincide en los 65\,536 elementos y en el checksum; en el clúster físico de cuatro equipos, con 640 MiB aportados, la misma corrida también coincide. El filtro sintético de $640 \times 480$ con 30 cuadros no presenta discrepancias en 9\,216\,000 píxeles, y sus fallas de escritura se mantienen en 9000 al variar los hilos, lo que muestra que el costo de página es independiente del reparto. El juego de la vida informa el rendimiento de cada corrida, que depende del tablero, de la imagen y de las generaciones; por eso no se fija una cifra única, y lo que se conserva como evidencia es la comparación exacta con la referencia y las estadísticas de fallos, páginas y mensajes.
+
+Estas aplicaciones no usan \texttt{dsm\_dist\_launch}. El reparto de filas o cuadros ocurre entre hilos de un solo proceso, y la memoria distribuida aporta capacidad y coherencia, no ejecución en varios nodos. La ejecución distribuida de trabajo se ejercita en \texttt{demo}, con las particiones que describe la sección~\ref{sec:demo}; confundir ambos mecanismos llevaría a atribuir a \texttt{matmul} un paralelismo entre nodos que no tiene. La ventaja que sí ofrece la vista es que A, B, C o los dos tableros pueden ocupar más memoria que la de un nodo y que las páginas se traen bajo demanda sin que el programa cambie sus punteros.

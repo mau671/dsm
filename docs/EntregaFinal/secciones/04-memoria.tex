@@ -1,0 +1,159 @@
+\section{Memoria virtual distribuida}\label{sec:memoria}
+
+La memoria que una aplicación reserva con \texttt{dsm\_alloc} aparece ante ella como una región contigua de direcciones virtuales, aunque el contenido habite en los marcos de respaldo de varios equipos y llegue a la copia local solo cuando se toca. Esa ilusión se sostiene en tres piezas que trabajan juntas: un mapeo fijo de la vista en todos los procesos, un conjunto de permisos por página que el kernel hace cumplir mediante \texttt{mprotect} y un manejador de \texttt{SIGSEGV} que convierte el acceso sin permiso en una solicitud de coherencia. Ninguna de las tres decide por sí sola qué contenido es válido, porque la vista solo aporta la dirección, el permiso indica qué operación se admite y el protocolo de la sección~\ref{sec:msi} resuelve el contenido y su versión.
+
+\subsection{Vista virtual común y mapeo de páginas}\label{sec:vista-virtual}
+
+Cada proceso crea al arrancar un objeto de memoria anónima con \texttt{memfd\_create} y la bandera \texttt{MFD\_ALLOW\_SEALING}, lo trunca a \texttt{VIEW\_SIZE} bytes y le agrega los sellos \texttt{F\_SEAL\_SHRINK} y \texttt{F\_SEAL\_GROW} para que nadie altere su tamaño después. Sobre ese objeto construye dos mapeos compartidos. El primero se coloca en \texttt{BASE\_ADDR}, con \texttt{MAP\_SHARED} y \texttt{MAP\_FIXED\_NOREPLACE}, y arranca con \texttt{PROT\_NONE}; la bandera \texttt{NOREPLACE} hace que la llamada falle si el rango ya está ocupado, en vez de superponerse a una biblioteca o al montón del proceso. El segundo mapeo, llamado alias, lo ubica el kernel en una dirección libre y conserva \texttt{PROT\_READ} y \texttt{PROT\_WRITE} de forma permanente.
+
+La dirección base predeterminada es $0\text{x}200000000000$, equivalente a 32 TiB, y la vista mide 4 GiB, de modo que el espacio de usuario de Linux de 64 bits queda holgado y la región no compite con el ejecutable, las bibliotecas, el montón ni la pila. Ambos valores son configurables, porque un equipo del laboratorio podría tener ocupada esa zona, y el perfil de compilación con el instrumentador de hilos usa una base distinta para no chocar con la región que ese instrumentador reserva. Los dos mapeos apuntan a las mismas páginas físicas del \texttt{memfd}, y esa propiedad es la razón de haber elegido un objeto de memoria en lugar de un mapeo anónimo, ya que un mapeo anónimo no admite dos ventanas sobre el mismo contenido.
+
+La separación entre vista y alias responde a una condición de carrera concreta. El código de red necesita escribir el contenido de una página que acaba de llegar, y si lo hiciera a través de la vista tendría que abrir el permiso de escritura antes de copiar, con lo que un hilo de la aplicación podría leer la página a medio llenar. El alias permite depositar los 4096 bytes completos sin tocar los permisos de la vista y cambiar el permiso solo al final, cuando el contenido ya es íntegro y el estado de coherencia corresponde. La vista es, por lo tanto, la superficie que la aplicación observa y el alias es la superficie de servicio del protocolo.
+
+El tamaño de la región no compromete memoria física, porque un \texttt{memfd} es disperso y solo materializa las páginas que se escriben. Con \texttt{PAGE\_SIZE} de 4096 bytes, la vista contiene $2^{20}$ páginas, es decir 1\,048\,576 identificadores posibles, y esa cifra es el límite de direcciones que el arreglo local de metadatos debe cubrir. La capacidad real del clúster no sale de la vista sino de la suma de páginas que aportan los nodos vivos, así que una vista de 4 GiB puede describir un espacio mucho menor o servir de marco a un conjunto que crezca sin reubicar la ventana.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.95, every node/.style={transform shape},
+    pg/.style={draw=borderblue, fill=softblue, thick, rounded corners=2pt, font=\scriptsize, align=center, minimum width=2.05cm, minimum height=0.95cm, inner sep=2pt},
+    sh/.style={pg, draw=bordergreen, fill=softgreen},
+    inv/.style={pg, draw=borderorange, fill=softorange},
+    fr/.style={draw=gray!65, fill=gray!8, thick, rounded corners=2pt, font=\scriptsize, align=center, minimum width=2.05cm, minimum height=0.75cm, inner sep=2pt},
+    lab/.style={font=\scriptsize, align=center},
+    arr/.style={->, >=Latex, thick, draw=black!60}
+]
+
+% Vista
+\node[lab, anchor=east] at (-0.25, 0) {\texttt{BASE\_ADDR}};
+\node[inv] (p0) at (1.1, 0) {página $p$\\\texttt{I} · sin acceso};
+\node[sh]  (p1) at (3.35, 0) {página $p{+}1$\\\texttt{S} · lectura};
+\node[pg]  (p2) at (5.6, 0) {página $p{+}2$\\\texttt{M} · escritura};
+\node[fr]  (dots) at (7.55, 0) {$\cdots$};
+
+\draw[<->, >=Latex, thick, draw=gray!60] (0.0, 1.1) -- (8.45, 1.1)
+    node[midway, above, font=\scriptsize] {\texttt{VIEW\_SIZE} = 4 GiB ($2^{20}$ páginas)};
+\draw[gray!60] (0.0, 1.02) -- (0.0, 1.16);
+\draw[gray!60] (8.45, 1.02) -- (8.45, 1.16);
+
+% Marcos locales
+\node[fr] (f1) at (3.35, -2.1) {marco local 12};
+\node[fr] (f2) at (5.6, -2.1) {marco local 5};
+\node[lab, text=gray!60!black] at (4.5, -2.95) {marcos del home local};
+\draw[arr] (f1) -- (p1);
+\draw[arr] (f2) -- (p2);
+
+% Home remoto
+\node[fr, fill=softpurple, draw=purple!60!black] (rh) at (1.1, -2.1) {home remoto $B$\\marco 3};
+\draw[arr, draw=borderorange] (rh) -- node[right, font=\tiny] {\texttt{PAGE\_DATA}} (p0);
+
+\end{tikzpicture}
+\caption{Mapa de la vista virtual común. Cada proceso mapea la misma región en \texttt{BASE\_ADDR}; las páginas con copia local se respaldan en marcos del nodo que las custodia y las demás se llenan desde el home remoto.}
+\label{fig:mapa-vista}
+\end{figure}
+
+\subsection{Páginas, marcos y memoria aportada}\label{sec:paginas-marcos}
+
+El tamaño de página predeterminado es de 4096 bytes, múltiplo de \texttt{sysconf(\_SC\_PAGESIZE)} y potencia de dos, de modo que una página de la vista coincide con la unidad que controla \texttt{mprotect}. La configuración admite páginas mayores siempre que se respeten esas dos condiciones, y el resto del sistema trabaja con el valor cargado en lugar de suponer 4 KiB. El número de páginas de la vista se calcula una sola vez y gobierna el tamaño de las tablas de directorio, de estado local y de colas por página.
+
+Cada nodo aporta \texttt{NODE\_MEM} bytes de memoria física y esa cantidad es local, porque un equipo con más RAM puede aportar más sin cambiar el archivo compartido. El respaldo de las páginas que el nodo custodiará se reserva al arrancar como \texttt{NODE\_MEM} multiplicado por \texttt{HOME\_SLACK} y dividido entre el tamaño de página, con un factor de holgura de 1.25 que absorbe la desviación del anillo y deja espacio para recibir páginas durante un cambio de membresía. Con los valores predeterminados, un nodo de 256 MiB reserva 320 MiB de respaldo, equivalentes a 81\,920 marcos de 4 KiB; un proceso cliente reserva cero, porque usa la memoria del clúster pero no custodia páginas.
+
+Los marcos no se reparten al inicio entre páginas concretas. El arreglo \texttt{frames} tiene una entrada por página de la vista, inicializada en \texttt{DSM\_PAGE\_ID\_NONE}, y el arreglo \texttt{frame\_used} marca qué marcos del respaldo están ocupados; la primera vez que una página se persiste, \texttt{frame\_ensure} le asigna el primer marco libre y esa asignación permanece mientras el nodo sea su home. El estado \texttt{backing\_state} distingue una página nunca persistida de una con contenido válido, lo que evita confundir ceros iniciales con datos escritos. Cuando el nodo deja de custodiar una página, \texttt{dsm\_mem\_backing\_drop} borra el marco, lo devuelve a la lista y limpia el estado, de modo que una copia vieja no pueda reaparecer como vigente.
+
+El permiso de cada página de la vista se ajusta con \texttt{mprotect} a \texttt{PROT\_NONE}, \texttt{PROT\_READ} o la combinación de \texttt{PROT\_READ} y \texttt{PROT\_WRITE}, según el estado de coherencia que describe la sección~\ref{sec:msi}; el alias, en cambio, conserva siempre lectura y escritura y no participa de esa decisión. La memoria que \texttt{dsm\_alloc} puede entregar se calcula contra la suma de páginas de los nodos vivos y no contra \texttt{VIEW\_SIZE}. Una página cuya custodia corresponde a otro nodo no consume respaldo local, porque la copia que este nodo conserva vive en la vista y se descarta cuando el protocolo la invalida; el respaldo solo existe en el home. Esa división explica por qué la capacidad agregada puede ser mucho menor que la región virtual y por qué la falta de espacio se detecta en el asignador global antes de que la aplicación toque una dirección.
+
+\subsection{Propiedad, colocación y anillo de nodos}\label{sec:propiedad-anillo}
+
+Cada página del espacio global tiene un nodo home que guarda su entrada de directorio y su respaldo. La asignación se calcula con un anillo de dispersión consistente de 64 bits ponderado por memoria: cada nodo coloca 16 vnodes por mebibyte aportado, y la posición de cada vnode sale de aplicar el finalizador \texttt{fmix64} a la combinación de su UUID y el índice del vnode. Para una página se aplica el mismo finalizador a su número y se avanza en sentido horario hasta el primer vnode; el dueño de ese vnode es el home. El cálculo depende del UUID y no del slot, así que un nodo que se reinicia y recibe otra ranura conserva la misma posición en el anillo.
+
+Todos los nodos obtienen el mismo home porque parten de la misma tabla de membresía y de los mismos UUID, sin consultar a nadie. El resultado no es exactamente proporcional a la memoria aportada, porque un número finito de vnodes deja huecos, y de ahí sale el factor de holgura del respaldo. Cuando la membresía cambia, el anillo se reconstruye y algunas páginas cambian de custodio; el arreglo \texttt{home\_map} conserva el último home calculado para cada página, de modo que el nodo que pierde una página puede distinguir ese caso de una página que nunca custodió.
+
+El traspaso ocurre en el momento en que el nodo anterior advierte el cambio. Si todavía tiene una copia válida o un marco de respaldo, la envía al nuevo home con \texttt{WRITEBACK} y la bandera \texttt{TRANSFER}, que persiste el contenido sin emitir un delta de paridad porque el dato no cambió, solo su custodio; cuando el nuevo home confirma, el anterior marca la página como inválida, libera el marco y responde \texttt{NOT\_HOME} a quien todavía use la tabla vieja. Si el nuevo home descubre que no tiene el contenido, pregunta a los pares vivos con \texttt{PAGE\_REQUEST} y la bandera \texttt{PROBE}, y solo recurre a ceros cuando ninguna copia existe y la página nunca fue escrita. Esa secuencia evita publicar una versión anterior como si fuera la vigente.
+
+\subsection{Asignador global de bloques}\label{sec:asignador-global}
+
+Las reservas se coordinan en un solo nodo para que dos procesos no reciban el mismo rango. El coordinador es el miembro vivo de menor ranura que aporta memoria, un criterio que todos calculan con la misma tabla y que no requiere elección. Ese nodo mantiene la marca de agua \texttt{next\_page}, que apunta a la primera página nunca entregada, y una lista de huecos ordenada por primera página que se genera con las liberaciones. Una reserva busca primero en los huecos con first-fit y solo cuando ninguno alcanza avanza la marca de agua, de modo que el espacio liberado se reutiliza antes de crecer.
+
+El mapa global se replica fuera del coordinador mediante el mensaje \texttt{WELCOME}. La instantánea contiene un registro de marca de agua y un registro por hueco, y viaja también en cada cambio para que el relevo no dependa de la vista que cada nodo tenía al unirse. Al importar, la marca de agua solo avanza y los huecos se reemplazan por los de la instantánea vigente, porque reintroducir el hueco de una vista atrasada permitiría repartir una página que otro nodo ya reservó. Un contador de secuencia del mapa distingue una réplica nueva de una repetida y evita retrocesos.
+
+Cuando el coordinador cae, el nodo de menor ranura asume la función, pero no reparte espacio hasta reconstruir el mapa. Para eso envía \texttt{ALLOC\_SYNC} a los pares vivos y adopta la marca de agua mayor que reciba en \texttt{ALLOC\_STATE}; los huecos de su última instantánea se descartan, porque entre esa vista y la baja pudieron entregarse páginas. Si algún par no responde, el nuevo coordinador devuelve \texttt{BUSY} en lugar de arriesgar una colisión, y las liberaciones posteriores reconstruyen la lista de huecos. La misma reserva que originó el relevo puede reintentarse cuando el mapa queda completo.
+
+Una reserva remota viaja como \texttt{ALLOC\_REQ} con la cantidad de páginas y el PID del solicitante, y el coordinador responde \texttt{ALLOC\_RESP} con la primera página o con un código de rechazo; la liberación usa \texttt{FREE\_REQ} y \texttt{FREE\_RESP}. Si el coordinador no responde, la llamada devuelve \texttt{DSM\_ERR\_NET} y no hay una reserva local silenciosa que después choque con la de otro nodo. Del lado del solicitante, el rango se anota en la tabla local de bloques vivos y en la copia del mapa, de modo que una liberación posterior pueda validar que la dirección y el tamaño corresponden a una reserva real.
+
+\subsection{Metadatos de página, propietario y orden}\label{sec:metadatos-pagina}
+
+Cada página de la vista tiene una entrada \texttt{page\_local\_t} con el estado de coherencia, la versión instalada, el último \texttt{tseq} aplicado y dos campos de identificación: el PID del proceso que reservó el bloque y el orden de la página dentro de ese bloque. El estado y la secuencia se protegen con el semáforo de la franja a la que pertenece la página, mientras que el PID y el orden solo cambian entre la reserva y la liberación, bajo esa misma franja. Esos dos campos no intervienen en la coherencia y existen para que las consultas y los informes puedan decir a qué proceso pertenece cada página sin deducirlo de la dirección.
+
+El directorio del home guarda una entrada por página con el estado \texttt{UNCACHED}, \texttt{SHARED} o \texttt{MODIFIED}, el \texttt{owner} cuando hay una copia modificada, el mapa de bits \texttt{copyset} con un bit por ranura, el \texttt{tseq} de la última transacción, la versión del contenido, el marco de respaldo y la bandera \texttt{busy} que reserva el turno de la página. El campo \texttt{owner} describe una copia válida solo en \texttt{MODIFIED}, y el \texttt{copyset} se interpreta como conjunto de lectores en \texttt{SHARED}; en \texttt{MODIFIED} se conserva como registro auxiliar de la ranura dueña, y fuera de esos estados no describe una copia válida. La distinción importa porque una lectura no debe interpretar un owner viejo como una promesa de contenido.
+
+La tabla global de páginas consulta la tabla local de todos los miembros vivos, incluidos los clientes, y arma cada fila con el home calculado por el anillo, el PID y el orden que anotó la reserva, el copyset y la franja de paridad. Consultar también a los clientes es necesario porque el PID y el orden viven en la tabla de quien tiene la copia, no en el custodio, y propagarlos por la red en cada transacción añadiría campos que la coherencia no necesita. El informe HTML usa la misma información y por eso puede mostrar el proceso y la posición de cada página sin recorrer un millón de entradas vacías.
+
+\subsection{Fallos de página y manejo de SIGSEGV}\label{sec:fallos-pagina}
+
+El nodo instala el manejador con \texttt{sigaction} y las banderas \texttt{SA\_SIGINFO}, \texttt{SA\_ONSTACK} y \texttt{SA\_RESTART}. \texttt{SA\_SIGINFO} entrega la dirección que provocó el fallo en el campo \texttt{si\_addr} de \texttt{siginfo\_t} y el contexto del hilo en un \texttt{ucontext\_t}; \texttt{SA\_ONSTACK} hace que el manejador corra sobre una pila alternativa de 64 KiB que cada hilo registra con \texttt{dsm\_thread\_attach}, sin la cual un desbordamiento de la pila del propio hilo no tendría dónde ejecutar la atención. El manejador no resuelve el fallo, solo lo registra y duerme al hilo, porque en contexto de señal no puede tomar mutex, reservar memoria ni abrir una conexión.
+
+El primer paso del manejador es comprobar que exista un contexto DSM y que \texttt{si\_addr} caiga dentro de \texttt{[view, view + VIEW\_SIZE)}. Si la dirección está fuera, restaura la disposición anterior y regresa, con lo que el fallo sigue su curso normal y termina el proceso; un acceso fuera de la vista es un error de la aplicación y no una página que el protocolo deba traer. Si la dirección pertenece a la vista, lee el registro de error del contexto y usa el bit 1 de \texttt{REG\_ERR} para distinguir escritura de lectura, con lo que evita pedir primero una lectura y repetir después la solicitud como escritura. El número de página se obtiene dividiendo el desplazamiento entre el tamaño de página.
+
+La ranura de fallo del hilo vive en una variable TLS declarada con modelo \textit{initial-exec}, de modo que su dirección se resuelve al cargar el programa y el manejador no pasa por \texttt{\_\_tls\_get\_addr}, que podría ejecutar \texttt{malloc} en la primera referencia de un hilo nuevo. El manejador llena la ranura con la página, el tipo de acceso, el error en cero y \texttt{done} en cero, y la empuja en \texttt{faultq}, una cola acotada de 4096 celdas que varios productores y varios consumidores comparten sin cerrojos. Cada celda lleva un contador de secuencia que indica si está libre para la generación en curso, y el productor reserva su posición con una operación atómica; cuando la cola está llena, el manejador termina el proceso con \texttt{\_exit(128 + SIGSEGV)} en lugar de bloquearse dentro de la señal. Un \texttt{sem\_post}, que es seguro en contexto de señal, avisa al despachador sin tomar cerrojos.
+
+Después de encolar, el hilo incrementa el contador de fallos de lectura o de escritura y espera en un bucle de \texttt{futex} sobre el campo \texttt{done} de su ranura. El bucle es necesario porque la espera puede retornar por una señal ajena o porque el despachador puede marcar la ranura antes de que el hilo entre a dormir; en ambos casos la condición se vuelve a evaluar y no se pierde el aviso. Cuando \texttt{done} queda en uno, el manejador revisa el campo \texttt{error}: si el despachador encontró una condición terminal, restaura la disposición anterior, desbloquea \texttt{SIGSEGV} y reenvía la señal para que el proceso termine en vez de repetir el acceso en un ciclo de CPU. En el caso normal regresa y el kernel reintenta la instrucción, que ahora encuentra el permiso correcto.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.82, every node/.style={transform shape},
+    proc/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\footnotesize, minimum width=2.7cm, minimum height=0.85cm},
+    kern/.style={draw=borderorange, fill=softorange, thick, rounded corners, align=center, font=\footnotesize, minimum width=2.7cm, minimum height=0.85cm},
+    net/.style={draw=bordergreen, fill=softgreen, thick, rounded corners, align=center, font=\footnotesize, minimum width=2.7cm, minimum height=0.85cm},
+    flow/.style={->, >=Latex, thick, draw=black!65, font=\tiny, align=center}
+]
+
+\node[proc] (app) at (0, 0) {Hilo de\\aplicación};
+\node[kern] (sig) at (4.9, 0) {Kernel entrega\\\texttt{SIGSEGV}};
+\node[kern] (hdl) at (9.8, 0) {Manejador en\\pila alternativa};
+\node[proc] (fq) at (14.7, 0) {\texttt{faultq}\\\texttt{done} en cero};
+
+\node[proc] (disp) at (14.7, -3.2) {Despachador\\\texttt{msi\_local\_fault}};
+\node[net] (home) at (9.8, -3.2) {Worker del home\\o home local};
+\node[kern] (prot) at (4.9, -3.2) {\texttt{page\_apply}\\y \texttt{mprotect}};
+\node[proc] (wake) at (0, -3.2) {\texttt{futex} despierta\\y reintenta};
+
+\draw[flow] (app) -- node[above, font=\tiny] {acceso} node[below, font=\tiny] {sin permiso} (sig);
+\draw[flow] (sig) -- node[above, font=\tiny] {\texttt{si\_addr}} node[below, font=\tiny] {\texttt{REG\_ERR}} (hdl);
+\draw[flow] (hdl) -- node[above, font=\tiny] {\texttt{faultq\_push}} node[below, font=\tiny] {y duerme} (fq);
+\draw[flow] (fq) -- node[right, font=\tiny] {\texttt{sem\_post}} (disp);
+\draw[flow] (disp) -- node[above, font=\tiny] {\texttt{PAGE\_REQUEST}} (home);
+\draw[flow] (home) -- node[above, font=\tiny] {\texttt{PAGE\_DATA}} node[below, font=\tiny] {\texttt{GRANT}} (prot);
+\draw[flow] (prot) -- node[above, font=\tiny] {\texttt{page\_apply}} (wake);
+\draw[flow] (wake.north) to[bend right=20] node[midway, left, align=right, font=\tiny] {\texttt{FUTEX\_WAKE}\\y reintento} (app.south);
+
+\end{tikzpicture}
+\caption{Recorrido de un fallo de página desde el acceso de la aplicación hasta el reintento de la instrucción, con la cola libre de cerrojos y los cambios de permiso fuera del manejador de señal.}
+\label{fig:flujo-fallo}
+\end{figure}
+
+El despachador espera en el semáforo de la cola con un plazo de 100 ms, que le permite revisar la bandera de ejecución durante el apagado sin quedar bloqueado. Al tomar una ranura llama a \texttt{msi\_local\_fault}; si la página está en un estado transitorio, la función devuelve \texttt{DSM\_ERR\_BUSY} y el despachador encola la ranura en la cola FIFO de esa página, donde aguarda en una variable de condición con el plazo de \texttt{LOCK\_TIMEOUT\_MS}. Cada finalización de la página difunde la condición y provoca un solo reintento, y un tope de reintentos actúa como red de seguridad para que una página sin progreso no monopolice al despachador. Los errores terminales, como el dueño muerto de una copia modificada, la falta de espacio o la falta de memoria local, no se reintentan: el motivo se publica en la ranura y el manejador reenvía la señal.
+
+La separación entre manejador, despachador y workers es lo que permite que la resolución espere por la red sin violar las reglas del contexto de señal. El manejador solo usa lecturas de variables ya inicializadas, operaciones atómicas, \texttt{sem\_post} y \texttt{futex}; el despachador es un hilo normal que puede bloquearse en una RPC y en la cola de la página; y los workers atienden los mensajes que llegan y nunca esperan una respuesta de otro nodo. Ningún hilo toma un mutex dentro del manejador y ningún worker queda retenido esperando la página que otro worker necesita, de modo que el grafo de espera se mantiene acíclico.
+
+\subsection{Reserva, compartición y liberación}\label{sec:reserva-comparticion}
+
+\texttt{dsm\_alloc} redondea el tamaño pedido a páginas completas, comprueba que quepa en la capacidad agregada y obtiene el rango del coordinador. Cuando el llamador es el coordinador, la búsqueda ocurre bajo el mutex del mapa; cuando no lo es, el rango llega en \texttt{ALLOC\_RESP} y la copia local del mapa se actualiza con el resultado. En ambos casos la función registra el bloque en la tabla de bloques vivos y anota en cada página el PID del proceso y su orden dentro del bloque. La dirección devuelta es la base del rango dentro de la vista, y las páginas permanecen en estado \texttt{I} con \texttt{PROT\_NONE} hasta que la aplicación las toque.
+
+El primer acceso a una página reservada produce un fallo de protección que el sistema interpreta como una solicitud de contenido. Esa es la razón por la que una reserva no copia datos ni contacta al home: el costo se paga cuando la página se usa y no cuando se pide el bloque, de modo que una aplicación que reserva mucho y toca poco no genera tráfico innecesario. Una página recién reservada contiene ceros solo después de que el home la persiste por primera vez; antes de eso, el protocolo la sirve como página nunca escrita y el contenido inicial es cero por construcción.
+
+Compartir un bloque no consiste en llamar a \texttt{dsm\_alloc} en cada proceso, porque dos reservas distintas reciben rangos distintos. El creador comunica a los demás la dirección virtual que obtuvo y ellos usan esa misma dirección dentro de su propia vista, que está mapeada en la misma \texttt{BASE\_ADDR} y por lo tanto tiene el mismo significado en todos los procesos. El protocolo se encarga de traer la página al primero que la lea, de compartirla en modo lectura y de invalidar las copias cuando alguien escribe, sin que la aplicación tenga que traducir direcciones ni conocer el home.
+
+\texttt{dsm\_free} valida que el puntero sea la base de un bloque vivo, que esté alineado a página y que el tamaño redondee al mismo número de páginas de la reserva. Después recorre las páginas y llama a \texttt{msi\_release\_page}, que rechaza la operación si alguna está en un estado transitorio, persiste el contenido si está en \texttt{M} y, cuando el nodo es el home, invalida las copias remotas y espera sus acuses antes de olvidar el copyset. Solo entonces la página se llena de ceros, se deja en \texttt{I} con \texttt{PROT\_NONE}, se libera su marco de respaldo y se borran el PID y el orden. El rango vuelve al mapa global con \texttt{FREE\_REQ}; si el coordinador no confirma, el bloque sigue vivo y la llamada devuelve error para que pueda reintentarse.
+
+La persistencia de una página modificada es una operación distinta de la liberación. \texttt{dsm\_sync} recorre la tabla local, toma cada página en \texttt{M} y la envía al home con \texttt{WRITEBACK} cuando el custodio es remoto, o la copia a su marco de respaldo cuando el custodio es local. El home actualiza su respaldo, calcula el delta de paridad si la redundancia está activa y responde con \texttt{WRITEBACK\_ACK}; la página permanece en \texttt{M}, así que la aplicación puede seguir escribiendo sin un fallo nuevo. Un \texttt{WRITEBACK} repetido con el mismo contenido no genera delta, porque el delta es el XOR contra el respaldo y resulta cero.
+
+\subsection{Durabilidad y alcance de la vista}\label{sec:durabilidad}
+
+La vista vive en memoria volátil. El \texttt{memfd} es un objeto anónimo respaldado por RAM, sin ruta en el sistema de archivos, y el respaldo de los homes es un bloque reservado con \texttt{calloc}; los marcos de paridad también son memoria dinámica. Cuando un proceso termina, su mapeo desaparece y el contenido que solo existía en su vista se pierde; cuando todos los nodos se detienen, el mapa global, las franjas y la paridad se reconstruyen vacíos en el siguiente arranque. El sistema no promete recuperar el estado después de apagar el clúster, y esa condición es parte del modelo, no un olvido.
+
+Dentro de un clúster vivo, la durabilidad de una escritura se alcanza con \texttt{dsm\_sync}. La llamada lleva el contenido de cada página en \texttt{M} al marco de respaldo de su home y, si la redundancia está activa, actualiza la paridad de la franja con el delta correspondiente. El punto en que la escritura queda protegida es el acuse del home, porque hasta entonces el contenido solo existe en la copia del dueño y la caída de ese nodo lo eliminaría. Una escritura posterior al acuse vuelve a quedar expuesta hasta el siguiente \texttt{dsm\_sync}, aunque la página siga en \texttt{M} y la aplicación pueda leerla sin fallos.
+
+La paridad extiende esa protección a la pérdida de un nodo mientras el clúster sigue operando. Cada franja guarda $K$ páginas de datos y una página de paridad calculada por XOR, y el custodio de la paridad se elige fuera de los custodios de los datos para que la caída de un nodo no destruya a la vez un dato y su paridad. Si un nodo desaparece, el nuevo custodio reconstruye la pieza perdida con las supervivientes y la instala; si no encuentra una copia válida ni paridad suficiente, deja la página inválida en lugar de publicar una versión anterior. La durabilidad efectiva es, por lo tanto, la del último \texttt{dsm\_sync} más la tolerancia de una pieza por franja, y no una persistencia en disco que sobreviva al reinicio de todos los procesos.
+
+El alcance de la vista también es local en el sentido de que cada proceso debe mapearla y registrar sus hilos. Un puntero obtenido de \texttt{dsm\_alloc} solo es válido dentro de un proceso que haya ejecutado \texttt{dsm\_init} y \texttt{dsm\_thread\_attach}, y el contenido que representa puede estar en otro equipo. Esa combinación de dirección local y contenido distribuido es la que permite usar punteros normales sin renunciar a que la memoria pertenezca al clúster, y la que obliga a que la capacidad real se mida por páginas aportadas y no por el tamaño de la región virtual.

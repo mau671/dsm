@@ -1,0 +1,247 @@
+\documentclass[11pt,spanish]{article}
+
+% --- Idioma y codificación para Tectonic / XeLaTeX ---
+\usepackage[spanish,es-tabla,es-noquoting]{babel}
+\usepackage{fontspec}
+
+% --- Márgenes / papel ---
+\usepackage{geometry}
+\geometry{a4paper, margin=2.5cm}
+
+% --- Matemáticas y símbolos ---
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+% --- Tablas, enlaces y elementos visuales ---
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{xltabular}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,shapes.geometric,arrows.meta,calc,fit,backgrounds,babel}
+\usepackage{enumitem}
+\usepackage{ragged2e}
+\usepackage{caption}
+\captionsetup{skip=6pt}
+\captionsetup[table]{position=top}
+\captionsetup[figure]{position=bottom}
+\usepackage{xurl}
+\usepackage[colorlinks=true, linkcolor=blue!70!black, urlcolor=blue!70!black, citecolor=blue!70!black, hypertexnames=false]{hyperref}
+
+% --- Párrafo en bloque ---
+\makeatletter
+\renewcommand\paragraph{\@startsection{paragraph}{4}{\z@}%
+  {2.2ex \@plus1ex \@minus.2ex}%
+  {0.8ex}%
+  {\normalfont\normalsize\bfseries}}
+\makeatother
+
+% --- Listados de código ---
+\usepackage{listings}
+\definecolor{codebg}{rgb}{0.97,0.97,0.98}
+\definecolor{codeframe}{rgb}{0.85,0.85,0.88}
+\definecolor{commentgreen}{rgb}{0.13,0.54,0.13}
+\definecolor{keywordblue}{rgb}{0.0,0.2,0.7}
+\definecolor{stringpurple}{rgb}{0.6,0.1,0.4}
+
+\definecolor{softblue}{rgb}{0.88, 0.93, 1.0}
+\definecolor{softgreen}{rgb}{0.88, 0.96, 0.88}
+\definecolor{softorange}{rgb}{1.0, 0.92, 0.82}
+\definecolor{softpurple}{rgb}{0.93, 0.88, 0.98}
+\definecolor{softteal}{rgb}{0.85, 0.95, 0.95}
+\definecolor{softyellow}{rgb}{1.0, 0.95, 0.80}
+\definecolor{borderblue}{rgb}{0.2, 0.4, 0.7}
+\definecolor{bordergreen}{rgb}{0.2, 0.6, 0.2}
+\definecolor{borderorange}{rgb}{0.8, 0.4, 0.1}
+
+\lstdefinestyle{customcode}{
+    backgroundcolor=\color{codebg},
+    basicstyle=\ttfamily\scriptsize,
+    breakatwhitespace=false,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    numbers=none,
+    showspaces=false,
+    showstringspaces=false,
+    showtabs=false,
+    tabsize=4,
+    frame=single,
+    rulecolor=\color{codeframe},
+    commentstyle=\color{commentgreen}\itshape,
+    keywordstyle=\color{keywordblue}\bfseries,
+    stringstyle=\color{stringpurple},
+    xleftmargin=0.5em,
+    xrightmargin=0.5em
+}
+\lstset{style=customcode}
+
+% --- Encabezado y pie de página ---
+\usepackage[myheadings]{fancyhdr}
+\usepackage{lastpage}
+\setlength{\headheight}{30pt}
+\setlength{\footskip}{30pt}
+
+% --- Interlineado ---
+\linespread{1.18}
+\sloppy
+\setlength{\emergencystretch}{2em}
+
+% --- Datos del documento ---
+\newcommand{\Institucion}{Instituto Tecnológico de Costa Rica}
+\newcommand{\Campus}{Escuela de Ingeniería en Computación}
+\newcommand{\DocumentoTitulo}{Sistema de memoria distribuida}
+\newcommand{\DocumentoSubtitulo}{Diseño e implementación}
+\newcommand{\DocumentoAvance}{Entrega final}
+\newcommand{\Curso}{IC-6600 Principios de Sistemas Operativos}
+\newcommand{\Profesor}{Esteban Arias Méndez}
+\newcommand{\FechaDocumento}{27 de noviembre de 2026}
+\newcommand{\PeriodoAcademico}{II Semestre}
+\newcommand{\AnioDocumento}{2026}
+
+\newcommand{\AutoresPortada}{%
+\begin{minipage}{0.85\textwidth}
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lr@{}}
+Mauricio González Prendas & 2024143009 \\
+Samuel Durán Maroto & 2023072368 \\
+\end{tabular*}
+\end{minipage}%
+}
+
+\newcommand{\DocHeaderLeft}{\Curso}
+\newcommand{\DocHeaderRight}{\DocumentoTitulo\ -- Entrega final}
+
+\title{\DocumentoTitulo: \DocumentoSubtitulo}
+\author{Mauricio González Prendas, Samuel Durán Maroto}
+\date{\FechaDocumento}
+
+% --- Tablas ---
+\newcolumntype{Y}{>{\RaggedRight\arraybackslash}X}
+\newcolumntype{P}[1]{>{\RaggedRight\arraybackslash}p{#1}}
+\renewcommand{\arraystretch}{1.22}
+\setlength{\LTpre}{0.5em}
+\setlength{\LTpost}{0.5em}
+
+% --- Ancho uniforme de los números en el índice ---
+\makeatletter
+\renewcommand*\l@section{\@dottedtocline{1}{1.5em}{2.8em}}
+\renewcommand*\l@subsection{\@dottedtocline{2}{4.3em}{3.2em}}
+\renewcommand*\l@subsubsection{\@dottedtocline{3}{7.5em}{4.1em}}
+\makeatother
+
+% --- Encabezado y pie ---
+\pagestyle{fancy}
+\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+\fancyfoot[C]{\thepage}
+
+\fancypagestyle{plain}{%
+    \fancyhf{}%
+    \renewcommand{\headrulewidth}{0pt}%
+    \renewcommand{\footrulewidth}{0pt}%
+    \fancyfoot[C]{\thepage}%
+}
+\fancypagestyle{widefancy}{%
+    \fancyhf{}%
+    \renewcommand{\headrulewidth}{0pt}%
+    \renewcommand{\footrulewidth}{0pt}%
+    \fancyfoot[C]{\thepage}%
+}
+
+\newcommand{\MakeCover}{%
+\begin{titlepage}
+\thispagestyle{empty}
+\centering
+
+\includegraphics[width=0.22\linewidth]{figuras/logo.png}
+\vspace{0.6cm}
+
+{\bfseries \huge \Institucion \par}
+\vspace{0.25cm}
+{\LARGE \Campus \par}
+
+\vfill
+
+{\huge \bfseries \DocumentoTitulo \par}
+\vspace{0.3cm}
+{\LARGE \DocumentoSubtitulo \par}
+\vspace{0.4cm}
+{\Large \DocumentoAvance \par}
+
+\vfill
+
+{\bfseries \LARGE Profesor: \par}
+\vspace{0.2cm}
+{\Large \Profesor \par}
+
+\vfill
+
+{\bfseries \LARGE Estudiantes: \par}
+\vspace{0.3cm}
+{\Large \AutoresPortada \par}
+
+\vfill
+
+{\bfseries\LARGE Fecha: \par}
+\vspace{0.2cm}
+{\Large \FechaDocumento \par}
+
+\vfill
+
+{\LARGE \PeriodoAcademico \par}
+{\LARGE \AnioDocumento \par}
+
+\end{titlepage}%
+}
+
+\begin{document}
+\hypersetup{pageanchor=false}
+\MakeCover
+
+\newpage
+\hypersetup{pageanchor=true}
+\pagenumbering{roman}
+
+\section*{Resumen}
+\addcontentsline{toc}{section}{Resumen}
+\input{secciones/resumen}
+
+\newpage
+{\small\tableofcontents}
+\newpage
+{\small\listoffigures}
+\newpage
+{\small\listoftables}
+
+\newpage
+\section*{Glosario y convenciones}
+\addcontentsline{toc}{section}{Glosario y convenciones}
+\input{secciones/glosario}
+
+\newpage
+\pagenumbering{arabic}
+
+\input{secciones/01-introduccion}
+\input{secciones/02-arquitectura}
+\input{secciones/03-configuracion}
+\input{secciones/04-memoria}
+\input{secciones/05-msi}
+\input{secciones/06-concurrencia}
+\input{secciones/07-redundancia}
+\input{secciones/08-distribuida}
+\input{secciones/09-protocolo}
+\input{secciones/10-api}
+\input{secciones/11-aplicaciones}
+\input{secciones/12-herramientas}
+\input{secciones/13-validacion}
+\input{secciones/14-conclusiones}
+
+\appendix
+\input{secciones/apendices}
+
+\end{document}

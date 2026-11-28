@@ -1,0 +1,208 @@
+\section{Coherencia MSI}\label{sec:msi}
+
+La coherencia se decide por página y sigue el esquema clásico de un escritor exclusivo o varios lectores. Cada página tiene un nodo custodio que mantiene el directorio, y cada nodo conserva en su vista una copia cuyo estado determina qué operaciones permite el kernel. El modelo base son los estados \texttt{M}, \texttt{S} e \texttt{I}, a los que se suman tres estados transitorios que describen una transición mientras la respuesta viaja por la red. El resultado es que una escritura invalida todas las demás copias antes de concederse, una lectura puede compartirse y una copia modificada se recupera del dueño antes de que otro nodo la lea.
+
+\subsection{Estados, permisos y transiciones}\label{sec:msi-estados}
+
+El estado \texttt{M} identifica una copia exclusiva y modificable que constituye la versión vigente, y el nodo que la posee es el único con contenido válido; la vista se abre con \texttt{PROT\_READ} y \texttt{PROT\_WRITE}, y el directorio del home queda en \texttt{MODIFIED} con ese nodo en el campo \texttt{owner}. El estado \texttt{S} describe una copia de solo lectura que puede compartirse con otros nodos; la vista se abre con \texttt{PROT\_READ}, el directorio queda en \texttt{SHARED} y el \texttt{copyset} enumera las ranuras que la conservan. El estado \texttt{I} indica que no hay copia válida, la vista se deja con \texttt{PROT\_NONE} y cualquier acceso produce un fallo de protección. Los tres estados restantes son \texttt{IS\_PEND}, \texttt{IM\_PEND} y \texttt{SM\_PEND}, que no describen contenido definitivo sino una solicitud en curso.
+
+Las transiciones estables siguen una regla sencilla. Un fallo de lectura sobre \texttt{I} lleva a \texttt{IS\_PEND} y espera un \texttt{PAGE\_DATA}; un fallo de escritura sobre \texttt{I} lleva a \texttt{IM\_PEND} y espera un \texttt{GRANT} o un \texttt{PAGE\_DATA} con la página; un fallo de escritura sobre \texttt{S} lleva a \texttt{SM\_PEND} y espera que el home cierre las demás copias. Cuando llega la respuesta, \texttt{IS\_PEND} pasa a \texttt{S} y \texttt{IM\_PEND} o \texttt{SM\_PEND} pasan a \texttt{M}. En sentido contrario, una orden \texttt{DOWNGRADE} del home lleva \texttt{M} a \texttt{S}, y una orden \texttt{INVALIDATE} lleva \texttt{S} o \texttt{M} a \texttt{I}; una invalidación que llega durante una transición también deja la página en \texttt{I}, porque el contenido que estaba en vuelo ya no es utilizable en ese nodo.
+
+El cambio de estado y el cambio de permiso ocurren juntos bajo el semáforo de la franja de la página. Al degradar una copia propia de \texttt{M} a \texttt{S}, el nodo cierra primero la escritura con \texttt{PROT\_READ}, copia después el contenido que debe entregar y solo entonces publica el estado \texttt{S}, de modo que ningún hilo pueda modificar la página entre la copia y el cierre. Al invalidar, el nodo aplica \texttt{PROT\_NONE} y marca \texttt{I} antes de responder el acuse, porque el home solo debe recibir la confirmación cuando la copia dejó de ser accesible. Esa correspondencia entre estado, permiso y contenido evita que un hilo lea una página que el protocolo ya considera perdida.
+
+\subsection{Estados transitorios y su justificación}\label{sec:msi-transitorios}
+
+Una transición de coherencia no ocurre en una instrucción, sino que depende de una respuesta que viaja por la red. Si el nodo mantuviera el cerrojo de la página durante esa espera, bloquearía todas las operaciones sobre la misma franja y violaría la regla de no retener cerrojos a través de la red; si lo liberara sin dejar rastro, un segundo fallo sobre la misma página no tendría forma de saber que ya hay una solicitud en curso y generaría un duplicado. Los estados transitorios resuelven ambos problemas porque publican la intención, conservan el permiso que todavía es seguro y permiten que el segundo acceso espere sin iniciar otra transacción.
+
+\texttt{IS\_PEND} e \texttt{IM\_PEND} dejan la vista con \texttt{PROT\_NONE} porque el nodo no tiene contenido válido: en el primer caso pidió la página para leerla y en el segundo para escribirla, y en ambos el contenido llegará con la respuesta. \texttt{SM\_PEND} conserva \texttt{PROT\_READ} porque la copia \texttt{S} que el nodo ya tenía sigue siendo válida para leer mientras el home cierra las demás; descartarla obligaría a pedir la página completa otra vez y retrasaría una elevación que solo necesita permiso de escritura. La diferencia entre los tres no es cosmética, ya que determina qué accesos pueden continuar y cuáles deben esperar.
+
+Mientras una página está en un estado transitorio, \texttt{msi\_local\_fault} devuelve \texttt{DSM\_ERR\_BUSY} y el despachador encola la ranura en la cola FIFO de esa página. La página no se marca como fallida ni se pierde la solicitud: la ranura espera en una variable de condición con plazo y cada finalización difunde la señal para que todos los esperadores reintenten una sola vez sobre el estado ya publicado. Ese mecanismo reemplaza el sondeo y evita que una ráfaga de fallos sobre la misma página genere una ráfaga de mensajes idénticos al home.
+
+La llegada de una orden durante un transitorio tiene tratamiento propio. Un \texttt{INVALIDATE} sobre \texttt{IS\_PEND} o \texttt{IM\_PEND} deja la página en \texttt{I} y responde el acuse sin datos, porque el nodo todavía no tiene una copia que devolver; si después llega la respuesta de la solicitud original, la compuerta de \texttt{tseq} decide si corresponde a una transacción posterior o si es una respuesta vieja que debe descartarse. Un \texttt{DOWNGRADE} sobre \texttt{SM\_PEND} se atiende con el contenido de la copia \texttt{S}, que sigue siendo la versión válida, y la deja en \texttt{SM\_PEND} porque la elevación continúa en curso; sobre \texttt{IM\_PEND} el nodo responde \texttt{BUSY} porque no tiene contenido, y el home recurre a su respaldo para no quedar esperando a un dueño que a su vez espera al home. Esa respuesta corta un ciclo que de otro modo podría formarse entre el turno del home y la cola local del dueño.
+
+\subsection{Directorio y transacciones por página}\label{sec:msi-directorio}
+
+El directorio del home tiene una entrada por página con el estado \texttt{UNCACHED}, \texttt{SHARED} o \texttt{MODIFIED}, el \texttt{owner}, el \texttt{copyset}, el \texttt{tseq}, la versión, el marco de respaldo y la bandera \texttt{busy}. La entrada se protege con \texttt{dir\_mu}, mientras que el estado local de la página se protege con el semáforo de su franja; ambos cerrojos son cortos y nunca se conservan durante una llamada de red. La bandera \texttt{busy} reserva el turno de la página y hace que una segunda transacción no observe el directorio a medio modificar.
+
+Una solicitud local que encuentra el turno ocupado se encola en una lista FIFO de la página y espera en una variable de condición con el plazo de \texttt{LOCK\_TIMEOUT\_MS}. Una solicitud remota no ocupa un worker mientras espera: se deja diferida en la misma cola, con una copia de su carga si la tiene, y cuando el turno se libera se reencola para que un worker la atienda con el turno ya reservado. La marca interna \texttt{TXN\_OWNER} viaja solo dentro del proceso y evita que el mensaje reencolado vuelva a competir por \texttt{busy}. El campo \texttt{seq\_next} numera las llegadas de ambos tipos, de modo que una solicitud local y una remota que coinciden en el tiempo conservan el orden en que se encolaron.
+
+El dueño del turno nunca retiene \texttt{txn\_mu}, \texttt{dir\_mu} ni la franja de la página durante una RPC; conserva \texttt{busy} y suelta los cerrojos antes de salir a la red. El orden de adquisición es siempre \texttt{txn\_mu} y después \texttt{dir\_mu}, y la liberación del turno se hace en la etiqueta de salida de la función, incluso en los caminos de error. Cuando el turno se libera, \texttt{home\_txn\_release} elige al siguiente de la cola y reencola el diferido o despierta al esperador local, sin mantener el cerrojo mientras el worker procesa el mensaje.
+
+El home atiende la solicitud en una única función que separa lectura de escritura. Si el nodo que recibe el mensaje ya no es el home según el anillo, responde \texttt{NOT\_HOME} y el solicitante vuelve a resolver la ubicación; si el directorio declara \texttt{MODIFIED} con un dueño que es el propio solicitante, el home busca el contenido en su respaldo y lo entrega sin pedirle la copia al dueño, porque ese dueño fantasma ya no la tiene; si el dueño remoto está muerto, responde \texttt{NODE\_DOWN} en lugar de servir un respaldo que podría ser anterior a la última escritura. Esas tres decisiones cubren los casos en que el directorio y el contenido real no coinciden.
+
+Cuando el home es también el solicitante, la transacción se ejecuta por llamada de función y no se envía un mensaje a sí mismo. La lógica de coherencia vive en un solo lugar y el turno se toma igual, de modo que una página local y una remota se comportan de la misma manera salvo por el transporte. Esa simetría es la que permite que la aplicación no distinga entre páginas propias y ajenas y que el mismo camino de fallo sirva para ambas.
+
+\subsection{Números de secuencia y compuerta tseq}\label{sec:msi-tseq}
+
+Cada página tiene un contador \texttt{tseq} de 32 bits que el home incrementa con cada transacción que entrega contenido o permiso. \texttt{dir\_tseq\_next} hace el incremento bajo \texttt{dir\_mu} y salta el cero, que queda reservado para ``sin secuencia''. El valor viaja en la cabecera de \texttt{PAGE\_DATA}, \texttt{GRANT}, \texttt{INVALIDATE} y \texttt{DOWNGRADE}, y el receptor lo compara con el último aplicado antes de instalar nada. La comparación y la publicación ocurren en \texttt{tseq\_accept}, bajo el semáforo de la franja, y la publicación es temprana a propósito: si la instalación falla después, la secuencia ya avanzó y una respuesta vieja no podrá colarse en un reintento.
+
+Una respuesta con \texttt{tseq} menor o igual al registrado se descarta y se contabiliza en \texttt{tseq\_discarded}. Si la página estaba en un estado pendiente, \texttt{page\_apply} la devuelve a \texttt{I} y difunde la condición para que el hilo que esperaba vuelva a fallar, en lugar de dejarla pendiente para siempre; si la página ya tenía una copia \texttt{S} o \texttt{M} más nueva, esa copia se conserva intacta. El descarte no cambia permisos ni contenido, de modo que una respuesta repetida no puede retroceder una página que ya avanzó.
+
+La capa de red consulta el mismo criterio con \texttt{msi\_tseq\_stale} antes de despertar una RPC. Si una respuesta de página es vieja, \texttt{pending\_complete} devuelve \texttt{NOT\_FOUND} y el listener la descarta sin tocar la tabla de páginas. Esa comprobación temprana evita que una respuesta tardía active un hilo que ya había agotado su plazo y que después aplique contenido anterior sobre una copia más reciente.
+
+El \texttt{tseq} también se usa para sembrar el orden cuando cambia el custodio. \texttt{INVALIDATE} y \texttt{DOWNGRADE} registran su secuencia en el receptor, de modo que una concesión anterior que llegue después se descarte. Cuando el anillo asigna la página a otro home, el nodo que detecta el cambio reinicia su \texttt{tseq\_seen} a cero, porque el nuevo custodio puede empezar en un valor más bajo y, sin ese reinicio, la primera respuesta se rechazaría por antigua. El traspaso con \texttt{PAGE\_MOVE} o \texttt{WRITEBACK} con \texttt{TRANSFER} siembra en el nuevo home la secuencia del anterior antes de incrementarla, de modo que sus respuestas superen lo que los demás nodos ya vieron.
+
+La secuencia es por página y por periodo de custodia, no un orden total entre homes distintos. Si una página cambia de custodio, la secuencia del nuevo home puede empezar en un valor que otro nodo ya vio, y el reinicio local resuelve ese caso sin comparar números entre periodos. La compuerta protege contra respuestas repetidas o reordenadas dentro de un mismo periodo, que es exactamente el riesgo que introducen los reintentos y los mensajes que se cruzan.
+
+\subsection{Lectura: de inválida a compartida}\label{sec:msi-lectura}
+
+Una lectura sobre una página en \texttt{I} produce \texttt{SIGSEGV}, el despachador toma la ranura y \texttt{msi\_local\_fault} cambia el estado local a \texttt{IS\_PEND} con la vista todavía en \texttt{PROT\_NONE}. Después resuelve el home con el anillo y, si el home es el propio nodo, ejecuta la transacción local; si es remoto, envía \texttt{PAGE\_REQUEST} con acceso de lectura y la bandera \texttt{WANT\_DATA}. La solicitud no lleva contenido, porque el solicitante no tiene nada que entregar, y el home la atiende con el turno de la página ya reservado.
+
+El home consulta su directorio y decide de dónde sale el contenido. Si la entrada está en \texttt{MODIFIED} con un dueño remoto, envía \texttt{DOWNGRADE} con \texttt{HAS\_DATA} a ese dueño y espera su \texttt{DOWNGRADE\_ACK}; el dueño cierra la escritura, copia la página, pasa a \texttt{S} y devuelve los 4096 bytes junto con el acuse. Si el dueño es el propio home, cierra su escritura, copia el contenido y se degrada a \texttt{S}. Si la entrada está en \texttt{UNCACHED} o la copia local no existe, el home busca el contenido en su marco de respaldo, pregunta a los pares que todavía conserven una copia y, solo si nunca se escribió, sirve ceros.
+
+Con el contenido en la mano, el home lo persiste en su respaldo, actualiza el delta de paridad si corresponde, marca la entrada como \texttt{SHARED} y agrega al solicitante y a sí mismo al \texttt{copyset}. Conserva las demás copias de lectura que ya existían, porque siguen siendo válidas y habrá que invalidarlas en la próxima concesión de escritura. Después responde \texttt{PAGE\_DATA} con la página completa y el \texttt{tseq} de esa transacción.
+
+El solicitante recibe la respuesta, comprueba que el \texttt{tseq} supere el último aplicado, instala el contenido a través del alias, abre la vista con \texttt{PROT\_READ} y publica el estado \texttt{S}. La instalación y el cambio de permiso ocurren bajo el semáforo de la franja, y la finalización difunde la condición de la página para que los fallos que esperaban reintenten. Cuando el hilo que falló despierta, el kernel reintenta la instrucción y la lectura encuentra el permiso correcto sin que la aplicación haya visto nada distinto de un acceso normal.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.88, every node/.style={transform shape},
+    line/.style={draw=black!60, thick, dashed},
+    msg/.style={->, >=Latex, thick, draw=borderblue, font=\scriptsize},
+    resp/.style={->, >=Latex, thick, draw=bordergreen, font=\scriptsize},
+    box/.style={draw=black!70, fill=softblue, rounded corners, font=\small\bfseries, minimum width=3.0cm, minimum height=0.7cm},
+    note/.style={draw=black!40, fill=softyellow, font=\tiny, align=center, rounded corners=1pt, inner sep=2pt, minimum width=2.2cm}
+]
+
+\node[box] (R) at (0, 0) {Solicitante $R$};
+\node[box] (H) at (5.8, 0) {Home $H$};
+\node[box] (B) at (11.6, 0) {Copia $B$};
+
+\draw[line] (R) -- (0, -7.3);
+\draw[line] (H) -- (5.8, -7.3);
+\draw[line] (B) -- (11.6, -7.3);
+
+\node[note] at (0, -1.05) {fallo lectura\\$I \to \text{IS\_PEND}$};
+\draw[msg] (0, -1.75) -- (5.8, -1.75) node[midway, above] {\texttt{PAGE\_REQUEST(read, p)}};
+
+\node[note] at (5.8, -2.55) {turno \texttt{busy}\\directorio \texttt{MODIFIED}};
+\draw[msg] (5.8, -3.2) -- (11.6, -3.2) node[midway, above] {\texttt{DOWNGRADE(p, datos)}};
+
+\node[note] at (11.6, -4.0) {$M \to S$\\\texttt{PROT\_READ}};
+\draw[resp] (11.6, -4.65) -- (5.8, -4.65) node[midway, above] {\texttt{DOWNGRADE\_ACK(p, datos, $t_1$)}};
+
+\node[note] at (5.8, -5.45) {respaldo al día\\\texttt{SHARED}, copyset};
+\draw[resp] (5.8, -6.1) -- (0, -6.1) node[midway, above] {\texttt{PAGE\_DATA(p, datos, $t_2$)}};
+
+\node[note] at (0, -6.9) {$\text{IS\_PEND} \to S$\\\texttt{PROT\_READ}};
+
+\end{tikzpicture}
+\caption{Secuencia de lectura sobre una página inválida cuando otro nodo conserva la única copia modificada. El home degrada al dueño, persiste el contenido y responde con la secuencia $t_2$ posterior a $t_1$.}
+\label{fig:msi-lectura}
+\end{figure}
+
+\subsection{Escritura: invalidación y acuses}\label{sec:msi-escritura}
+
+Una escritura sobre una página en \texttt{S} produce \texttt{SIGSEGV} y lleva el estado local a \texttt{SM\_PEND}, mientras que una escritura sobre \texttt{I} lleva a \texttt{IM\_PEND}; en ambos casos la vista queda con el permiso que corresponde al estado de partida y el nodo envía \texttt{PAGE\_REQUEST} con acceso de escritura. El home reserva el turno, consulta el directorio y, si hay un dueño remoto en \texttt{M}, le envía \texttt{DOWNGRADE} con acceso de escritura para recuperar la versión sucia antes de seguir. El dueño degradado pasa a \texttt{S} y entrega el contenido en su acuse, con lo que el home ya tiene la versión más reciente.
+
+El home persiste el contenido y su delta de paridad antes de conceder nada, porque a partir de ese momento su respaldo es la última versión confirmada y puede usarse si el dueño desaparece o queda pendiente de otra transacción. Después invalida todas las copias del \texttt{copyset} distintas del solicitante: la copia local del propio home se invalida con una llamada directa y las remotas reciben \texttt{INVALIDATE} con el \texttt{tseq} de la transacción. La invalidación no espera una RPC por copia, sino que registra una espera con un mapa de bits donde cada destinatario tiene su bit; el mapa se inicializa con todos los esperados y cada acuse limpia el suyo.
+
+La estructura de espera guarda lo que falta, no lo que llegó. \texttt{expected} cuenta los destinatarios, \texttt{received} cuenta los acuses nuevos y \texttt{ok\_mask} conserva los bits pendientes; cuando la máscara queda vacía y la cuenta alcanza el total, la espera se completa. Un acuse duplicado encuentra su bit ya limpio y no incrementa la cuenta, y un acuse de un nodo que no estaba en el conjunto tampoco altera el resultado. Si un destinatario ya no está vivo, el home lo retira del \texttt{copyset} antes de esperar, porque un acuse que nunca llegará agotaría el plazo en cada concesión.
+
+Cuando todos los acuses llegan, el directorio pasa a \texttt{MODIFIED} con el solicitante como \texttt{owner} y el \texttt{copyset} queda con un solo bit. El home responde \texttt{GRANT} con la página completa y el \texttt{tseq} nuevo, y el solicitante aplica el contenido, abre la vista con \texttt{PROT\_READ} y \texttt{PROT\_WRITE} y publica el estado \texttt{M}. La respuesta lleva datos incluso cuando el solicitante venía de \texttt{S} y su copia seguía siendo válida, porque el home ya la invalidó para conceder la escritura y el camino de aplicación es el mismo para los dos orígenes.
+
+Si la invalidación falla, el home invalida su propia copia, responde \texttt{BUSY} y no concede la escritura; el solicitante invalida su estado pendiente y devuelve el error al despachador, que puede reintentar más tarde. Esa decisión prefiere negar el permiso antes que concederlo con una copia remota viva, porque una escritura con lectores activos rompería la garantía de un solo escritor. El respaldo ya actualizado evita perder el contenido que se había recuperado del dueño anterior.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.88, every node/.style={transform shape},
+    line/.style={draw=black!60, thick, dashed},
+    msg/.style={->, >=Latex, thick, draw=borderblue, font=\scriptsize},
+    resp/.style={->, >=Latex, thick, draw=bordergreen, font=\scriptsize},
+    box/.style={draw=black!70, fill=softblue, rounded corners, font=\small\bfseries, minimum width=3.0cm, minimum height=0.7cm},
+    note/.style={draw=black!40, fill=softyellow, font=\tiny, align=center, rounded corners=1pt, inner sep=2pt, minimum width=2.2cm}
+]
+
+\node[box] (R) at (0, 0) {Solicitante $R$};
+\node[box] (H) at (5.8, 0) {Home $H$};
+\node[box] (B) at (11.6, 0) {Copia $B$};
+
+\draw[line] (R) -- (0, -9.3);
+\draw[line] (H) -- (5.8, -9.3);
+\draw[line] (B) -- (11.6, -9.3);
+
+\node[note] at (0, -1.05) {fallo escritura\\$S \to \text{SM\_PEND}$};
+\draw[msg] (0, -1.75) -- (5.8, -1.75) node[midway, above] {\texttt{PAGE\_REQUEST(write, p)}};
+
+\node[note] at (5.8, -2.55) {turno \texttt{busy}\\owner $B$ en \texttt{M}};
+\draw[msg] (5.8, -3.2) -- (11.6, -3.2) node[midway, above] {\texttt{DOWNGRADE(p, write)}};
+
+\node[note] at (11.6, -4.0) {$M \to S$\\\texttt{PROT\_READ}};
+\draw[resp] (11.6, -4.65) -- (5.8, -4.65) node[midway, above] {\texttt{DOWNGRADE\_ACK(p, datos, $t_1$)}};
+
+\node[note] at (5.8, -5.45) {respaldo y paridad\\invalida el copyset};
+\draw[msg] (5.8, -6.1) -- (11.6, -6.1) node[midway, above] {\texttt{INVALIDATE(p, $t_2$)}};
+
+\node[note] at (11.6, -6.9) {$S \to I$\\\texttt{PROT\_NONE}};
+\draw[resp] (11.6, -7.55) -- (5.8, -7.55) node[midway, above] {\texttt{INVALIDATE\_ACK(p)}};
+
+\node[note] at (0, -8.95) {$\text{SM\_PEND} \to M$\\\texttt{READ+WRITE}};
+\draw[resp] (5.8, -8.25) -- (0, -8.25) node[midway, above] {\texttt{GRANT(p, datos, $t_3$)}};
+
+\end{tikzpicture}
+\caption{Secuencia de escritura con una copia compartida. El home recupera la versión del dueño, la persiste, espera el acuse de cada invalidación y solo entonces concede la página al solicitante.}
+\label{fig:msi-escritura}
+\end{figure}
+
+\subsection{Respuestas huérfanas y retransmisión}\label{sec:msi-huerfanas}
+
+Cada solicitud se correlaciona por un \texttt{req\_id} que el emisor registra en una tabla de 1024 cubetas antes de enviarla, y la respuesta llega como un mensaje independiente que el listener busca por ese identificador. Si la respuesta no encuentra una solicitud pendiente, el listener no la entrega a ningún worker cuando se trata de \texttt{PAGE\_DATA} o \texttt{GRANT}: libera la carga y cierra la conexión. Esa guardia impide que una respuesta de una RPC vencida se aplique sobre una página que ya está en \texttt{S} o \texttt{M} y sobrescriba una versión más nueva.
+
+La primera defensa contra una respuesta vieja es la compuerta de \texttt{tseq}, que el listener consulta antes de buscar la solicitud pendiente. Una respuesta con secuencia repetida o anterior se descarta aunque su \texttt{req\_id} coincida con una solicitud activa, algo que puede ocurrir cuando un reintento reutiliza el identificador de la transacción. La segunda defensa es \texttt{page\_accept\_pending}, que solo permite aplicar la respuesta si la página sigue en \texttt{IS\_PEND}, \texttt{IM\_PEND} o \texttt{SM\_PEND}; una respuesta que llega después de que la página volvió a \texttt{I}, \texttt{S} o \texttt{M} ya no encuentra un estado pendiente y se descarta. La tercera es la comprobación dentro de \texttt{page\_apply}, que repite la condición bajo el semáforo de la franja y evita que una invalidación concurrente reabra una página ya cerrada.
+
+La retransmisión de solicitudes se apoya en el mismo esquema. \texttt{dsm\_net\_rpc\_ex} hace hasta \texttt{REQUEST\_RETRIES} intentos con una espera exponencial acotada por \texttt{RECONNECT\_MAX\_MS}, y solo reintenta ante errores de transporte o de plazo, porque una respuesta con estado distinto de \texttt{OK} es una respuesta del protocolo y llegaría igual en el siguiente intento. Cada intento de \texttt{PAGE\_REQUEST} abre una solicitud nueva y recibe su propio \texttt{req\_id}, de modo que una respuesta del intento anterior queda huérfana por construcción; cuando el identificador se comparte, como en la RPC de \texttt{DOWNGRADE}, la compuerta de \texttt{tseq} y el mapa de acuses cubren el duplicado.
+
+Un \texttt{INVALIDATE} repetido es idempotente, porque un nodo que ya perdió la copia responde el acuse sin cambiar nada y un nodo que todavía la tiene la invalida una sola vez. Un \texttt{DOWNGRADE} repetido se atiende con el contenido que el nodo conserve y, si ya está en \texttt{S}, vuelve a copiar y a acusar; el acuse duplicado lo absorbe el mapa de acuses. Una concesión \texttt{GRANT} repetida se descarta porque la página ya salió del estado pendiente. Un \texttt{WRITEBACK} repetido persiste el mismo contenido y no genera delta de paridad, ya que el XOR contra el respaldo es cero.
+
+Cuando el home reejecuta una solicitud porque el solicitante reintentó, no conserva la respuesta anterior ni la reproduce: vuelve a leer el directorio, aplica la transacción sobre el estado actual y responde con un \texttt{tseq} nuevo. Esa decisión hace que el reintento sea seguro sin una memoria de respuestas y que el solicitante reciba la versión vigente, no la que había pedido en el intento que venció. La compuerta de secuencia se encarga de que la respuesta del intento viejo, si todavía llega, no reemplace a la nueva.
+
+\subsection{Diagrama de estados}\label{sec:msi-diagrama}
+
+La máquina de estados local resume las transiciones que cambian el estado visible de una página. Los estados azules son estables y los naranjas transitorios; las flechas continuas representan fallos de la aplicación, las verdes respuestas del home y las naranjas órdenes del custodio. Las invalidaciones que llegan mientras la página espera no se dibujan como flechas separadas, porque el nodo pasa a \texttt{I} en el acto y esa transición se lee como un paso desde el estado transitorio.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.86, every node/.style={transform shape},
+    st/.style={draw=borderblue, fill=softblue, thick, rounded corners, minimum width=1.5cm, minimum height=0.8cm, font=\small\bfseries, align=center},
+    ts/.style={draw=borderorange, fill=softorange, thick, rounded corners, minimum width=2.4cm, minimum height=0.8cm, font=\small\bfseries, align=center},
+    fault/.style={->, >=Latex, thick, draw=black!65, font=\scriptsize},
+    up/.style={->, >=Latex, thick, draw=bordergreen, font=\scriptsize},
+    down/.style={->, >=Latex, thick, draw=borderorange, font=\scriptsize}
+]
+
+\node[st] (I) at (0, 0) {\texttt{I}};
+\node[ts] (IS) at (4.8, 3.0) {\texttt{IS\_PEND}};
+\node[st] (S) at (9.6, 3.0) {\texttt{S}};
+\node[ts] (IM) at (4.8, -3.0) {\texttt{IM\_PEND}};
+\node[ts] (SM) at (9.6, -3.0) {\texttt{SM\_PEND}};
+\node[st] (M) at (14.4, 0) {\texttt{M}};
+
+\draw[fault] (I.north) to[bend left=18] node[midway, left, font=\tiny, align=right] {fallo\\lectura} (IS.west);
+\draw[fault] (I.south) to[bend right=18] node[midway, left, font=\tiny, align=right] {fallo\\escritura} (IM.west);
+\draw[fault] (S.south) -- node[midway, right, font=\tiny, align=left] {fallo\\escritura} (SM.north);
+
+\draw[up] (IS.east) -- node[midway, above, font=\tiny] {\texttt{PAGE\_DATA}} (S.west);
+\draw[up] (IM.east) to[bend right=10] node[pos=0.12, above, font=\tiny] {\texttt{PAGE\_DATA}} (M.south west);
+\draw[up] (SM.east) to[bend right=6] node[pos=0.6, below right, font=\tiny] {\texttt{GRANT}} (M.south);
+
+\draw[down] (M.north) to[bend right=16] node[midway, above right, font=\tiny] {\texttt{DOWNGRADE}} (S.east);
+\draw[down] (S.north) .. controls (9.9, 6.5) and (1.2, 6.5) .. node[midway, above, font=\tiny] {\texttt{INVALIDATE}} (I.north);
+\draw[down] (M.south) .. controls (14.2, -6.5) and (1.2, -6.5) .. node[midway, below, font=\tiny] {\texttt{INVALIDATE}} (I.south);
+
+\end{tikzpicture}
+\caption{Máquina de estados local del protocolo MSI con los tres estados transitorios. Las flechas verdes completan una solicitud y las naranjas aplican una orden del home; una invalidación sobre cualquier transitorio también deja la página en \texttt{I}.}
+\label{fig:msi-estados}
+\end{figure}
+
+La lectura del diagrama sigue el ciclo de una página. Un acceso sobre \texttt{I} abre una solicitud de lectura o de escritura y deja la página en el transitorio correspondiente; la respuesta la lleva a \texttt{S} o a \texttt{M} según el permiso concedido. Una escritura sobre \texttt{S} pasa por \texttt{SM\_PEND} y termina en \texttt{M} cuando el home confirma que las demás copias se invalidaron. Las órdenes del custodio cierran el ciclo al revés: \texttt{M} se degrada a \texttt{S} cuando otro nodo necesita leer, y cualquier copia válida se invalida cuando otro nodo va a escribir.
+
+\subsection{Secuencias completas de lectura y escritura}\label{sec:msi-secuencias}
+
+Las dos secuencias de las figuras~\ref{fig:msi-lectura} y~\ref{fig:msi-escritura} muestran el recorrido completo con tres participantes: el solicitante, el home y una copia. En la lectura, el solicitante falla sobre una página inválida, el home descubre que la única copia válida está en \texttt{M} en otro nodo y la degrada antes de entregarla. La secuencia $t_1$ corresponde a la degradación y la $t_2$ a la respuesta al solicitante, de modo que el contenido que llega es posterior a la última versión que el dueño entregó. El solicitante termina en \texttt{S} con permiso de lectura y el home conserva una copia de lectura propia en el \texttt{copyset}.
+
+En la escritura, el solicitante falla sobre una página que estaba en \texttt{S} o en \texttt{I}. El home recupera primero la versión sucia del dueño, si existe, y la persiste con su delta de paridad antes de seguir. Después invalida la copia que queda en \texttt{S} y espera su acuse; solo cuando la máscara de acuses queda vacía publica el directorio en \texttt{MODIFIED} y responde \texttt{GRANT} con la página y la secuencia $t_3$. El solicitante cierra la transición a \texttt{M} con ambos permisos, y a partir de ese momento puede escribir sin un fallo nuevo hasta que otra operación lo obligue a degradar o invalidar la copia.
+
+El orden de los pasos en ambas secuencias no es arbitrario. La degradación del dueño ocurre antes de persistir porque el home necesita el contenido más reciente para no perder escrituras; la persistencia ocurre antes de invalidar porque, si una invalidación falla, el respaldo ya quedó al día y el home puede negar la concesión sin perder datos; y la respuesta al solicitante ocurre al final porque hasta ese momento el home no puede garantizar que no queden lectores. Cada paso deja el sistema en un estado del que puede recuperarse si el siguiente falla, y esa propiedad es la que sostiene la coherencia cuando la red no entrega un mensaje o un nodo deja de responder.

@@ -1,0 +1,126 @@
+\section{Ejecución distribuida}\label{sec:distribuida}
+
+La ejecución distribuida permite que un proceso reparta un conjunto de tareas entre varios nodos del clúster y recoja un resultado por tarea. El proceso que llama a \texttt{dsm\_dist\_launch} actúa como coordinador del trabajo, una figura distinta del coordinador del asignador global, que es el nodo vivo de menor ranura y solo interviene en las reservas de memoria. Cada tarea se describe como una partición sobre la vista compartida: un rango de entrada, un rango de salida y una cantidad de bytes. El nodo que ejecuta la partición aplica una función registrada localmente, accede a la vista como cualquier hilo de aplicación y devuelve un resumen con el estado, el CRC32 del rango de salida y los fallos de página que atendió. La coordinación del trabajo viaja en dos mensajes, \texttt{DIST\_RUN} y \texttt{DIST\_DONE}, mientras que el contenido permanece en la memoria compartida y nunca se copia por la red.
+
+\subsection{Tareas, particiones y kernels}
+
+Un trabajo se identifica con un \texttt{job\_id} de 32 bits y se asocia a un \texttt{kernel\_id} también de 32 bits. La carga de trabajo se reparte en un arreglo de \texttt{dsm\_dist\_part\_t}, una estructura con cuatro campos: \texttt{id}, \texttt{src\_va}, \texttt{dst\_va} y \texttt{nbytes}. El campo \texttt{id} numera la partición dentro del trabajo y debe ser único en el intervalo $0 \ldots nparts-1$, porque el coordinador usa ese valor como índice del resultado y un identificador repetido volvería ambigua la correlación. Las direcciones \texttt{src\_va} y \texttt{dst\_va} pertenecen a la vista DSM, que todos los nodos mapean en la misma dirección base, de modo que un puntero calculado en el coordinador conserva su significado en el trabajador. Una \texttt{src\_va} igual a cero indica que la partición solo produce salida y que el kernel no debe leer un rango de entrada.
+
+El kernel tiene la firma \texttt{void fn(void *arg, const dsm\_dist\_part\_t *part, dsm\_dist\_result\_t *out)}. El primer parámetro es el argumento opaco que la aplicación entregó al registrar la función, el segundo describe la partición y el tercero es la estructura donde el kernel escribe su resultado. El coordinador no interpreta ese resultado más allá de los campos comunes: \texttt{status} en cero indica éxito y cualquier otro valor señala un fallo, \texttt{items} informa la cantidad de elementos procesados, \texttt{crc32} resume el contenido de salida, \texttt{us} guarda la duración en microsegundos y \texttt{faults\_r} y \texttt{faults\_w} cuentan los fallos de lectura y escritura ocurridos durante la llamada. Los campos \texttt{slot} y \texttt{part\_id} los completa el trabajador antes de invocar la función, no el kernel.
+
+Las particiones son independientes entre sí y el sistema no impone un orden de ejecución ni un tamaño de grano. La aplicación decide cómo dividir el trabajo y qué regiones de la vista escribe cada kernel; el marco distribuido garantiza que cada partición se ejecute una vez en el trabajador asignado y que su resultado se contabilice, pero no serializa escrituras concurrentes sobre la misma página. Cuando dos particiones escriben rangos que comparten página, la coherencia MSI mantiene el contenido consistente, aunque el valor final depende del orden en que los kernels escriben. Esa responsabilidad recae en la aplicación, que puede usar \texttt{dsm\_lock} o \texttt{dsm\_barrier} para separar fases.
+
+Un trabajo puede contener hasta \texttt{WAIT\_POOL\_ENTRIES} particiones, con valor predeterminado 64 y un tope duro de 4096 en \texttt{DSM\_DIST\_PARTS\_MAX}. La capacidad efectiva se calcula con \texttt{dist\_capacity}, que toma la clave de configuración, sustituye el cero por 64 y recorta el resultado al tope. Un arreglo con más particiones que la capacidad devuelve \texttt{DSM\_ERR\_NO\_SPACE} antes de reservar ninguna estructura. El límite protege las tablas internas y obliga a que un trabajo se divida en varios lanzamientos cuando la carga supera ese tamaño.
+
+\subsection{Registro de kernels en cada proceso}
+
+El registro vive en \texttt{dsm\_dist\_t}, una estructura por proceso con 32 ranuras de kernel y 16 ranuras de trabajo. Cada ranura de kernel guarda la bandera \texttt{used}, el \texttt{kernel\_id}, el puntero a la función y el argumento opaco. \texttt{dsm\_dist\_register} busca el identificador bajo el mutex del módulo; si ya existe, reemplaza la función y el argumento, y si no existe ocupa la primera ranura libre. Cuando las 32 ranuras están ocupadas, la llamada devuelve \texttt{DSM\_ERR\_NO\_SPACE}. El reemplazo es inmediato y no afecta a una ejecución en curso, porque el receptor de \texttt{DIST\_RUN} copia el puntero y el argumento bajo el mutex antes de invocar la función.
+
+El registro es local al proceso y no se propaga por la red. El coordinador envía el identificador del kernel, nunca su código, así que un trabajador solo puede ejecutar funciones que estén compiladas en su binario o registradas por su propia aplicación después de \texttt{dsm\_init}. Esa decisión evita construir un cargador de código y mantiene el protocolo independiente del lenguaje y del compilador. La contraparte es que la aplicación que lance trabajo a otro nodo debe registrar el mismo \texttt{kernel\_id} en ambos procesos; si el trabajador no lo encuentra, responde con \texttt{status} igual a \texttt{DSM\_ERR\_INVALID} y no toca la vista.
+
+Todos los procesos registran el kernel de demostración \texttt{DSM\_DIST\_KERNEL\_DEMO}, cuyo identificador es \texttt{0xD15D0001}. La función copia \texttt{nbytes} desde \texttt{src\_va} hacia \texttt{dst\_va} y, cuando \texttt{src\_va} es cero, rellena el destino con ceros. El registro ocurre en \texttt{dist\_init}, durante el arranque del nodo, de modo que un daemon sin kernels de aplicación puede atender una copia o calcular el CRC32 de un rango. Ese kernel sirve para comprobar el camino completo de un trabajo sin escribir código adicional y para verificar que las direcciones de la vista son válidas en el trabajador; el CRC32 lo calcula el marco distribuido sobre el rango de salida.
+
+\begin{lstlisting}[language=C, caption={Registro de un kernel y descripción de una partición.}, label={lst:dist-registro}]
+static void kernel_suma(void *arg, const dsm_dist_part_t *p,
+                        dsm_dist_result_t *out)
+{
+    const uint32_t *src = (const uint32_t *)(uintptr_t)p->src_va;
+    uint32_t *dst = (uint32_t *)(uintptr_t)p->dst_va;
+    uint64_t n = p->nbytes / sizeof(uint32_t);
+    uint32_t base = *(uint32_t *)arg;
+
+    for (uint64_t i = 0; i < n; i++) {
+        dst[i] = src[i] + base;
+    }
+    out->items = n;
+}
+
+uint32_t base = 7;
+dsm_dist_register(0x1001, kernel_suma, &base);
+
+dsm_dist_part_t parts[2] = {
+    { .id = 0, .src_va = (uint64_t)(uintptr_t)a,
+      .dst_va = (uint64_t)(uintptr_t)c, .nbytes = mitad },
+    { .id = 1, .src_va = (uint64_t)(uintptr_t)(a + mitad),
+      .dst_va = (uint64_t)(uintptr_t)(c + mitad), .nbytes = mitad },
+};
+\end{lstlisting}
+
+\subsection{Lanzamiento, ejecución y recolección}
+
+\texttt{dsm\_dist\_launch} concentra las validaciones que deben ocurrir antes de enviar la primera orden. Rechaza punteros nulos, cuentas en cero y un plazo en cero con \texttt{DSM\_ERR\_INVALID}; rechaza un arreglo de particiones que supere la capacidad con \texttt{DSM\_ERR\_NO\_SPACE}; exige que los identificadores sean únicos y menores que \texttt{nparts}; comprueba que cada ranura de \texttt{workers} pertenezca a la membresía, no esté marcada como \texttt{DSM\_NODE\_DEAD}, no sea un cliente y aporte páginas de memoria; y verifica que el kernel esté registrado y que el \texttt{job\_id} no esté en uso. Las validaciones de forma devuelven \texttt{DSM\_ERR\_INVALID} y el exceso de capacidad devuelve \texttt{DSM\_ERR\_NO\_SPACE}, sin crear el trabajo ni enviar mensajes.
+
+Cuando las validaciones pasan, el coordinador reserva una ranura de trabajo, dos arreglos del tamaño de \texttt{nparts} para los resultados y para la ranura asignada a cada partición, e incrementa un contador \texttt{launch\_seq} que distingue este lanzamiento de otro con el mismo \texttt{job\_id}. La partición $i$ se asigna al trabajador $i \bmod nworkers$, de modo que el reparto por turno equilibra la carga cuando las particiones tienen un costo similar. La tabla \texttt{part\_slot} conserva la ranura que recibió cada partición y se usa después para descartar un resultado que llegue desde un nodo distinto del asignado.
+
+El envío se hace en dos pasadas. La primera recorre las particiones remotas y envía un \texttt{DIST\_RUN} a cada trabajador; la segunda recorre las locales y las ejecuta en el hilo llamador mediante una llamada directa a \texttt{dist\_on\_run}. El orden importa porque los trabajadores remotos empiezan a ejecutar mientras el coordinador todavía está despachando, en lugar de esperar a que el coordinador termine su propia parte. Una partición local no abre una conexión TCP contra el listener del mismo proceso, lo que evita un diálogo que podría competir con la atención de mensajes de página.
+
+Cada \texttt{DIST\_RUN} lleva una carga de 48 bytes con el rango, el trabajo, el kernel, el número de particiones, el plazo y el correlato del lanzamiento. La cabecera usa el tipo \texttt{0x50}, coloca el identificador de la partición en \texttt{page\_id}, toma un \texttt{req\_id} nuevo y publica la época vigente. El plazo que recibe la función se transporta en \texttt{deadline\_ms}; el lanzamiento no espera a que las particiones terminen y devuelve \texttt{DSM\_OK} después de enviar las órdenes. La espera real ocurre en \texttt{dsm\_dist\_collect} o en \texttt{dsm\_dist\_verify}, que son las llamadas que bloquean al hilo del coordinador.
+
+En el trabajador, \texttt{dist\_on\_run} comprueba que la carga mida exactamente 48 bytes, busca el kernel bajo el mutex y copia la función y el argumento. Antes de invocar el kernel valida que \texttt{nbytes} sea mayor que cero y no supere el tamaño de la vista, y que los rangos de origen y destino queden contenidos en la vista o en su alias de lectura y escritura; el origen nulo se acepta como ausencia de entrada. La comprobación se hace con \texttt{dist\_range\_inside}, que recorre las dos bases y verifica que la suma no desborde. Una dirección fuera de esos mapeos se rechaza con \texttt{status} igual a \texttt{DSM\_ERR\_INVALID}, porque aceptarla permitiría que un mensaje remoto escribiera en cualquier dirección del proceso.
+
+La ejecución del kernel ocurre en el hilo worker que atendió el mensaje. Antes de llamarlo, el worker registra su pila alternativa con \texttt{dsm\_sig\_thread\_attach}; de ese modo, un acceso a una página que todavía no está presente se atiende por el mismo manejador de \texttt{SIGSEGV} que usa un hilo de aplicación. El worker lee los contadores de fallos antes y después de la llamada, calcula la diferencia y la recorta a 32 bits. Al terminar, si el estado es cero y el destino no es nulo, calcula el CRC32 sobre \texttt{nbytes} del rango de salida. Una partición fallida deja el CRC en cero, de acuerdo con la regla que usa la verificación agregada.
+
+El resultado viaja en un \texttt{DIST\_DONE} de 44 bytes con el trabajo, la partición, el estado, los elementos, el CRC, la duración, el correlato del lanzamiento y los dos contadores de fallos. El trabajador reutiliza el \texttt{req\_id} de la orden y coloca la partición en \texttt{page\_id}. Si la orden llegó del propio coordinador, la respuesta se entrega con una llamada local a \texttt{dist\_on\_done}; en caso contrario se envía por red al nodo de origen. Un fallo de envío incrementa el contador de particiones rechazadas y no se reintenta, porque el trabajo conserva el estado parcial y la espera del coordinador termina por plazo.
+
+El coordinador recibe el resultado en \texttt{dist\_on\_done}. La función busca el trabajo, rechaza un \texttt{part\_id} fuera de rango, un trabajo que ya completó su capacidad o un resultado cuyo \texttt{launch\_seq} no coincida con el vigente. También exige que la ranura de origen sea la que la tabla \texttt{part\_slot} asignó a esa partición y rechaza un \texttt{part\_id} que ya esté en la lista. Los resultados se guardan en el orden en que llegan, sin reordenarlos por identificador, y el trabajo se marca como terminado cuando la cuenta de recibidos alcanza \texttt{nparts}. Cada inserción difunde la variable de condición del módulo para despertar a los hilos que esperan en \texttt{collect} o \texttt{verify}.
+
+\texttt{dsm\_dist\_collect} recibe la capacidad del arreglo de salida en \texttt{*n}. Con capacidad cero y plazo cero devuelve \texttt{DSM\_OK} y deja \texttt{*n} en cero; con capacidad cero y plazo distinto de cero devuelve \texttt{DSM\_ERR\_INVALID}. Si hay plazo y no existen resultados nuevos, el hilo espera sobre la variable de condición hasta que llegue uno o venza el plazo. Al despertar vuelve a resolver la ranura del trabajo por identificador, porque la tabla puede reciclarse mientras el hilo espera. La copia toma como máximo la capacidad indicada, avanza el índice de recogidos y devuelve en \texttt{*n} la cantidad escrita. Una llamada posterior entrega los resultados que aún no se habían recogido.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.95, every node/.style={transform shape},
+    coord/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.6cm, minimum height=1.0cm},
+    work/.style={draw=bordergreen, fill=softgreen, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.6cm, minimum height=1.0cm},
+    flow/.style={-{Latex}, thick, draw=black!65, font=\scriptsize, align=center}
+]
+
+\node[coord] (launch) at (0, 3.3) {Coordinador\\\texttt{dsm\_dist\_launch}};
+\node[work]  (w0) at (-4.7, 0) {Trabajador $w_0$\\kernel local};
+\node[work]  (w1) at (0, 0) {Trabajador $w_1$\\kernel local};
+\node[work]  (w2) at (4.7, 0) {Trabajador $w_2$\\kernel local};
+\node[coord] (coll) at (0, -3.3) {Coordinador\\\texttt{collect} y \texttt{verify}};
+
+\draw[flow] (launch.south) -- (w0.north);
+\draw[flow] (launch.south) -- node[right, pos=0.5] {\texttt{DIST\_RUN}\\48 B} (w1.north);
+\draw[flow] (launch.south) -- (w2.north);
+\draw[flow] (w0.south) -- (coll.north);
+\draw[flow] (w1.south) -- node[right, pos=0.5] {\texttt{DIST\_DONE}\\44 B} (coll.north);
+\draw[flow] (w2.south) -- (coll.north);
+
+\end{tikzpicture}
+\caption{Flujo de un trabajo distribuido. El coordinador envía una orden por cada partición remota, cada trabajador ejecuta su kernel local y devuelve el resultado, y la partición que corresponde al propio coordinador se ejecuta en el hilo llamador sin abrir una conexión.}
+\label{fig:distribuida-flujo}
+\end{figure}
+
+\subsection{Verificación de resultados}
+
+\texttt{dsm\_dist\_verify} espera a que el trabajo tenga todas sus particiones y compara un CRC32 agregado con el valor esperado. Si el trabajo todavía no está marcado como terminado, el hilo espera sobre la variable de condición con el plazo \texttt{DIST\_TIMEOUT\_MS}, que vale 5000 ms por defecto y se puede cambiar en la configuración. Al vencer el plazo devuelve \texttt{DSM\_ERR\_TIMEOUT} sin modificar el booleano de salida. Cuando el trabajo termina, recorre los resultados recibidos y combina sus CRC con una operación XOR; una partición fallida aporta cero, así que el agregado no depende del orden de llegada ni de que los resultados se hayan recogido antes con \texttt{collect}.
+
+La comparación con \texttt{expected\_crc32} produce \texttt{true} cuando los valores coinciden y \texttt{false} en caso contrario, y la función devuelve \texttt{DSM\_OK} en ambos casos porque la comparación se completó. El valor esperado lo calcula la aplicación, normalmente con una ejecución secuencial de referencia sobre el mismo patrón de entrada o con una suma conocida. El CRC32 que usa el trabajador es el mismo IEEE 802.3 del protocolo, de modo que la aplicación puede reutilizar \texttt{dsm\_crc32} para construir la referencia.
+
+La verificación agregada comprueba que el conjunto de salidas coincide con el esperado, pero no vuelve a leer la memoria ni recalcula el CRC de cada partición en el coordinador. Esa decisión mantiene el costo de la verificación proporcional al número de particiones y no al tamaño de los datos. Un coordinador que necesite una comprobación byte a byte puede recoger los resultados, comparar los CRC individuales con los de su referencia y leer los rangos de la vista, que siguen siendo accesibles en su propio mapeo.
+
+El estado de cada partición también es visible en la estructura que entrega \texttt{collect}. Una partición con \texttt{status} distinto de cero conserva su código de error y su CRC en cero, de modo que no altera el XOR; su ausencia se detecta revisando los estados y no el valor agregado. La verificación, por tanto, es una comprobación de contenido y no sustituye la revisión del estado de cada tarea.
+
+\subsection{Flujo de mensajes entre coordinador y trabajadores}
+
+El diálogo de un trabajo tiene tres momentos. En el lanzamiento, el coordinador construye un \texttt{DIST\_RUN} por cada partición remota y lo entrega a \texttt{dsm\_net\_send}; el mensaje viaja por una conexión TCP propia, se valida en el listener del trabajador y se encola para un worker. En la ejecución, el worker resuelve el kernel, comprueba el rango, ejecuta la función y arma un \texttt{DIST\_DONE}. En la recolección, el coordinador recibe el resultado, lo contrasta con la tabla del trabajo y lo publica para \texttt{collect} o \texttt{verify}. La figura~\ref{fig:distribuida-flujo} resume ese recorrido.
+
+La correlación tiene dos niveles. El campo \texttt{req\_id} de la cabecera acompaña la orden y su respuesta, y permite que un \texttt{DIST\_DONE} se asocie con el mensaje que lo provocó. El campo \texttt{launch\_seq} de la carga resuelve un problema distinto: distingue dos lanzamientos que usan el mismo \texttt{job\_id} en momentos diferentes, de modo que un resultado rezagado del primero no se confunda con uno del segundo. La tabla \texttt{part\_slot} añade el tercer filtro, porque solo acepta el resultado que llega desde la ranura asignada a esa partición.
+
+\texttt{DIST\_DONE} está clasificado como respuesta en \texttt{dsm\_msg\_is\_response}, pero el lanzamiento no registra una solicitud pendiente que espere por él. El listener del coordinador intenta completar una solicitud con el \texttt{req\_id}; cuando no la encuentra, entrega el mensaje al worker y \texttt{dist\_on\_done} lo procesa. Esa caída al worker es la que permite usar un mensaje de respuesta sin una RPC bloqueante y mantiene la ejecución distribuida separada del mecanismo de solicitudes de página.
+
+El flujo no tiene retransmisión en la capa de distribución. Una orden que no llega deja la partición sin resultado y el trabajo no se completa; \texttt{collect} agota su plazo y \texttt{verify} devuelve \texttt{DSM\_ERR\_TIMEOUT}. Un resultado que no llega al coordinador produce el mismo efecto. La confiabilidad del tramo depende de TCP, que entrega los bytes completos o reporta el cierre, y la aplicación decide si relanza el trabajo completo o si vuelve a intentar las particiones pendientes con un nuevo \texttt{job\_id}.
+
+\subsection{Garantías de la ejecución distribuida}
+
+El lanzamiento valida todo lo que puede comprobar antes de enviar: punteros, cuentas, plazo, unicidad de identificadores, pertenencia y estado de los trabajadores, registro del kernel y disponibilidad de una ranura de trabajo. Si una validación falla, no se crea el trabajo ni se envía una orden parcial. Si el envío falla a mitad de la ronda, el coordinador libera la ranura y despierta a los que esperan, de modo que el trabajo no queda en un estado que nadie pueda consultar; las órdenes ya enviadas pueden llegar y se rechazan porque el trabajo ya no existe.
+
+Cada trabajo tiene una tabla de resultados del tamaño exacto de sus particiones. Un resultado se acepta una sola vez, desde la ranura asignada y con el correlato del lanzamiento vigente. Un duplicado, un resultado tardío de otro lanzamiento o un mensaje de un nodo que no era el asignado se descarta y se cuenta como rechazo. El trabajo se marca como terminado cuando la cuenta de resultados aceptados alcanza \texttt{nparts}; a partir de ese momento \texttt{verify} puede decidir sin esperar más. El ciclo del trabajo tiene tres estados: activo, terminado cuando llegan todas las particiones y reciclable cuando además se recogieron todos los resultados.
+
+La ejecución de cada partición ocurre en el hilo worker del nodo destino, con la pila alternativa instalada y con los mismos permisos de página que tendría un hilo de aplicación. El kernel puede provocar fallos de página y el despachador los resuelve por el camino MSI habitual; los fallos quedan contados en el resultado. El worker comprueba que los rangos de origen y destino estén dentro de la vista o de su alias antes de invocar la función, lo que impide que una orden remota lea o escriba fuera del mapeo compartido. La comprobación no impide que dos particiones se solapen, porque el solapamiento es una decisión de la aplicación y no un error de formato.
+
+El plazo \texttt{timeout\_ms} del lanzamiento viaja en \texttt{deadline\_ms} y describe el intervalo de arranque de la partición. El trabajador lo recibe, pero la ejecución no se interrumpe cuando vence: un kernel en curso termina su llamada antes de responder. Los plazos que realmente acotan la espera del coordinador son el de \texttt{dsm\_dist\_collect} y el de \texttt{dsm\_dist\_verify}; el primero lo elige la aplicación en cada llamada y el segundo usa \texttt{DIST\_TIMEOUT\_MS}. Esa separación mantiene el lanzamiento no bloqueante y deja la decisión de cuánto esperar en el punto donde el coordinador necesita el resultado.
+
+Los límites de recursos son concretos. Un proceso mantiene 32 ranuras de kernel, incluido el de demostración, y 16 trabajos activos; una ranura de trabajo se recicla cuando el trabajo terminó y todos sus resultados se recogieron. Un trabajo admite hasta 4096 particiones, acotadas por \texttt{WAIT\_POOL\_ENTRIES}. La cantidad de kernels que un nodo ejecuta en paralelo está acotada por sus hilos worker, cuatro por defecto, de modo que un kernel largo ocupa uno de esos hilos y retrasa la atención de los mensajes de página de ese worker.

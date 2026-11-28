@@ -1,0 +1,533 @@
+\section{Requisitos}\label{sec:requisitos}
+
+El sistema DSM se ejecuta sobre Linux y organiza un clúster de procesos que comparten una vista de memoria. Antes de compilar conviene revisar la arquitectura, la memoria y la red, porque la mayor parte de los fallos de arranque proviene de un sistema operativo distinto al del laboratorio, de un firewall que bloquea el descubrimiento o de una configuración que no coincide entre computadoras.
+
+\subsection{Hardware y red}\label{subsec:hardware-red}
+
+Cada computadora necesita una arquitectura de 64 bits, porque la vista se proyecta en la dirección \texttt{0x200000000000} y reserva 4 GiB de espacio virtual por proceso. La memoria física debe alcanzar para el sistema operativo, para las páginas que el nodo aporta y para las copias locales de la aplicación. Como regla práctica, deje libre al menos una vez y media el valor de \texttt{NODE\_MEM}; con 256 MiB por nodo, 2 GiB de RAM permiten operar con holgura. El árbol compilado y los datos de prueba ocupan menos de 200 MB, así que 500 MB libres de disco son suficientes; los videos de salida y los reportes pueden requerir más.
+
+La red debe ser IPv4 y conectar todos los equipos en la misma subred, sin NAT entre nodos. El descubrimiento depende de multicast UDP y, como respaldo, de broadcast; los switches administrados suelen podar el multicast con IGMP snooping y las redes Wi-Fi con aislamiento de clientes bloquean ambos mecanismos. Para el laboratorio se recomienda cable Ethernet y, si es posible, enlaces de 1 Gb/s, porque el tráfico de páginas y de paridad crece con el tamaño de los datos. Si la red usa VLAN, todos los nodos deben quedar en la misma o contar con un reflector de multicast configurado por el administrador.
+
+\subsection{Software, compilador y permisos}\label{subsec:software-permisos}
+
+El sistema requiere Linux con \texttt{memfd\_create(2)}, disponible desde el kernel 3.17, un compilador de C con soporte para C11, \texttt{make}, la biblioteca de hilos de POSIX y las herramientas de binutils que usa el enlace. En una distribución típica basta con \texttt{gcc}, \texttt{make} y \texttt{libc6-dev}; no se necesitan bibliotecas externas, servicios ni bases de datos.
+
+No hace falta ejecutar como \texttt{root}. El nodo escribe su identidad en \texttt{\$HOME/.dsm} y los reportes en el directorio de salida, así que el usuario necesita permisos en el repositorio, en su directorio personal y en esa ruta. Si el límite de descriptores es bajo, \texttt{dsm\_init} lo eleva hasta el máximo permitido por el sistema.
+
+Antes de compilar, confirme el entorno en cada computadora con:
+
+\begin{lstlisting}
+uname -r
+gcc --version | head -n 1
+ldd --version | head -n 1
+getconf LONG_BIT
+\end{lstlisting}
+
+La salida de \texttt{getconf LONG\_BIT} debe ser 64. Si el kernel es anterior a 3.17, el arranque falla al crear el \texttt{memfd} y no hay forma de sustituir esa llamada desde la configuración.
+
+\section{Compilación}\label{sec:compilacion}
+
+La compilación produce una biblioteca estática y siete ejecutables. Todo el código se compila con advertencias tratadas como errores, de modo que un binario solo se genera cuando el árbol está limpio. El perfil \texttt{release} es el que se usa para operar el clúster y para ejecutar las aplicaciones de prueba.
+
+\subsection{Obtención del código}\label{subsec:obtencion-codigo}
+
+Clone el repositorio o descomprima la entrega en una ruta con permisos de escritura:
+
+\begin{lstlisting}
+git clone https://github.com/mau671/dsm
+cd dsm
+\end{lstlisting}
+
+El directorio debe contener el \texttt{Makefile}, \texttt{src}, \texttt{apps}, \texttt{tools}, \texttt{data} y el archivo \texttt{dsm.conf}. No es necesario descargar datos adicionales: el video y la fotografía de prueba están versionados en \texttt{data/}.
+
+\subsection{make release}\label{subsec:make-release}
+
+Desde la raíz del repositorio ejecute:
+
+\begin{lstlisting}
+make release
+ls -l ./build/bin/release
+\end{lstlisting}
+
+El objetivo compila \texttt{libdsm.a} y enlaza los ejecutables en \texttt{./build/bin/release}. Si el compilador no es \texttt{gcc}, use \texttt{make release CC=gcc}. La compilación no muestra avisos porque el proyecto usa \texttt{-Wall}, \texttt{-Wextra}, \texttt{-Wpedantic} y \texttt{-Werror}; cualquier advertencia detiene el proceso y debe corregirse antes de continuar.
+
+La salida de \texttt{ls} debe incluir \texttt{dsm}, \texttt{dsmctl}, \texttt{demo}, \texttt{matmul}, \texttt{juego\_vida}, \texttt{filtro\_video} y \texttt{video\_pack}. Si falta alguno, revise el mensaje de error; los casos más comunes son la ausencia de \texttt{gcc}, de \texttt{make} o de las cabeceras de desarrollo de la biblioteca C. El \texttt{Makefile} toma un cerrojo sobre \texttt{.build.lock} para serializar compilaciones concurrentes y no debe borrarse mientras haya una en curso.
+
+\subsection{Perfiles y binarios generados}\label{subsec:perfiles}
+
+Cada perfil escribe sus objetos, su biblioteca y sus ejecutables en un subdirectorio propio, así que se pueden conservar al mismo tiempo sin que se mezclen.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Perfiles de compilación y binarios que produce cada uno.}
+\label{tab:perfiles}
+\begin{tabularx}{\textwidth}{@{}l l Y@{}}
+\toprule
+Perfil & Banderas principales & Ejecutables en \texttt{./build/bin/<perfil>} \\
+\midrule
+\texttt{make release} & \texttt{-O2 -DNDEBUG} & \texttt{dsm}, \texttt{dsmctl}, \texttt{demo}, \texttt{matmul}, \texttt{juego\_vida}, \texttt{filtro\_video}, \texttt{video\_pack} \\
+\texttt{make debug} & \texttt{-g3 -O0} & Los mismos siete ejecutables, con símbolos para depuración \\
+\texttt{make asan} & AddressSanitizer y UBSan & \texttt{dsm} y \texttt{dsmctl} \\
+\texttt{make tsan} & ThreadSanitizer & \texttt{dsm} y \texttt{dsmctl} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Use \texttt{release} para operar y medir tiempos, \texttt{debug} para seguir un fallo con \texttt{gdb}, y \texttt{asan} o \texttt{tsan} para detectar errores de memoria y carreras. Estos dos últimos no construyen las aplicaciones de prueba de forma predeterminada. Todos los comandos de este manual suponen el perfil \texttt{release} y la ruta completa, por ejemplo \path{./build/bin/release/dsm}.
+
+\section{Configuración}\label{sec:configuracion}
+
+La configuración se reparte entre un archivo por computadora y variables de entorno por proceso. El archivo define la identidad del clúster, el tamaño de página, la memoria que aporta el equipo, los puertos y el comportamiento de la red. Las variables distinguen procesos que comparten el mismo archivo, sobre todo cuando se arrancan varios nodos en una sola máquina.
+
+\subsection{dsm.conf por computadora}\label{subsec:conf-por-pc}
+
+Cada computadora lleva su propio \texttt{dsm.conf}. El archivo usa líneas \texttt{clave = valor}, admite comentarios con \texttt{\#} y no distingue mayúsculas en los nombres. El nodo recibe la ruta como primer argumento; si se omite, usa \texttt{dsm.conf} del directorio actual. Las aplicaciones aceptan \texttt{-{}-conf} y, sin esa opción, también leen \texttt{dsm.conf} del directorio en el que se ejecutan.
+
+Una configuración mínima para un nodo de 256 MiB es la siguiente. Las once claves compartidas y la memoria local aparecen juntas para que se vea qué se cambia al pasar de una computadora a otra.
+
+\begin{lstlisting}
+CLUSTER_ID      = 0x534F3031
+PAGE_SIZE       = 4096
+BASE_ADDR       = 0x200000000000
+VIEW_SIZE       = 4294967296
+PORT_MIN        = 27600
+PORT_MAX        = 27699
+DISCOVERY_GROUP = 239.255.42.99
+DISCOVERY_PORT  = 27699
+VNODES_PER_MB   = 16
+HOME_SLACK      = 1.25
+REDUNDANCY      = false
+
+# Memoria local de esta computadora; puede variar entre nodos.
+NODE_MEM        = 268435456
+\end{lstlisting}
+
+Mantenga el archivo en la raíz del repositorio y ejecute los programas desde ahí, así las rutas de \texttt{data/} y de los reportes funcionan sin ajustes. Para revisar cómo se interpretó un archivo, ejecute \texttt{dsmctl config}: imprime los valores cargados, el tamaño de la vista, el rango de puertos y el hash compartido.
+
+\subsection{Claves que deben coincidir}\label{subsec:claves-compartidas}
+
+Once claves forman la identidad del clúster y deben tener el mismo valor en todas las computadoras. El nodo las resume en un CRC32 que viaja en el saludo de descubrimiento; si el hash de un par no coincide, la unión se rechaza y el nodo no entra al clúster.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Claves compartidas que deben coincidir en todos los nodos.}
+\label{tab:claves-compartidas}
+\begin{tabularx}{\textwidth}{@{}P{4.1cm} P{2.6cm} Y@{}}
+\toprule
+Clave & Valor típico & Función \\
+\midrule
+\texttt{CLUSTER\_ID} & \texttt{0x534F3031} & Identificador del clúster; separa clústeres en la misma red. \\
+\texttt{PAGE\_SIZE} & 4096 & Tamaño de página y unidad de coherencia. \\
+\texttt{BASE\_ADDR} & \texttt{0x200000000000} & Dirección virtual de la vista compartida. \\
+\texttt{VIEW\_SIZE} & 4294967296 & Tamaño de la vista, 4 GiB por defecto. \\
+\texttt{PORT\_MIN} & 27600 & Primer puerto del bloque de escucha TCP. \\
+\texttt{PORT\_MAX} & 27699 & Último puerto del bloque de escucha TCP. \\
+\texttt{DISCOVERY\_GROUP} & 239.255.42.99 & Grupo multicast de los anuncios. \\
+\texttt{DISCOVERY\_PORT} & 27699 & Puerto UDP de descubrimiento. \\
+\texttt{VNODES\_PER\_MB} & 16 & Nodos virtuales del anillo por MiB aportado. \\
+\texttt{HOME\_SLACK} & 1.25 & Margen sobre la memoria nominal para los respaldos. \\
+\texttt{REDUNDANCY} & \texttt{false} & Activa la paridad y cambia el tamaño de franja. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Las demás claves son locales y pueden diferir. \texttt{NODE\_MEM} es la más importante: un nodo con 128 MiB y otro con 256 MiB se aceptan si las once claves coinciden. También pueden diferir \texttt{OUTPUT\_DIR}, los tiempos de espera, los hilos, el nivel de registro y \texttt{CHUNK\_PAGES}.
+
+Un archivo con \texttt{REDUNDANCY=true} y otro con \texttt{false} no se pueden mezclar, aunque el resto coincida, porque la redundancia cambia las franjas y la paridad. Dos grupos o puertos de descubrimiento distintos tampoco se ven. El formato no importa, pero el valor sí; \texttt{0x534F3031} y su equivalente decimal producen el mismo hash. Cuando un nodo detecta una discrepancia, el registro muestra \texttt{Configuración compartida distinta en el par anunciado} y \texttt{dsm\_init} devuelve \texttt{DSM\_ERR\_CONFIG}. Para localizarla, ejecute \texttt{dsmctl config} en cada computadora y compare la línea \texttt{Hash de configuración compartida}.
+
+\subsection{NODE\_MEM y memoria aportada}\label{subsec:node-mem}
+
+\texttt{NODE\_MEM} indica cuánta memoria física aporta esa computadora, en bytes. Debe ser múltiplo de \texttt{PAGE\_SIZE} y al menos una página; el valor por defecto es 268435456, equivalente a 256 MiB. Cada equipo puede declarar una cantidad distinta y el total del clúster es la suma de los nodos vivos que aportan memoria. Un cliente no aporta nada y no suma a ese total. Para dimensionar, 64 MiB son 16384 páginas, 128 MiB son 32768, 256 MiB son 65536 y 512 MiB son 131072.
+
+La vista de 4 GiB es un espacio de direcciones reservado con \texttt{memfd}, no 4 GiB de RAM comprometidos al arrancar. Las páginas se materializan cuando la aplicación las toca y el nodo custodio guarda su respaldo dentro de \texttt{NODE\_MEM}, con el margen del 25\,\% fijado por \texttt{HOME\_SLACK}. Ese margen no convierte a \texttt{NODE\_MEM} en una cuota elástica: si la aplicación necesita más memoria que la suma nominal, la reserva falla o el respaldo se agota durante el procesamiento.
+
+Las aplicaciones consumen aproximadamente lo siguiente: \texttt{matmul} necesita $3 \times N^2 \times 8$ bytes, que son 1.5 MiB con $N=256$ y 96 MiB con $N=2048$; \texttt{juego\_vida} necesita dos tableros de \textit{ancho} por \textit{alto}, es decir 72 KiB para 192 por 192; \texttt{filtro\_video} necesita la entrada RGB24 más la salida de un byte por píxel.
+
+Para cambiar la memoria de un nodo, edite \texttt{NODE\_MEM} en el archivo de esa computadora y reinícielo. El binario \texttt{dsm} no acepta una opción de línea de comandos para reemplazarlo. Si arranca varios nodos en la misma máquina y quiere que aporten cantidades distintas, use copias separadas del archivo con las once claves idénticas y solo \texttt{NODE\_MEM} diferente. No configure un valor por encima de la RAM disponible: el sistema puede aceptar la reserva y recurrir al intercambio, con una degradación que parece un fallo de coherencia.
+
+\subsection{Puertos, multicast y firewall}\label{subsec:puertos-firewall}
+
+Los nodos abren un socket TCP de escucha en el primer puerto libre del bloque \texttt{PORT\_MIN} a \texttt{PORT\_MAX}, que por defecto va de 27600 a 27699. El anuncio de descubrimiento usa el 27699 por UDP, de modo que en la práctica los nodos quedan en 27600 a 27698. Cada proceso de una misma computadora toma el siguiente puerto libre, así que dos nodos locales escuchan en 27600 y 27601 sin intervención manual.
+
+El descubrimiento envía anuncios al grupo multicast \texttt{239.255.42.99:27699} y, como respaldo, a la dirección de broadcast limitada en el mismo puerto. Los anuncios incluyen el UUID, el nombre, la IP, el puerto TCP, el rol y las páginas que aporta cada nodo. Los pares válidos se convierten en sondas TCP y en una operación de unión; no hay una lista de equipos que mantener.
+
+El bloque está fijado en el código y la validación rechaza cualquier rango fuera de 27600 a 27699, así que varias computadoras pueden usar la misma configuración sin chocar. En una sola computadora no se pueden operar dos clústeres independientes con el mismo bloque, porque competirían por los mismos puertos.
+
+Si el equipo tiene firewall, abra el bloque TCP y el puerto UDP. En Ubuntu con \texttt{ufw}:
+
+\begin{lstlisting}
+sudo ufw allow 27600:27699/tcp
+sudo ufw allow 27699/udp
+sudo ufw reload
+\end{lstlisting}
+
+En Fedora o RHEL, abra los mismos puertos con \texttt{firewall-cmd} y recargue la configuración.
+
+Para comprobar qué está escuchando y si la interfaz se unió al grupo, use \texttt{ss -ltnp | grep -E ':276[0-9][0-9]'}, \texttt{ss -lunp | grep 27699} e \texttt{ip maddr show}. La primera muestra los puertos TCP, la segunda el socket UDP y la tercera los grupos multicast de cada interfaz. Si un nodo está vivo pero la interfaz no aparece unida al grupo, el problema está en la red o en el firewall.
+
+\subsection{Redundancia}\label{subsec:redundancia}
+
+\texttt{REDUNDANCY=true} activa la paridad. La unión exige al menos tres nodos vivos que aporten memoria; un nodo que arranca solo espera entre 15 y 30 segundos, según \texttt{DISCOVERY\_TIMEOUT\_MS}, y si no reúne el mínimo falla con \texttt{DSM\_ERR\_CONFIG} sin unirse. Los clientes no cuentan porque no aportan páginas.
+
+El número de páginas de datos por franja se deriva de la membresía como $K = \text{nodos vivos} - 1$, acotado a $[2,8]$. Con tres nodos, $K=2$ y cada franja tiene dos páginas de datos y una de paridad; con cuatro, $K=3$; a partir de nueve, $K$ se queda en 8. La paridad se calcula con XOR, se actualiza por deltas y permite reconstruir el contenido de un nodo caído con los datos y la paridad que sobreviven.
+
+La redundancia tolera la pérdida de un nodo por franja, no la de dos. El costo es una página de paridad por cada $K$ de datos, más el tráfico de los deltas; con $K=2$ el sobrecosto es del 50\,\% y con $K=8$ baja al 12.5\,\%. Un clúster de dos nodos no puede cumplir el mínimo, así que debe quedar con \texttt{REDUNDANCY=false}. La clave es compartida: cambiarla exige detener el clúster, editar todos los archivos y volver a arrancar.
+
+\section{Arranque de nodos}\label{sec:arranque}
+
+Un nodo aporta memoria y puede ser custodio de páginas; un cliente usa la memoria sin aportar ninguna y nunca es custodio. El rol se elige con \texttt{DSM\_NODE\_MODE}, que acepta \texttt{node} o \texttt{client} y vale \texttt{node} por defecto. Las aplicaciones de prueba se unen como clientes, de modo que ejecutarlas no agrega un nodo a la membresía.
+
+\subsection{Un nodo}\label{subsec:un-nodo}
+
+Abra una terminal en la raíz del repositorio y arranque el primer nodo con una etiqueta propia:
+
+\begin{lstlisting}
+DSM_NODE_TAG=n1 ./build/bin/release/dsm dsm.conf
+\end{lstlisting}
+
+El proceso queda en primer plano y registra el puerto de escucha, la ranura y el momento en que queda activo. El primer nodo de un clúster sin pares asume la ranura 0 y la época 1 después del plazo corto de descubrimiento. Con \texttt{REDUNDANCY=true}, ese arranque espera a que existan tres nodos y falla si no aparecen; para una prueba de un solo nodo use redundancia desactivada.
+
+Mientras el nodo sigue vivo, consulte la membresía desde otra terminal:
+
+\begin{lstlisting}
+./build/bin/release/dsmctl nodes
+\end{lstlisting}
+
+La tabla debe mostrar la ranura 0, el rol \texttt{nodo}, el estado \texttt{ALIVE}, las páginas aportadas y el puerto. Para detener el nodo, pulse \texttt{Ctrl+C} en su terminal; el proceso anuncia su salida, imprime las estadísticas finales y termina con \texttt{Nodo detenido correctamente}. El nivel de registro se controla con \texttt{DSM\_LOG\_LEVEL}; use \texttt{INFO} para operar y \texttt{DEBUG} para diagnosticar.
+
+\subsection{Varios nodos en la misma computadora}\label{subsec:nodos-locales}
+
+Para probar un clúster sin varias máquinas, abra una terminal por nodo y use el mismo archivo con etiquetas distintas. Cada proceso toma el siguiente puerto libre y su propia ranura:
+
+\begin{lstlisting}
+DSM_NODE_TAG=n1 ./build/bin/release/dsm dsm.conf
+DSM_NODE_TAG=n2 ./build/bin/release/dsm dsm.conf
+\end{lstlisting}
+
+Repita el patrón con \texttt{n3} y \texttt{n4} en terminales adicionales. Con 256 MiB por nodo, cuatro procesos aportan 1 GiB al clúster aunque la vista de cada uno siga siendo de 4 GiB. Si quiere que aporten cantidades distintas, copie el archivo con \texttt{cp dsm.conf dsm-n1.conf}, cambie solo \texttt{NODE\_MEM} en cada copia y arranque con la ruta correspondiente. Las once claves compartidas deben quedar idénticas.
+
+También puede lanzar los nodos en segundo plano y guardar su registro:
+
+\begin{lstlisting}
+DSM_NODE_TAG=n1 nohup ./build/bin/release/dsm dsm.conf \
+    > /tmp/n1.log 2>&1 &
+\end{lstlisting}
+
+La etiqueta forma parte de la identidad persistente en \texttt{\$HOME/.dsm}. Dos procesos con la misma etiqueta en la misma computadora comparten UUID y el sistema los rechaza. No reutilice una etiqueta mientras el proceso anterior siga vivo. Para detener los nodos en segundo plano, localícelos con \texttt{pgrep -af 'release/dsm'} y envíeles \texttt{SIGINT} con \texttt{kill -INT <pid>}.
+
+\subsection{Varias computadoras}\label{subsec:varias-pc}
+
+En cada computadora clone o copie el código fuente y compile allí mismo con \texttt{make release}. No copie la carpeta \texttt{build/} de una máquina a otra: los binarios quedan enlazados contra la glibc y el kernel del equipo donde se compilaron. El procedimiento para el laboratorio se detalla en la sección~\ref{subsec:binarios-incompatibles}.
+
+Anote la IP de cada equipo con \texttt{ip -4 addr} y prepare un \texttt{dsm.conf} por computadora. Las once claves compartidas deben ser iguales; \texttt{NODE\_MEM} se ajusta a la memoria que cada equipo puede aportar. Arranque primero un nodo y luego los demás, con una etiqueta distinta por proceso:
+
+\begin{lstlisting}
+DSM_NODE_TAG=pc1 ./build/bin/release/dsm dsm.conf
+\end{lstlisting}
+
+Desde otra computadora compruebe la membresía contra la IP del primer nodo:
+
+\begin{lstlisting}
+./build/bin/release/dsmctl -H IP_DEL_NODO nodes
+./build/bin/release/dsmctl -H IP_DEL_NODO stats
+\end{lstlisting}
+
+Sustituya \texttt{IP\_DEL\_NODO} por la dirección del equipo que quiera consultar. \texttt{dsmctl} abre una conexión TCP efímera y no se une al clúster, así que puede ejecutarse desde un equipo que no aporta memoria. Si la consulta local funciona pero la remota no, revise el firewall y la ruta. Las aplicaciones pueden ejecutarse en cualquier equipo con conectividad, aunque esa máquina no tenga un nodo propio.
+
+\subsection{Verificación con dsmctl}\label{subsec:verificacion-dsmctl}
+
+La comprobación mínima después de arrancar el clúster es consultar la membresía y las estadísticas:
+
+\begin{lstlisting}
+./build/bin/release/dsmctl nodes
+./build/bin/release/dsmctl stats
+\end{lstlisting}
+
+En \texttt{nodes} cada nodo debe aparecer una sola vez, con estado \texttt{ALIVE}, rol \texttt{nodo}, una ranura distinta y las páginas que corresponden a su \texttt{NODE\_MEM}. Para 256 MiB se esperan 65536 páginas aportadas; para 64 MiB, 16384. La columna \texttt{Latidos} debe permanecer en 0 en un clúster sano. Los clientes aparecen en filas separadas, con 0 páginas, y no suman al total de nodos.
+
+La salida de \texttt{stats} reúne los contadores de todos los nodos. Al inicio los fallos y los mensajes están en cero; después de una aplicación aparecen los fallos de página, el tráfico y, con redundancia, los deltas de paridad. La línea final indica cuántos nodos respondieron. Para comparar la configuración entre computadoras, ejecute \texttt{dsmctl config} en cada una y revise el hash compartido.
+
+\section{Aplicaciones}\label{sec:aplicaciones}
+
+Las aplicaciones de prueba usan la API pública y necesitan al menos un nodo vivo. \texttt{matmul}, \texttt{juego\_vida} y \texttt{filtro\_video} se unen como clientes; \texttt{demo} incluye roles de nodo y un productor que se lanza como cliente. Las tres primeras leen \texttt{dsm.conf} del directorio actual o la ruta que reciban con \texttt{-{}-conf}; \texttt{demo} recibe la ruta como argumento posicional. Devuelven 0 cuando la ejecución y la verificación terminan bien, 1 cuando falla la ejecución y 2 cuando los argumentos son incorrectos. Los datos de \texttt{data/} son material real: un video RGB24 de 128 por 96 con 48 cuadros y una fotografía en escala de grises de 192 por 192.
+
+\subsection{Matrices}\label{subsec:matrices}
+
+\texttt{matmul} reserva tres matrices cuadradas, llena A y B con patrones deterministas, reparte las filas de C entre hilos y sincroniza antes de verificar. La sintaxis es:
+
+\begin{lstlisting}
+./build/bin/release/matmul [N] [--conf <archivo>] [--hilos H]
+\end{lstlisting}
+
+\texttt{N} vale 256 por defecto y admite hasta 2048. \texttt{H} vale 4 por defecto y se reduce a \texttt{N} si se pide más. Cada matriz ocupa $N^2 \times 8$ bytes: con 256 son 0.5 MiB por matriz y 1.5 MiB en total; con 2048 son 32 MiB por matriz y 96 MiB en total. La referencia secuencial necesita otras dos matrices en memoria local.
+
+Una ejecución típica sobre un clúster de cuatro nodos es \texttt{./build/bin/release/matmul 256 -{}-hilos 4}. La salida informa dimensiones, hilos, nodos activos, memoria del clúster, tiempo de cálculo, tiempo de \texttt{dsm\_sync}, los dos checksums, la diferencia máxima y los elementos distintos. La ejecución es correcta cuando la línea final dice \texttt{VERIFICACION: OK} y el conteo es 0 de 65536. Para $N=256$, el checksum de referencia es 41107839280 y debe coincidir con el del DSM.
+
+Si el clúster no alcanza para las tres matrices, el programa lo detecta antes de reservar e indica cuántos MiB necesita y cuántos ofrece. Aumente \texttt{NODE\_MEM}, agregue un nodo o reduzca \texttt{N}. Un error \texttt{DSM\_ERR\_NO\_SPACE} en \texttt{dsm\_alloc} también puede indicar que la vista se quedó sin páginas libres; revise \texttt{dsmctl alloc} y \texttt{dsmctl pages}.
+
+\subsection{Juego de la vida}\label{subsec:juego-vida}
+
+\texttt{juego\_vida} simula el autómata de Conway sobre dos tableros de un byte por celda y alterna origen y destino por paridad de la generación. La sintaxis es:
+
+\begin{lstlisting}
+./build/bin/release/juego_vida [--verificar] [--patron <nombre>] \
+    [--imagen <archivo>] [--conf <archivo>] \
+    <ancho> <alto> <generaciones> [hilos]
+\end{lstlisting}
+
+El tablero debe medir al menos 3 por 3 y admite hasta 65536 por lado, con un máximo de $2^{32}$ celdas y 10\,000\,000 de generaciones. \texttt{hilos} vale 4 por defecto y se reduce al número de filas si se pide más. \texttt{-{}-imagen} siembra el tablero con una imagen en escala de grises del tamaño exacto; cada píxel con valor 128 o más queda vivo. \texttt{-{}-patron} acepta \texttt{block}, \texttt{blinker} o \texttt{glider}, y sin ninguna de las dos opciones se usa una semilla pseudoaleatoria fija con densidad del 30\,\%.
+
+Una ejecución verificada con la fotografía del repositorio es:
+
+\begin{lstlisting}
+./build/bin/release/juego_vida --imagen data/tablero_192.gray \
+    --verificar 192 192 30 4
+\end{lstlisting}
+
+La aplicación imprime el tamaño del tablero, la reserva de los dos tableros, las celdas vivas iniciales y finales, las generaciones, el tiempo total, el rendimiento en celdas por segundo y las estadísticas de fallos y páginas. Con \texttt{-{}-verificar} repite la simulación en memoria normal y compara celda por celda; el resultado correcto es \texttt{Coincidencia exacta} y ningún conteo de divergencias. Si hay diferencias, informa cuántas celdas distintas hay y dónde está la primera.
+
+Antes de reservar, el programa comprueba que el clúster aporte al menos el doble del tablero, porque necesita dos tableros completos. Los dos tableros de 192 por 192 usan 72 KiB; los de 4096 por 4096, 32 MiB. El modo \texttt{-{}-verificar} admite hasta $2^{28}$ celdas porque la referencia secuencial necesita dos tableros adicionales en memoria local.
+
+\subsection{Filtro de video}\label{subsec:filtro-video}
+
+\texttt{filtro\_video} lee cuadros RGB24, calcula la luminancia BT.601 de cada píxel y escribe un byte por píxel en escala de grises. La entrada y la salida viven en la vista compartida, de modo que el archivo se carga una vez y los hilos procesan rangos de cuadros. La sintaxis es:
+
+\begin{lstlisting}
+./build/bin/release/filtro_video [--conf <archivo>] <entrada> <salida> [hilos]
+./build/bin/release/filtro_video --generar <archivo> <ancho> <alto> <cuadros>
+\end{lstlisting}
+
+El primer modo procesa un archivo real; el segundo fabrica un video sintético con un gradiente. \texttt{hilos} vale 4 por defecto y admite hasta 256. La entrada tiene una cabecera de tres enteros de 32 bits con ancho, alto y cantidad de cuadros, seguida de los píxeles RGB24; la salida conserva la cabecera y agrega un byte de luminancia por píxel.
+
+Para procesar el video del repositorio:
+
+\begin{lstlisting}
+./build/bin/release/filtro_video data/video_128x96.rgb /tmp/gris.gris 4
+\end{lstlisting}
+
+El video tiene 128 por 96 y 48 cuadros, así que la entrada ocupa 1\,769\,472 bytes de píxeles y la salida 589\,824 bytes, más 12 bytes de cabecera en cada archivo. La aplicación informa dimensiones, bytes, hilos, tiempo de filtrado, tiempo con escritura, rendimiento en MiB/s y estadísticas de fallos y mensajes. La ejecución termina bien cuando imprime \texttt{Salida escrita en} con la ruta solicitada.
+
+Si la ruta de entrada no existe, el programa genera en esa misma ruta un video sintético de 640 por 480 con 30 cuadros y continúa. Esto permite probar sin datos externos, pero también significa que un error en la ruta crea un archivo en lugar de fallar de inmediato. Si el archivo existe pero su cabecera no coincide con el tamaño real, la aplicación aborta.
+
+Para preparar material propio, convierta una secuencia RGB24 cruda con \texttt{video\_pack}:
+
+\begin{lstlisting}
+ffmpeg -i origen.mp4 -t 0.8 -vf scale=128:96 -pix_fmt rgb24 \
+    -f rawvideo crudo.rgb
+./build/bin/release/video_pack crudo.rgb video.rgb 128 96
+\end{lstlisting}
+
+\texttt{video\_pack} agrega la cabecera que espera \texttt{filtro\_video}. El ancho y el alto deben coincidir con los del cuadro crudo; la cantidad de cuadros se deduce del tamaño del archivo.
+
+\subsection{demo}\label{subsec:demo}
+
+\texttt{demo} reúne las demostraciones de coherencia MSI, ejecución distribuida y paridad. Cada rol tiene una orden distinta y varios leen instrucciones por la entrada estándar, por lo que se ejecutan en terminales separadas.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\caption{Roles de \texttt{demo} y la entrada que espera cada uno.}
+\label{tab:demo-roles}
+\begin{tabularx}{\textwidth}{@{}P{2.0cm} P{6.7cm} Y@{}}
+\toprule
+Rol & Orden & Comportamiento y entrada \\
+\midrule
+\texttt{dist coord} & \texttt{./build/bin/release/demo dist coord dsm.conf} & Reserva el bloque, registra el kernel y espera \texttt{LAUNCH <ranura>} o \texttt{QUIT}. \\
+\texttt{dist worker} & \texttt{./build/bin/release/demo dist worker dsm.conf} & Registra el kernel y espera órdenes remotas; acepta \texttt{QUIT}. \\
+\texttt{raid hold} & \texttt{./build/bin/release/demo raid hold dsm.conf} & Nodo custodio del bloque; acepta \texttt{READ}, \texttt{READPAGE} y \texttt{QUIT}. \\
+\texttt{raid produce} & \texttt{./build/bin/release/demo raid produce dsm.conf <páginas> <nodos>} & Cliente que escribe, sincroniza y verifica; termina solo. \\
+\texttt{msi a} & \texttt{./build/bin/release/demo msi a dsm.conf} & Publica la dirección de una página y espera \texttt{READ} y \texttt{QUIT}. \\
+\texttt{msi b} & \texttt{./build/bin/release/demo msi b dsm.conf <dirección>} & Lee y escribe la página de \texttt{a}; espera \texttt{QUIT}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+La demostración de coherencia MSI usa dos procesos. Ejecute \texttt{./build/bin/release/demo msi a dsm.conf} en una terminal y anote la dirección de \texttt{A\_READY PASS}. En la segunda arranque \texttt{./build/bin/release/demo msi b dsm.conf} con esa dirección: B lee el patrón de A, lo verifica, escribe el suyo e informa \texttt{B\_AFTER\_WRITE PASS}. En la terminal de A escriba \texttt{READ} y Enter; A debe responder \texttt{A\_AFTER\_B\_WRITE PASS}. Cierre ambos con \texttt{QUIT}.
+
+La demostración de paridad necesita tres nodos custodios y un productor cliente. Abra tres terminales con \texttt{./build/bin/release/demo raid hold dsm.conf} y, cuando las tres hayan publicado \texttt{HOLD\_READY}, ejecute:
+
+\begin{lstlisting}
+DSM_NODE_MODE=client ./build/bin/release/demo raid produce dsm.conf 24 3
+\end{lstlisting}
+
+El productor espera hasta 30 segundos a que existan los tres nodos, reserva 24 páginas, escribe un patrón conocido, llama a \texttt{dsm\_sync} y verifica la lectura. La línea \texttt{RAID\_READY} con \texttt{SYNC=ok} y \texttt{LECTURA=ok} confirma que el bloque quedó en los custodios y que la paridad se actualizó. Los procesos \texttt{raid hold} siguen vivos para leer el bloque o derribar uno y comprobar la reconstrucción.
+
+\section{Ejecución distribuida}\label{sec:ejecucion-distribuida}
+
+La ejecución distribuida permite repartir particiones de un trabajo entre varios nodos sin que la aplicación abra conexiones ni serialice mensajes. Cada proceso registra el kernel que sabe ejecutar, el coordinador describe las particiones con direcciones de la vista compartida y la biblioteca envía las órdenes a las ranuras indicadas. El trabajador ejecuta el kernel sobre su copia de la vista y devuelve estado, elementos, CRC32 y duración.
+
+El registro del kernel es local al proceso y no viaja por la red, así que cada nodo que deba ejecutar un \texttt{kernel\_id} tiene que registrarlo con \texttt{dsm\_dist\_register} antes de recibir la orden. La biblioteca registra el kernel de demostración \texttt{DSM\_DIST\_KERNEL\_DEMO}, que copia un rango o lo rellena con ceros cuando \texttt{src\_va} es cero; para un kernel propio, use otro identificador y registre la misma función en todos los participantes.
+
+El coordinador reserva un bloque con \texttt{dsm\_alloc} y lo llena con los datos de entrada. Después construye un arreglo de \texttt{dsm\_dist\_part\_t} donde cada entrada tiene un identificador único, la dirección de origen, la de destino y la cantidad de bytes; las direcciones son de la vista compartida, no locales del coordinador. Luego llama a \texttt{dsm\_dist\_launch} con el trabajo, el kernel, las particiones, las ranuras de los trabajadores y un plazo. La llamada no espera a que terminen: solo confirma que las órdenes se enviaron.
+
+El coordinador recoge los resultados con \texttt{dsm\_dist\_collect}, que copia hasta la capacidad indicada y puede esperar un plazo o consultar sin bloquear. Cuando tiene todas las particiones, \texttt{dsm\_dist\_verify} compara el XOR de los CRC32 con el valor esperado; una partición fallida aporta cero y el agregado no depende del orden de llegada. El plazo de la verificación es \texttt{DIST\_TIMEOUT\_MS}, 5000 ms por defecto, y la cantidad de particiones está limitada por \texttt{WAIT\_POOL\_ENTRIES}.
+
+La demostración lista para ejecutar usa dos procesos nodo. En la primera terminal arranque el coordinador y en la segunda el trabajador:
+
+\begin{lstlisting}
+./build/bin/release/demo dist coord dsm.conf
+./build/bin/release/demo dist worker dsm.conf
+\end{lstlisting}
+
+El coordinador imprime \texttt{COORD\_READY} con su ranura y la dirección del bloque; el trabajador imprime \texttt{WORKER\_READY} con la suya. En la terminal del coordinador escriba \texttt{LAUNCH} seguido de la ranura del trabajador, por ejemplo \texttt{LAUNCH 1}, y pulse Enter. La salida correcta termina con:
+
+\begin{lstlisting}
+DIST PASS remote=4 total=8 verify=ok lectura=ok
+\end{lstlisting}
+
+La línea indica que cuatro de las ocho particiones se ejecutaron en el trabajador remoto, que las ocho llegaron, que el CRC32 agregado coincide y que el contenido leído es el esperado. Si aparece \texttt{DIST\_FAIL}, revise que el trabajador haya registrado el mismo kernel, que su ranura sea distinta de la del coordinador y que ambos usen el mismo \texttt{dsm.conf}. Cierre los procesos con \texttt{QUIT}. Para repartir trabajo entre más nodos, agregue sus ranuras al arreglo \texttt{workers} y aumente \texttt{nworkers}; los trabajadores deben ser nodos vivos con memoria, porque un cliente no puede recibir particiones.
+
+\section{Diagnóstico y reportes}\label{sec:diagnostico}
+
+El diagnóstico se apoya en \texttt{dsmctl} y en los reportes HTML. \texttt{dsmctl} consulta un nodo en ejecución sin unirse al clúster y no reserva memoria ni modifica la membresía; cada consulta abre una conexión TCP efímera, envía una petición y cierra. Los reportes se generan desde el nodo consultado y reúnen la tabla de páginas de todo el clúster.
+
+\subsection{Comandos de dsmctl}\label{subsec:comandos-dsmctl}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Comandos de \texttt{dsmctl}.}
+\label{tab:dsmctl}
+\begin{tabularx}{\textwidth}{@{}l Y@{}}
+\toprule
+Comando & Resultado \\
+\midrule
+\texttt{stats} & Consulta cada miembro y suma fallos, mensajes, bytes, tareas distribuidas, paridad, reconstrucciones y latidos perdidos. \\
+\texttt{nodes} & Membresía: ranura, UUID, IP, puerto, rol, estado, páginas aportadas, páginas libres, latidos perdidos y época. \\
+\texttt{pages [inicio] [n]} & Resumen local de páginas en M, S, I y transiciones pendientes; con argumentos agrega el directorio global del rango. \\
+\texttt{dir [inicio] [n]} & Directorio global: página, propietario, proceso, orden, copyset y franja. \\
+\texttt{alloc [inicio] [n]} & Bloques reservados del espacio global, con proceso y ranura. \\
+\texttt{html [directorio]} & Genera \texttt{global.html} y un archivo por nodo en el directorio indicado o en \texttt{OUTPUT\_DIR}. \\
+\texttt{config} & Muestra la configuración cargada, incluido el hash compartido. \\
+\texttt{help} & Lista los comandos y las opciones. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Las opciones generales son \texttt{-c} o \texttt{-{}-conf} para el archivo, \texttt{-H} o \texttt{-{}-host} para el nodo que se consulta y \texttt{-p} o \texttt{-{}-port} para su puerto. Sin opciones se usan \texttt{dsm.conf}, \texttt{127.0.0.1} y el \texttt{PORT\_MIN} del archivo, que es el puerto del primer nodo de la máquina. Las opciones se aceptan antes o después del comando.
+
+\begin{lstlisting}
+./build/bin/release/dsmctl nodes
+./build/bin/release/dsmctl -H 192.168.1.22 -p 27601 stats
+./build/bin/release/dsmctl pages 0 16
+./build/bin/release/dsmctl dir 0 32
+./build/bin/release/dsmctl alloc
+./build/bin/release/dsmctl html /tmp/reporte-dsm
+\end{lstlisting}
+
+\texttt{dir} y el detalle de \texttt{pages} recorren la vista completa, que con la configuración por defecto tiene más de un millón de páginas. Use siempre un rango acotado; sin argumentos, \texttt{dir} muestra 16 páginas y \texttt{alloc} muestra 32 bloques. Si el nodo no responde, \texttt{dsmctl} lo informa y devuelve un código distinto de cero.
+
+\subsection{Reportes HTML}\label{subsec:reportes-html}
+
+El comando \texttt{html} pide al nodo consultado que genere el reporte en su propio sistema de archivos. El directorio se crea si no existe; si se omite, se usa \texttt{OUTPUT\_DIR}, que por defecto es \texttt{reports}.
+
+\begin{lstlisting}
+./build/bin/release/dsmctl html /tmp/reporte-dsm
+\end{lstlisting}
+
+El resultado son dos tipos de archivo. \texttt{global.html} contiene el número de nodos, clientes, época, tamaño de página, páginas de la vista y particiones distribuidas; la tabla de nodos y clientes con ranura, rol, estado, memoria, dirección y enlace a su reporte; y la tabla global de páginas con propietario, proceso, orden, copyset y franja. Cada \texttt{nodo-<ranura>.html} contiene los metadatos de ese nodo, sus estadísticas locales si es el nodo que generó el reporte y su tabla de páginas con el estado MSI.
+
+El reporte global enlaza a los archivos por nodo con rutas relativas, así que se puede abrir \texttt{global.html} y navegar entre las tablas. Los archivos se escriben en la máquina del nodo consultado, no en la del usuario que ejecuta \texttt{dsmctl}; si consulta un nodo remoto con \texttt{-H}, el directorio debe poder crearse en esa máquina y tendrá que copiarlo desde allí.
+
+\subsection{Lectura de resultados}\label{subsec:lectura-resultados}
+
+La tabla de \texttt{nodes} responde cuatro preguntas. La ranura identifica al miembro y la época indica la generación del clúster. El rol distingue un nodo que aporta memoria de un cliente. El estado \texttt{ALIVE} indica que responde a los latidos, \texttt{SUSPECT} que dejó de responder pero aún no se le declara muerto y \texttt{DEAD} que ya salió o fue declarado caído. Las páginas aportadas y libres muestran cuánto ofrece y cuánto queda; los latidos perdidos cuentan transiciones a \texttt{SUSPECT} y \texttt{DEAD}, no cada intervalo de retraso.
+
+En el directorio, el propietario es la ranura del nodo custodio que mantiene la entrada, el proceso es el PID que reservó la página, el orden es la posición dentro del bloque de \texttt{dsm\_alloc}, el copyset son las ranuras con copia válida y la franja es la agrupación de paridad cuando la redundancia está activa. El estado MSI se lee así: \texttt{M} es una copia exclusiva y modificable, \texttt{S} una copia de solo lectura compartida e \texttt{I} una página sin copia válida que dispara un fallo en el próximo acceso. Los estados \texttt{IS\_PEND}, \texttt{IM\_PEND} y \texttt{SM\_PEND} son transitorios; un conteo alto y sostenido indica que algún par no responde o que la red está saturada.
+
+En \texttt{stats}, los fallos de lectura y escritura muestran cuántas veces la aplicación tocó una página que no tenía. Los mensajes y bytes indican el tráfico real entre nodos. Los deltas y las franjas reconstruidas solo crecen con redundancia activa, y las reconstrucciones confirman que el sistema recuperó datos de un nodo caído. Las respuestas descartadas por \texttt{tseq} son respuestas viejas o repetidas que el protocolo ignoró y no representan pérdida de datos.
+
+Los resultados de las aplicaciones se interpretan por su línea final. En \texttt{matmul}, \texttt{VERIFICACION: OK} y 0 elementos distintos confirman que la multiplicación coincide con la referencia. En \texttt{juego\_vida}, \texttt{Coincidencia exacta} confirma que el tablero final es idéntico al de la simulación local. En \texttt{filtro\_video}, \texttt{Salida escrita en} y el tamaño del archivo confirman el volcado. En \texttt{demo raid}, \texttt{RAID\_READY} con \texttt{SYNC=ok} y \texttt{LECTURA=ok} confirma persistencia y paridad; en \texttt{demo dist}, \texttt{DIST PASS} confirma las particiones remotas.
+
+\section{Detención y reinicio}\label{sec:detencion}
+
+La detención ordenada se hace con \texttt{Ctrl+C} en la terminal del nodo o con \texttt{kill -INT <pid>} si corre en segundo plano. El proceso captura \texttt{SIGINT} y \texttt{SIGTERM}, anuncia su salida, detiene los latidos, cierra el listener y las conexiones, imprime las estadísticas finales y libera la memoria. La línea \texttt{Nodo detenido correctamente} confirma el cierre limpio.
+
+Termine primero las aplicaciones y después los nodos. Una aplicación que sigue ejecutándose cuando su nodo desaparece puede recibir un fallo de página que ya no se puede resolver y terminar con error. Si detiene todo el clúster, hágalo nodo por nodo y espere a que la membresía se estabilice antes de apagar el siguiente, sobre todo con redundancia activa.
+
+Cuando un nodo se cae de forma abrupta, los supervivientes lo detectan por los latidos. Con los valores por defecto, \texttt{HB\_INTERVAL\_MS} es 500 ms, \texttt{HB\_SUSPECT} es 3 y \texttt{HB\_DEAD} es 6; el nodo pasa a \texttt{SUSPECT} tras unos 1.5 segundos sin respuesta y a \texttt{DEAD} tras unos 3 segundos. Cada transición suma una unidad a \texttt{hb\_missed}. Si la redundancia está activa, la desaparición dispara la reconstrucción de las franjas afectadas; espere a que \texttt{dsmctl stats} muestre un conteo estable antes de seguir.
+
+Para reiniciar un nodo, ejecute de nuevo la misma orden con la misma etiqueta. La identidad persistente en \texttt{\$HOME/.dsm} permite recuperar el UUID, aunque la ranura puede cambiar porque la asigna la membresía vigente. El nodo se une con una época nueva y el total de memoria se actualiza. Las aplicaciones que estaban en ejecución no se reconectan solas: son procesos nuevos y deben volver a lanzarse.
+
+Si cambió alguna de las once claves compartidas, detenga el clúster completo, aplique el cambio en todos los archivos y vuelva a arrancar; un reinicio parcial deja nodos con hashes distintos. Si solo cambió \texttt{NODE\_MEM}, basta con reiniciar el nodo afectado. Los reportes y las salidas permanecen en disco después de detener el clúster.
+
+\section{Problemas frecuentes}\label{sec:problemas}
+
+Los fallos de operación suelen dejar un mensaje en la terminal del nodo o en \texttt{dsmctl}. Antes de cambiar la configuración, lea el mensaje completo y compruebe la hipótesis más simple: un proceso anterior que sigue vivo, un firewall activo o un archivo distinto en una de las computadoras.
+
+\subsection{Puerto ocupado}\label{subsec:puerto-ocupado}
+
+El síntoma es un error de \texttt{dsm\_init} con \texttt{DSM\_ERR\_NET} y un mensaje como \texttt{No hay puertos disponibles en el rango asignado [27600, 27699]}. La causa habitual es un nodo anterior que no terminó, una aplicación que quedó escuchando o un clúster de otra persona en la misma máquina. Localice el proceso con \texttt{ss -ltnp | grep -E ':276[0-9][0-9]'} y \texttt{pgrep -af 'release/dsm'}, deténgalo con \texttt{kill -INT <pid>} y vuelva a arrancar.
+
+El bloque está fijado en el código y no se puede mover fuera de 27600 a 27699. Si el conflicto es con otro clúster, coordine con su responsable o use otra computadora; dos clústeres en la misma máquina chocan en los sockets antes de que el protocolo pueda separarlos.
+
+\subsection{Firewall}\label{subsec:firewall}
+
+Si \texttt{dsmctl nodes} funciona en la misma máquina pero falla contra otra, o si los nodos no se descubren entre equipos, el firewall puede estar bloqueando el TCP del bloque o el UDP de descubrimiento. Abra las reglas de la sección~\ref{subsec:puertos-firewall} y compruebe el estado con \texttt{sudo ufw status} o \texttt{sudo firewall-cmd -{}-list-all}. Un firewall que permite TCP pero bloquea UDP impide el descubrimiento; uno que permite UDP pero bloquea TCP deja que los nodos se vean y falla al unirse. Si la red usa NAT entre segmentos, los equipos deben quedar en la misma subred.
+
+\subsection{Multicast}\label{subsec:multicast}
+
+Cuando no aparece ningún par, compruebe que la interfaz se unió al grupo y que el tráfico multicast tiene ruta con \texttt{ip maddr show}, \texttt{ip route get 239.255.42.99} y \texttt{ping -I <interfaz> -c 2 239.255.42.99}. La salida de \texttt{ip maddr show} debe incluir \texttt{239.255.42.99} en la interfaz del laboratorio cuando hay un nodo vivo. Los switches con IGMP snooping pueden podar el grupo si no ven un receptor; el broadcast de respaldo ayuda en la misma subred, pero no cruza routers. Las redes Wi-Fi con aislamiento de clientes y las máquinas virtuales con NAT suelen bloquear ambos mecanismos; use cable, modo puente o la red del anfitrión.
+
+\subsection{Hash distinto}\label{subsec:hash-distinto}
+
+El nodo rechaza la unión y el registro muestra \texttt{Configuración compartida distinta en el par anunciado}. Esto significa que alguna de las once claves compartidas no coincide, no que falte memoria. Ejecute \texttt{dsmctl config} en cada computadora y compare el hash y los valores. Las diferencias más comunes son \texttt{REDUNDANCY} activado en un solo equipo, \texttt{VIEW\_SIZE} o \texttt{BASE\_ADDR} editados en uno, \texttt{DISCOVERY\_PORT} distinto, \texttt{HOME\_SLACK} con otro valor y \texttt{CLUSTER\_ID} copiado de otro clúster.
+
+Corrija el archivo, detenga el nodo y vuelva a arrancarlo. Si el cambio afecta a todo el clúster, detenga todos los nodos, aplique el mismo valor y arranque de nuevo. Cambiar \texttt{NODE\_MEM} no produce este error.
+
+\subsection{Nodos que no se descubren}\label{subsec:no-descubren}
+
+Revise en este orden: que el primer nodo esté vivo y haya publicado su ranura; que todos usen el mismo \texttt{DISCOVERY\_GROUP} y \texttt{DISCOVERY\_PORT}; que estén en la misma subred; que el firewall permita UDP y TCP; y que cada proceso tenga una etiqueta distinta. Dos nodos con la misma \texttt{DSM\_NODE\_TAG} en la misma computadora comparten el UUID y el sistema responde \texttt{El par anunciado responde con el mismo UUID} y pide una etiqueta distinta. Cambie una de las etiquetas.
+
+Si el nodo arrancó pero se quedó esperando, revise su terminal: un error de configuración, de puerto o de memoria explica por qué no se unió. \texttt{dsmctl nodes} contra un nodo vivo muestra la membresía que ese nodo conoce; si el equipo que falta no aparece, el problema es de descubrimiento, y si aparece como \texttt{SUSPECT} o \texttt{DEAD}, es de latidos o de red.
+
+\subsection{Falta de memoria}\label{subsec:falta-memoria}
+
+Los síntomas son \texttt{DSM\_ERR\_NO\_SPACE} en \texttt{dsm\_alloc}, el mensaje del juego de la vida que indica que el tablero no cabe, o el aviso de \texttt{matmul} con los MiB necesarios y los disponibles. Consulte la memoria real con \texttt{dsmctl nodes} y la columna \texttt{Libres clúster}, y revise las reservas con \texttt{dsmctl alloc}. Un bloque que quedó reservado por una aplicación que murió sin liberar puede consumir espacio; reiniciar el nodo o el clúster lo recupera.
+
+Aumente \texttt{NODE\_MEM} en los equipos con RAM libre, agregue un nodo o reduzca la carga. No configure \texttt{NODE\_MEM} por encima de la memoria física: el sistema puede aceptar la reserva y luego fallar o recurrir al intercambio. Recuerde que el juego de la vida reserva dos tableros y que su verificación necesita otros dos en memoria local.
+
+\subsection{Binarios incompatibles con el laboratorio}\label{subsec:binarios-incompatibles}
+
+Si un binario compilado en otra máquina falla al arrancar con mensajes como \texttt{version 'GLIBC\_2.xx' not found}, \texttt{FATAL: kernel too old} o \texttt{memfd\_create: Function not implemented}, el problema es la compatibilidad entre el equipo donde se compiló y el laboratorio. Los binarios quedan enlazados contra la versión de glibc y el kernel de la máquina de compilación, y no se pueden llevar a un sistema más antiguo.
+
+Compile en el laboratorio, en cada computadora, con \texttt{make clean} y \texttt{make release}. No copie la carpeta \texttt{build/} entre equipos ni entre distribuciones distintas. Antes de compilar, confirme las versiones con \texttt{uname -r} y \texttt{ldd -{}-version}; si el kernel es anterior a 3.17, el sistema no puede ejecutar DSM porque falta \texttt{memfd\_create}. Si el laboratorio tiene otra arquitectura, compile allí.
+
+\section{Referencia rápida de comandos}\label{sec:referencia}
+
+Esta tabla reúne las órdenes de uso frecuente. Todas suponen que el directorio actual es la raíz del repositorio y que los binarios se compilaron con \texttt{make release}.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\caption{Comandos de operación del clúster.}
+\label{tab:comandos}
+\begin{tabularx}{\textwidth}{@{}P{3.2cm} Y@{}}
+\toprule
+Tarea & Comando \\
+\midrule
+Compilar & \texttt{make release} \\
+Arrancar un nodo & \texttt{DSM\_NODE\_TAG=n1 ./build/bin/release/dsm dsm.conf} \\
+Consultar membresía & \texttt{./build/bin/release/dsmctl nodes} \\
+Consultar estadísticas & \texttt{./build/bin/release/dsmctl stats} \\
+Consultar otro equipo & \texttt{./build/bin/release/dsmctl -H IP\_DEL\_NODO nodes} \\
+Ver configuración y hash & \texttt{./build/bin/release/dsmctl config} \\
+Generar reporte HTML & \texttt{./build/bin/release/dsmctl html /tmp/reporte} \\
+Matrices & \texttt{./build/bin/release/matmul 256 -{}-hilos 4} \\
+Juego de la vida & \texttt{./build/bin/release/juego\_vida -{}-imagen data/tablero\_192.gray 192 192 30 4} \\
+Juego verificado & \texttt{./build/bin/release/juego\_vida -{}-imagen data/tablero\_192.gray -{}-verificar 192 192 30 4} \\
+Filtro de video & \texttt{./build/bin/release/filtro\_video data/video\_128x96.rgb /tmp/gris.gris 4} \\
+Coordinador distribuido & \texttt{./build/bin/release/demo dist coord dsm.conf} \\
+Trabajador distribuido & \texttt{./build/bin/release/demo dist worker dsm.conf} \\
+Nodo custodio de paridad & \texttt{./build/bin/release/demo raid hold dsm.conf} \\
+Productor de paridad & \texttt{DSM\_NODE\_MODE=client ./build/bin/release/demo raid produce dsm.conf 24 3} \\
+Detener un nodo & \texttt{Ctrl+C} o \texttt{kill -INT <pid>} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Las variables de entorno por proceso son \texttt{DSM\_NODE\_TAG} (identidad y nombre), \texttt{DSM\_NODE\_MODE} (\texttt{node} o \texttt{client}) y \texttt{DSM\_LOG\_LEVEL} (nivel de registro).
+
+Con esta referencia y las secciones anteriores se puede operar el clúster completo.

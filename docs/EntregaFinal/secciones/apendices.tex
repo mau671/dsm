@@ -1,0 +1,269 @@
+\section{Catálogo de configuración}\label{app:config}
+
+El archivo \texttt{dsm.conf} reúne las claves que gobiernan la identidad del clúster, la memoria, la red, los plazos y los grupos de hilos. Once de ellas forman el contrato compartido y se resumen en un CRC32 que viaja en el saludo: \texttt{CLUSTER\_ID}, \texttt{PAGE\_SIZE}, \texttt{BASE\_ADDR}, \texttt{VIEW\_SIZE}, \texttt{PORT\_MIN}, \texttt{PORT\_MAX}, \texttt{DISCOVERY\_GROUP}, \texttt{DISCOVERY\_PORT}, \texttt{VNODES\_PER\_MB}, \texttt{HOME\_SLACK} y \texttt{REDUNDANCY}. Las claves marcadas con asterisco en la tabla~\ref{tab:config-catalogo} pertenecen a ese grupo; las demás son locales y pueden variar entre equipos. \texttt{NODE\_MEM} es el caso más visible: cada PC declara la memoria que aporta y el hash la excluye para permitir clústeres heterogéneos.
+
+{\footnotesize
+\begin{xltabular}{\linewidth}{@{}l l l Y@{}}
+\caption{Catálogo de claves de \texttt{dsm.conf}. El asterisco marca las claves que entran en el hash compartido.}\label{tab:config-catalogo}\\
+\toprule
+\textbf{Clave} & \textbf{Tipo} & \textbf{Valor típico} & \textbf{Efecto} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Clave} & \textbf{Tipo} & \textbf{Valor típico} & \textbf{Efecto} \\
+\midrule
+\endhead
+\midrule
+\multicolumn{4}{r}{\footnotesize\textit{Continúa en la página siguiente}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+\texttt{CLUSTER\_ID}$^{\ast}$ & hexadecimal & $0\text{x}534F3031$ & Identificador del clúster. Un valor distinto rechaza la unión con \texttt{DSM\_ST\_CONFIG\_MISMATCH}. \\
+\texttt{PAGE\_SIZE}$^{\ast}$ & bytes & 4096 & Tamaño de la página virtual y de la unidad de coherencia; debe ser múltiplo de la página del sistema. \\
+\texttt{BASE\_ADDR}$^{\ast}$ & hexadecimal & $0\text{x}200000000000$ & Dirección virtual común donde se proyecta la vista en todos los procesos. \\
+\texttt{BASE\_ADDR\_TSAN} & hexadecimal & $0\text{x}4000000000$ & Dirección alternativa que usa la compilación con ThreadSanitizer para no chocar con su mapa. \\
+\texttt{VIEW\_SIZE}$^{\ast}$ & bytes & 4294967296 & Extensión de la ventana virtual; no compromete memoria física hasta que se materializan páginas. \\
+\texttt{MAX\_RUNTIME\_NODES} & entero & 256 & Tope de nodos admitidos en la membresía; no puede superar \texttt{MAX\_NODES}. \\
+\texttt{VNODES\_PER\_MB}$^{\ast}$ & entero & 16 & Vnodes del anillo por MiB aportado; pondera la probabilidad de custodiar páginas. \\
+\texttt{REDUNDANCY}$^{\ast}$ & booleano & \texttt{false} & Activa la paridad; con \texttt{true} la unión exige al menos tres nodos vivos y deriva $K$ de la membresía. \\
+\texttt{CHUNK\_PAGES} & páginas & 4 & Agrupa páginas en la franja que muestran los reportes HTML; no cambia la colocación de datos. \\
+\texttt{WAIT\_POOL\_ENTRIES} & entradas & 64 & Capacidad de particiones de un trabajo distribuido; un trabajo mayor devuelve \texttt{DSM\_ERR\_NO\_SPACE}. \\
+\texttt{DIST\_TIMEOUT\_MS} & milisegundos & 5000 & Plazo por defecto de \texttt{dsm\_dist\_verify} cuando el trabajo aún no terminó. \\
+\texttt{OUTPUT\_DIR} & ruta & \texttt{reports} & Directorio donde \texttt{dsm\_html\_report} escribe el archivo global y uno por nodo. \\
+\texttt{NODE\_MEM} & bytes & 268435456 & Memoria física que aporta el proceso local; es local y puede variar entre equipos. \\
+\texttt{PORT\_MIN}$^{\ast}$ & entero & 27600 & Primer puerto del bloque que el nodo recorre para tomar el primer puerto libre. \\
+\texttt{PORT\_MAX}$^{\ast}$ & entero & 27699 & Último puerto del bloque; el rango debe estar libre y permitido por el cortafuegos. \\
+\texttt{DISCOVERY\_GROUP}$^{\ast}$ & IPv4 & 239.255.42.99 & Grupo multicast donde cada nodo anuncia su UUID, IP, puerto, rol y páginas. \\
+\texttt{DISCOVERY\_PORT}$^{\ast}$ & entero & 27699 & Puerto UDP del grupo de descubrimiento; el broadcast se usa como respaldo. \\
+\texttt{CONNECT\_TIMEOUT\_MS} & milisegundos & 200 & Plazo de las conexiones no bloqueantes de sondeo. \\
+\texttt{DISCOVERY\_TIMEOUT\_MS} & milisegundos & 300 & Espera máxima de una respuesta \texttt{WELCOME} tras el sondeo. \\
+\texttt{SEND\_TIMEOUT\_MS} & milisegundos & 2000 & Plazo para emitir una trama completa antes de declarar fallo de enlace. \\
+\texttt{REQUEST\_TIMEOUT\_MS} & milisegundos & 3000 & Espera de una respuesta asíncrona antes de reintentar la solicitud. \\
+\texttt{REQUEST\_RETRIES} & entero & 3 & Cantidad de reenvíos antes de declarar inaccesible a un par. \\
+\texttt{RECONNECT\_MIN\_MS} & milisegundos & 100 & Cota inferior del retardo exponencial para reabrir un enlace caído. \\
+\texttt{RECONNECT\_MAX\_MS} & milisegundos & 2000 & Cota superior del retardo exponencial de reconexión. \\
+\texttt{HB\_INTERVAL\_MS} & milisegundos & 500 & Intervalo entre latidos enviados a todos los pares. \\
+\texttt{HB\_SUSPECT} & latidos & 3 & Latidos consecutivos perdidos que llevan una ranura a \texttt{SUSPECT}. \\
+\texttt{HB\_DEAD} & latidos & 6 & Latidos consecutivos perdidos que declaran la ranura \texttt{DEAD}; debe superar a \texttt{HB\_SUSPECT}. \\
+\texttt{WORKER\_THREADS} & hilos & 4 & Hilos que atienden solicitudes de red y ejecutan transacciones del protocolo. \\
+\texttt{DISPATCHER\_THREADS} & hilos & 2 & Hilos que resuelven los fallos de página encolados por el manejador de \texttt{SIGSEGV}. \\
+\texttt{PAGE\_LOCK\_STRIPES} & mutexes & 256 & Cantidad de cerrojos por franja que protegen el estado local de las páginas. \\
+\texttt{HOME\_SLACK}$^{\ast}$ & factor & 1.25 & Margen sobre \texttt{NODE\_MEM} para el respaldo del custodio y los marcos de paridad. \\
+\texttt{LOCK\_TIMEOUT\_MS} & milisegundos & 10000 & Plazo de \texttt{dsm\_lock} y \texttt{dsm\_barrier} antes de devolver \texttt{DSM\_ERR\_TIMEOUT}. \\
+\texttt{WORKER\_QUEUE\_CAP} & mensajes & 4096 & Capacidad de la cola de solicitudes pendientes de despacho. \\
+\texttt{DSM\_LOG\_LEVEL} & nivel & \texttt{INFO} & Nivel de detalle del registro: \texttt{ERROR}, \texttt{WARN}, \texttt{INFO}, \texttt{DEBUG} o \texttt{TRACE}. \\
+\end{xltabular}
+}
+
+\section{Estructuras y cargas útiles}\label{app:protocolo}
+
+Los mensajes viajan sobre TCP con una cabecera fija de 56 bytes seguida de una carga útil. La cabecera conserva el mismo formato en todas las versiones del protocolo y se serializa campo por campo en orden de red; el contenido de las páginas se transmite como bytes crudos. El CRC32 se calcula sobre la cabecera con su propio campo en cero y sobre la carga, de modo que una trama truncada o alterada se descarta antes de llegar a la lógica de coherencia. El catálogo completo y su agrupación por rangos aparece en la sección~\ref{sec:protocolo}.
+
+Las estructuras que viajan por la red se serializan campo por campo y usan tipos de ancho fijo, de modo que su tamaño no depende del compilador. La tabla~\ref{tab:estructuras-protocolo} enumera las principales. La cabecera tiene 56 bytes en el cable y 64 en memoria por la alineación natural; el CRC32 ocupa el último campo y se calcula con ese campo en cero.
+
+{\footnotesize
+\begin{xltabular}{\linewidth}{@{}l l Y@{}}
+\caption{Estructuras principales del protocolo y del estado local.}\label{tab:estructuras-protocolo}\\
+\toprule
+\textbf{Estructura} & \textbf{Tamaño} & \textbf{Contenido y uso} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Estructura} & \textbf{Tamaño} & \textbf{Contenido y uso} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+\texttt{msg\_header\_t} & 56 B & \texttt{magic}, \texttt{cluster\_id}, \texttt{proto\_version}, \texttt{type}, \texttt{epoch}, \texttt{src\_slot}, \texttt{dst\_slot}, \texttt{req\_id}, \texttt{page\_id}, \texttt{tseq}, \texttt{data\_version}, \texttt{access}, \texttt{flags}, \texttt{status}, \texttt{payload\_len} y \texttt{crc32}. \\
+\texttt{membership\_wire\_t} & 36 B & UUID, IP, puerto, ranura, estado, incarnation y páginas aportadas de un miembro. \\
+\texttt{node\_info\_t} & 56 B & Registro local de membresía: UUID, incarnation, último latido, ranura, IP, páginas, vnodes, puerto, estado y latidos perdidos. \\
+\texttt{dir\_entry\_t} & 72 B & Entrada del custodio: página, dueño, versión, \texttt{tseq}, marco, franja, cola de espera, transacción, estado, \texttt{busy} y \texttt{copyset} de 32 bytes. \\
+\texttt{page\_local\_t} & 16 B & Estado MSI local, marcas \texttt{pend\_inval} y \texttt{pend\_down}, versión instalada, último \texttt{tseq} y cabeza de espera. \\
+\texttt{stripe\_t} & 76 B & Identificador de franja, $K$, ranura de paridad, hasta ocho páginas de datos y sus custodios. \\
+\texttt{alloc\_rec\_t} & 24 B & Identificador de reserva, primera página, cantidad, ranura, PID y relleno. \\
+\texttt{discovery\_wire\_t} & 80 B & Anuncio UDP: UUID, clúster, hash compartido, IP, puerto, rol, páginas y versión. \\
+\texttt{dist\_run\_wire\_t} & 48 B & Trabajo, kernel, partición, rango de la vista, cantidad de particiones y plazo. \\
+\texttt{dist\_done\_wire\_t} & 44 B & Trabajo, partición, estado, elementos, CRC32, duración y fallos de lectura y escritura. \\
+\texttt{dsm\_stats\_t} & variable & Contadores de fallos, mensajes, bytes, invalidaciones, latencia, paridad, ejecución distribuida y latidos. \\
+\end{xltabular}
+}
+
+\section{Referencia de la API}\label{app:api}
+
+Todas las funciones devuelven \texttt{dsm\_status\_t}: \texttt{DSM\_OK} vale cero y los valores negativos son errores. Cuando una función falla, no escribe en sus parámetros de salida. La tabla~\ref{tab:api-funciones} enumera las funciones públicas y los errores que cada una puede devolver; la tabla~\ref{tab:codigos-estado} describe los códigos. La referencia detallada de parámetros y estado de implementación está en \texttt{docs/API.md}.
+
+{\footnotesize
+\begin{xltabular}{\linewidth}{@{}l Y P{3.2cm}@{}}
+\caption{Funciones públicas de la biblioteca DSM.}\label{tab:api-funciones}\\
+\toprule
+\textbf{Función} & \textbf{Propósito} & \textbf{Errores} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Función} & \textbf{Propósito} & \textbf{Errores} \\
+\midrule
+\endhead
+\midrule
+\multicolumn{3}{r}{\footnotesize\textit{Continúa en la página siguiente}} \\
+\endfoot
+\bottomrule
+\endlastfoot
+\texttt{dsm\_init} & Carga la configuración, crea la vista y el alias, instala \texttt{SIGSEGV}, arranca hilos y se une al clúster. & \texttt{CONFIG}, \texttt{MEM}, \texttt{NET}, \texttt{PROTO}, \texttt{NO\_SPACE}, \texttt{INVALID} \\
+\texttt{dsm\_finalize} & Anuncia \texttt{LEAVE}, detiene los hilos, cierra la red, restaura la señal y desmapea la vista. & \texttt{NOT\_INIT} \\
+\texttt{dsm\_is\_initialized} & Indica si existe un contexto DSM activo en el proceso. & Ninguno \\
+\texttt{dsm\_thread\_attach} & Asigna al hilo una pila alternativa y su ranura de fallo. & \texttt{NOT\_INIT}, \texttt{MEM} \\
+\texttt{dsm\_thread\_detach} & Desactiva la pila alternativa y libera la ranura del hilo. & \texttt{NOT\_INIT} \\
+\texttt{dsm\_alloc} & Reserva un bloque contiguo de páginas en la vista y devuelve su dirección. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{NO\_SPACE}, \texttt{BUSY}, \texttt{NET}, \texttt{PROTO} \\
+\texttt{dsm\_free} & Devuelve un bloque al mapa global y deja sus páginas inválidas y en ceros. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{NO\_SPACE}, \texttt{BUSY}, \texttt{NET}, \texttt{PROTO} \\
+\texttt{dsm\_sync} & Persiste las páginas en \texttt{M} en el respaldo de su custodio. & \texttt{NOT\_INIT}, \texttt{NET}, \texttt{TIMEOUT}, \texttt{MEM} \\
+\texttt{dsm\_lock} & Adquiere un cerrojo distribuido y espera si el custodio lo tiene ocupado. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{BUSY}, \texttt{NO\_SPACE}, \texttt{TIMEOUT}, \texttt{NET} \\
+\texttt{dsm\_unlock} & Libera el cerrojo que posee el hilo llamador. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{NET} \\
+\texttt{dsm\_barrier} & Espera a que \texttt{n} participantes lleguen a la misma generación. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{NO\_SPACE}, \texttt{TIMEOUT}, \texttt{NET} \\
+\texttt{dsm\_dist\_register} & Asocia un \texttt{kernel\_id} con una función y un argumento en la tabla local. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{NO\_SPACE} \\
+\texttt{dsm\_dist\_launch} & Reparte las particiones por turno y envía \texttt{DIST\_RUN} a los trabajadores. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{NO\_SPACE}, \texttt{NET} \\
+\texttt{dsm\_dist\_collect} & Copia los resultados disponibles de un trabajo. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{TIMEOUT}, \texttt{NET} \\
+\texttt{dsm\_dist\_verify} & Espera el trabajo y compara el XOR de los CRC32 con el valor esperado. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{TIMEOUT}, \texttt{NET} \\
+\texttt{dsm\_node\_id} & Escribe la ranura del nodo local. & \texttt{NOT\_INIT}, \texttt{INVALID} \\
+\texttt{dsm\_node\_count} & Cuenta los nodos vivos que aportan memoria, sin incluir clientes. & \texttt{NOT\_INIT}, \texttt{INVALID} \\
+\texttt{dsm\_global\_size} & Suma las páginas aportadas por los nodos vivos. & \texttt{NOT\_INIT}, \texttt{INVALID} \\
+\texttt{dsm\_stats} & Copia los contadores acumulados y las páginas locales en \texttt{M}, \texttt{S} e \texttt{I}. & \texttt{NOT\_INIT}, \texttt{INVALID} \\
+\texttt{dsm\_pages\_global} & Escribe la tabla de páginas materializadas con dueño, PID, orden, copyset y franja. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{NO\_SPACE}, \texttt{NET}, \texttt{PROTO} \\
+\texttt{dsm\_html\_report} & Genera un archivo global y uno por nodo en el directorio indicado. & \texttt{NOT\_INIT}, \texttt{INVALID}, \texttt{NO\_SPACE}, \texttt{NET}, \texttt{PROTO} \\
+\texttt{dsm\_strerror} & Devuelve la descripción estática de un código de estado. & Ninguno \\
+\texttt{dsm\_debug\_dump\_fd} & Escribe ranura, época, dirección base, tamaño de vista y nodos activos en un descriptor. & \texttt{NOT\_INIT} \\
+\end{xltabular}
+}
+
+{\footnotesize
+\begin{xltabular}{\linewidth}{@{}r l Y@{}}
+\caption{Códigos de estado del API.}\label{tab:codigos-estado}\\
+\toprule
+\textbf{Valor} & \textbf{Código} & \textbf{Significado} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Valor} & \textbf{Código} & \textbf{Significado} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+0 & \texttt{DSM\_OK} & Operación completada. \\
+-1 & \texttt{DSM\_ERR\_CONFIG} & Configuración inválida o hash compartido distinto. \\
+-2 & \texttt{DSM\_ERR\_NOT\_INIT} & El subsistema no está inicializado. \\
+-3 & \texttt{DSM\_ERR\_MEM} & Fallo de memoria, de hilos, de semáforos o de \texttt{memfd}/\texttt{mmap}. \\
+-4 & \texttt{DSM\_ERR\_NET} & Sin puerto, conexión rechazada o enlace caído. \\
+-5 & \texttt{DSM\_ERR\_TIMEOUT} & Plazo agotado en una espera. \\
+-6 & \texttt{DSM\_ERR\_NO\_SPACE} & Sin páginas, ranuras o entradas de espera. \\
+-7 & \texttt{DSM\_ERR\_INVALID} & Puntero nulo, tamaño cero o índice fuera de rango. \\
+-8 & \texttt{DSM\_ERR\_NODE\_DOWN} & La ranura destino no pertenece a la membresía activa. \\
+-9 & \texttt{DSM\_ERR\_BUSY} & Página o coordinador ocupado; la operación puede reintentarse. \\
+-10 & \texttt{DSM\_ERR\_PROTO} & Cabecera, versión, tipo o CRC32 inválidos. \\
+-11 & \texttt{DSM\_ERR\_INTR} & Llamada interrumpida por una señal; no la devuelve el API pública. \\
+-12 & \texttt{DSM\_ERR\_AGAIN} & Recurso no disponible de inmediato; no la devuelve el API pública. \\
+-13 & \texttt{DSM\_ERR\_NOT\_FOUND} & Sin pares durante el descubrimiento; \texttt{dsm\_init} la consume. \\
+\end{xltabular}
+}
+
+\section{Evidencia de ejecución}\label{app:evidencia}
+
+Los extractos siguientes provienen de corridas con binarios de \texttt{release} sobre el clúster local de cuatro nodos de 64 MiB. Las líneas se copian tal como las imprimen las herramientas, salvo los cortes de página y los espacios de alineación que el ancho del informe obliga a ajustar. Los identificadores UUID y las direcciones IP pertenecen a la corrida y cambian entre ejecuciones.
+
+\subsection{Membresía}
+
+\begin{lstlisting}[caption={Extracto de \texttt{dsmctl nodes} con la membresía del clúster local; se omite la columna UUID y se abrevian los encabezados para ajustar el ancho.}, label={lst:salida-nodes}]
+Ranura  IP               Puerto  Rol   Estado  Aportadas  Libres  Latidos  Época
+0       172.18.23.163    27600  nodo  ALIVE       16384   65536        0     15
+1       172.18.23.163    27601  nodo  ALIVE       16384   65536        0     15
+2       172.18.23.163    27602  nodo  ALIVE       16384   65536        0     15
+3       172.18.23.163    27603  nodo  ALIVE       16384   65536        0     15
+Nodos listados: 4
+\end{lstlisting}
+
+El listado muestra cuatro ranuras \texttt{ALIVE}, cada una con 16384 páginas, equivalentes a 64 MiB. El campo de latidos vale cero en las cuatro y el clúster reporta 65536 páginas libres, es decir, los 256 MiB agregados. La época es la misma para todos porque la membresía ya convergió cuando se hizo la consulta.
+
+\subsection{Estadísticas agregadas}
+
+\begin{lstlisting}[caption={Extracto de \texttt{dsmctl stats} después de una corrida de \texttt{matmul}.}, label={lst:salida-stats}]
+Ranura  Rol   Fallos L  Fallos E  Mensajes  Deltas  Reconstruidas  Latidos perdidos
+0       nodo         0         0      2260       0              0                 0
+1       nodo         0         0      2538       0              0                 0
+2       nodo         0         0      2341       0              0                 0
+3       nodo         0         0      2358       0              0                 0
+Nodos consultados: 4 de 4
+
+Estadísticas agregadas del clúster
+  Fallos de lectura        : 0
+  Fallos de escritura      : 0
+  Fallos totales           : 0
+  Mensajes enviados        : 4750
+  Mensajes recibidos       : 4747
+  Bytes enviados           : 1900092, equivalente a 1.81 MiB
+  Bytes recibidos          : 3448176, equivalente a 3.29 MiB
+  Tareas distribuidas      : 0 correctas, 0 fallidas
+  Deltas de paridad        : 0
+  Franjas reconstruidas    : 0
+  Respuestas descartadas   : 0
+  Latidos perdidos         : 0
+\end{lstlisting}
+
+Los fallos de lectura y escritura de los nodos valen cero porque \texttt{matmul} se ejecuta como cliente: sus fallos se contabilizan en el proceso de la aplicación y no en los custodios. Los mensajes, en cambio, muestran actividad de red entre los cuatro nodos, que incluye los latidos y la atención del cliente. La última línea, \texttt{Latidos perdidos: 0}, es la que sostiene la afirmación de estabilidad de la membresía durante la corrida.
+
+\subsection{Reporte HTML}
+
+La figura~\ref{fig:html-nodo} de la sección~\ref{sec:reportes-html} muestra el formato del reporte por nodo en la corrida de cinco procesos. El reporte global de esa misma corrida describe la vista y la membresía. Los valores extraídos del archivo \texttt{global.html} son los siguientes:
+
+\begin{lstlisting}[caption={Valores del reporte global \texttt{global.html} de la corrida local.}, label={lst:salida-html}]
+Nodos: 5
+Clientes: 0
+Época: 20
+Tamaño de página: 4096 B
+Páginas de la vista: 1048576
+Particiones distribuidas: 0 ok, 0 fallidas
+
+Ranura  Rol   Estado  Memoria          Dirección
+0       nodo  ALIVE   16384 páginas    172.18.23.163:27660
+1       nodo  ALIVE   16384 páginas    172.18.23.163:27661
+2       nodo  ALIVE   16384 páginas    172.18.23.163:27662
+3       nodo  ALIVE   16384 páginas    172.18.23.163:27663
+4       nodo  ALIVE   16384 páginas    172.18.23.163:27664
+\end{lstlisting}
+
+La vista declara 1048576 páginas, que corresponden a los 4 GiB de \texttt{VIEW\_SIZE}; la memoria aportada es mucho menor y se reparte entre los cinco nodos. El reporte por nodo de la figura~\ref{fig:html-nodo} agrega las estadísticas locales y la tabla de páginas materializadas, con el estado MSI de cada una.
+
+\subsection{Multiplicación de matrices}
+
+\begin{lstlisting}[caption={Salida de \texttt{matmul 256 --hilos 4} en el clúster local de cuatro nodos.}, label={lst:salida-matmul}]
+Multiplicación de matrices sobre memoria DSM
+Dimensiones: 256 x 256, elemento double
+Hilos: 4
+Matriz: 0.50 MiB; A, B y C: 1.50 MiB
+Nodos activos: 4; memoria del clúster: 256.00 MiB
+dsm_sync: OK (0.519 s)
+Tiempo de cálculo: 0.253 s
+Tiempo de referencia secuencial: 0.048 s
+Checksum DSM: 41107839280.000000
+Checksum referencia: 41107839280.000000
+Diferencia máxima: 0.000000e+00
+Elementos distintos: 0 de 65536
+VERIFICACION: OK
+\end{lstlisting}
+
+Los tiempos corresponden a la corrida de la tabla~\ref{tab:corridas}. El checksum y el conteo de elementos distintos no cambian entre corridas, porque el cálculo es determinista y la verificación compara contra la referencia completa; los tiempos sí varían con la carga del equipo y con el momento en que se materializan las páginas.
+
+\subsection{Pruebas de extremo a extremo}
+
+\begin{lstlisting}[caption={Resultados de los tres escenarios de \texttt{make test-e2e}.}, label={lst:salida-e2e}]
+=== Integración DSM: dos nodos y flujo MSI ===
+PASS: flujo de página entre dos nodos
+
+=== Integración DSM: ejecución distribuida entre dos procesos ===
+DIST PASS remote=4 total=8 verify=ok lectura=ok
+PASS: ejecución distribuida con dos procesos reales
+
+=== Integración DSM: paridad, caída de un nodo y reconstrucción ===
+Franjas reconstruidas: 6
+Páginas reconstruidas y verificadas: 5
+PASS: paridad conserva los datos tras la caída de un nodo
+\end{lstlisting}
+
+Los tres escenarios comparten el mismo arnés y se ejecutan con procesos reales. El primero confirma el flujo MSI entre dos nodos; el segundo exige que al menos una partición se ejecute en el otro proceso y que el CRC agregado coincida; el tercero derriba un custodio y verifica las páginas reconstruidas antes de declarar el éxito.

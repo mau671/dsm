@@ -1,0 +1,134 @@
+\section{Configuración, descubrimiento y membresía}\label{sec:configuracion}
+
+\subsection{Archivo \texttt{dsm.conf} y parámetros del sistema}
+
+La configuración se expresa en un archivo de texto con pares \texttt{clave = valor}, comentarios introducidos por \texttt{\#} y líneas en blanco ignoradas. El analizador es estricto: una clave desconocida, una clave repetida o un valor fuera de rango abortan la carga con \texttt{DSM\_ERR\_CONFIG} en lugar de aplicarse un valor por omisión silencioso. Los enteros aceptan notación decimal o hexadecimal, los booleanos admiten \texttt{true}/\texttt{false} y \texttt{1}/\texttt{0}, el margen de custodia se interpreta como un factor con hasta tres decimales y la dirección del grupo debe ser IPv4 multicast.
+
+La validación comprueba las relaciones que un valor aislado no revela. El tamaño de página debe ser potencia de dos y múltiplo de la página del sistema; la vista debe ser múltiplo del tamaño de página y no superar 64 GiB; la dirección base debe estar alineada a 2 MiB y no desbordar el espacio de direcciones al sumarle la vista; el rango de puertos debe quedar contenido en el bloque asignado al grupo; \texttt{HB\_SUSPECT} debe ser menor que \texttt{HB\_DEAD}; el intervalo de latidos no puede ser cero; los hilos de trabajo y de despacho se limitan a un rango de uno a sesenta y cuatro; el número de cerrojos particionados debe ser potencia de dos; y \texttt{NODE\_MEM} debe ser múltiplo del tamaño de página y de al menos una página.
+
+Las claves se dividen en dos clases según su alcance. Las once estructurales deben coincidir en todos los equipos: \texttt{CLUSTER\_ID}, \texttt{PAGE\_SIZE}, \texttt{BASE\_ADDR}, \texttt{VIEW\_SIZE}, \texttt{PORT\_MIN}, \texttt{PORT\_MAX}, \texttt{DISCOVERY\_GROUP}, \texttt{DISCOVERY\_PORT}, \texttt{VNODES\_PER\_MB}, \texttt{HOME\_SLACK} y \texttt{REDUNDANCY}. Las locales describen al proceso o al equipo y pueden diferir: la memoria aportada, el límite de nodos en tiempo de ejecución, las temporizaciones, los grupos de hilos, las rutas de salida y el nivel de registro. La tabla~\ref{tab:claves-compartidas} enumera el primer grupo.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\linewidth}{l l Y}
+\toprule
+\textbf{Clave} & \textbf{Valor base} & \textbf{Función en el clúster} \\
+\midrule
+\texttt{CLUSTER\_ID} & \texttt{0x534F3031} & Identifica el clúster y descarta anuncios ajenos. \\
+\texttt{PAGE\_SIZE} & 4096 & Unidad de coherencia y transferencia de la vista. \\
+\texttt{BASE\_ADDR} & \texttt{0x200000000000} & Dirección virtual común donde se proyecta la vista. \\
+\texttt{VIEW\_SIZE} & 4294967296 & Extensión de la ventana virtual (4 GiB). \\
+\texttt{PORT\_MIN} y \texttt{PORT\_MAX} & 27600 y 27699 & Bloque exclusivo del que se toma el puerto TCP. \\
+\texttt{DISCOVERY\_GROUP} & 239.255.42.99 & Grupo multicast; el broadcast es el respaldo. \\
+\texttt{DISCOVERY\_PORT} & 27699 & Puerto UDP de anuncios y sondeos. \\
+\texttt{VNODES\_PER\_MB} & 16 & Vnodes por mebibyte aportado en el anillo. \\
+\texttt{HOME\_SLACK} & 1.25 & Margen del respaldo sobre la memoria nominal. \\
+\texttt{REDUNDANCY} & \texttt{false} & Activa la paridad y exige al menos tres nodos. \\
+\bottomrule
+\end{tabularx}
+\caption{Claves que el hash compartido exige iguales en todos los nodos.}
+\label{tab:claves-compartidas}
+\end{table}
+
+El bloque de puertos requiere una separación explícita: la cátedra asigna cien puertos al grupo, de 27600 a 27699, y el sistema no abre puertos de escucha fuera de ese intervalo. El canal de descubrimiento ocupa el 27699, así que los nodos toman sus puertos TCP de escucha de 27600 a 27698. La reserva no depende de una convención externa: el primer puerto libre se elige intentando \texttt{bind} y confirmando con \texttt{listen}, porque dos sockets pueden enlazarse al mismo puerto mientras ninguno escuche. El que gana el \texttt{listen} conserva el puerto y el otro prueba el siguiente.
+
+\subsection{Claves compartidas y hash de configuración}
+
+El hash compartido es un CRC32 sobre una cadena canónica que el nodo construye con las once claves estructurales, en orden fijo y con ancho constante por campo. La forma canónica importa: si el orden dependiera del archivo o los valores se escribieran con anchos distintos, dos configuraciones equivalentes producirían hashes diferentes. La cadena incluye el identificador, el tamaño de página, la base y el tamaño de la vista, el rango de puertos, el grupo y el puerto de descubrimiento, los vnodes por mebibyte, el margen de custodia y el indicador de redundancia. \texttt{NODE\_MEM}, las temporizaciones, los hilos, las rutas y el nivel de registro quedan fuera.
+
+El hash viaja en cada anuncio y en el saludo \texttt{HELLO}; la conexión que transporta el \texttt{JOIN} ya pasó por ese filtro. Un par que lo presenta distinto no se incorpora: el nodo registra un aviso con el nombre, la dirección y ambos valores, y limita la repetición del aviso a una vez cada cinco segundos por identificador para no inundar el registro con un anuncio que se repite cada medio segundo. Cuando la discrepancia aparece en una conexión de sondeo, el miembro responde con estado \texttt{DSM\_ST\_CONFIG\_MISMATCH} y el solicitante termina con \texttt{DSM\_ERR\_CONFIG} en lugar de insistir con una vista que nunca va a coincidir.
+
+Esa separación es la que permite heterogeneidad de memoria sin configuraciones divergentes. Dos equipos con distinto \texttt{NODE\_MEM} comparten el mismo hash y se aceptan; dos con distinto \texttt{CLUSTER\_ID}, tamaño de página o rango de puertos se rechazan antes de intercambiar una sola página. El rol del proceso se resuelve aparte, a partir de \texttt{DSM\_NODE\_MODE}, porque un archivo compartido no debe describir si un proceso aporta memoria. El hash se calcula después de analizar el archivo y antes de resolver el rol, de modo que un archivo inválido falla igual en los dos modos.
+
+\subsection{Anuncio multicast y respaldo por broadcast}
+
+El descubrimiento usa un socket UDP enlazado al puerto 27699. El socket habilita \texttt{SO\_REUSEADDR}, que permite que varios procesos del mismo equipo escuchen el mismo grupo, y \texttt{SO\_BROADCAST} para el respaldo. Se suscribe al grupo multicast por la interfaz que elija el kernel y por loopback, con lo cual dos procesos de la misma máquina se ven aunque la interfaz principal no devuelva los datagramas. El TTL se fija en uno para que el anuncio no cruce un enrutador.
+
+Cada proceso emite un anuncio cada 500 ms y sondea el socket cada 100 ms. El anuncio se envía por loopback, por la interfaz principal y por broadcast, en ese orden; la copia por broadcast se emite siempre, aunque el multicast funcione, para cubrir el caso de una red que filtra el grupo. La interfaz principal se descubre sin enviar tráfico, conectando un datagrama a una dirección externa para que el kernel elija la ruta por omisión, y se restaura la interfaz configurada al terminar el envío.
+
+El anuncio ocupa 80 bytes e incluye el identificador del protocolo, la versión, el identificador del clúster, el hash compartido, el UUID del nodo, su nombre, la ranura que publica, su dirección IPv4, su puerto TCP, la cantidad de páginas que aporta y su rol. Al recibirlo, el nodo descarta los paquetes con identificador, versión o clúster ajenos, ignora su propio UUID y rechaza los que no traen una dirección utilizable o un puerto válido. Si el hash no coincide, registra el conflicto y no incorpora al par.
+
+La dirección que se conserva es la del remitente observada en el socket, no la que el par publica de sí mismo. Una dirección loopback publicada por el emisor se reemplaza por la dirección real del datagrama, porque la primera solo sirve para el mismo equipo. La tabla de pares anunciados conserva el nombre, el puerto, la ranura informativa, la memoria y el instante del último anuncio, y avisa a las esperas de membresía cuando aparece un par nuevo o cambia su puerto o su ranura.
+
+Si la suscripción multicast falla, el nodo conserva el socket y sigue anunciando por broadcast. Esa degradación es deliberada: el descubrimiento no detiene el arranque por una limitación de la red, y el respaldo alcanza a los equipos del mismo segmento. La contrapartida es que un entorno que filtre tanto multicast como broadcast necesita una vía adicional de descubrimiento.
+
+\subsection{Unión al clúster y asignación de ranura}
+
+La unión comienza por la identidad: el nodo carga su UUID persistente o lo crea en el primer arranque, y después reserva el primer puerto libre del bloque. Antes de tomar ningún cerrojo abre el listener y el socket de descubrimiento, porque los nodos que ya están en el clúster necesitan que el recién llegado responda sus saludos para considerarlo candidato. La figura~\ref{fig:descubrimiento-join} muestra la secuencia de intercambios.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    ent/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\footnotesize, minimum width=3.1cm, minimum height=0.65cm},
+    msg/.style={-{Latex[length=2mm]}, thick, draw=black!65},
+    back/.style={{Latex[length=2mm]}-, thick, draw=black!65},
+    lbl/.style={font=\scriptsize, align=center, fill=white, inner sep=2pt}
+]
+
+\node[ent] (n) at (0,0) {Nodo nuevo};
+\node[ent] (c) at (9.2,0) {Miembro del clúster};
+\draw[dashed, thick, draw=black!35] (n.south) -- ++(0,-6.1);
+\draw[dashed, thick, draw=black!35] (c.south) -- ++(0,-6.1);
+
+\draw[msg] (0,-1.0) -- node[lbl, above] {ANUNCIO UDP: uuid, IP, puerto, rol y memoria} (9.2,-1.0);
+\draw[msg] (0,-2.1) -- node[lbl, above] {HELLO: uuid y hash compartido} (9.2,-2.1);
+\draw[back] (0,-3.2) -- node[lbl, above] {WELCOME: tabla, época y mapa de reservas} (9.2,-3.2);
+\draw[msg] (0,-4.3) -- node[lbl, above] {JOIN: uuid, ranura propuesta y memoria} (9.2,-4.3);
+\draw[back] (0,-5.4) -- node[lbl, above] {JOIN\_ACK o NACK con \texttt{SLOT\_TAKEN}} (9.2,-5.4);
+\draw[msg] (0,-6.0) -- node[lbl, above] {HEARTBEAT periódico} (9.2,-6.0);
+
+\node[font=\scriptsize, align=center, text=black!65, text width=8.6cm] at (4.6,-7.0) {Ante un rechazo, el nodo elige la siguiente ranura y repite el \texttt{JOIN}.};
+
+\end{tikzpicture}
+\caption{Secuencia de descubrimiento y unión. El anuncio y el saludo identifican al candidato; el \texttt{WELCOME} entrega la vista del clúster y el \texttt{JOIN} confirma la ranura.}
+\label{fig:descubrimiento-join}
+\end{figure}
+
+Con el listener activo, el nodo toma un cerrojo en \texttt{\$HOME/.dsm} cuyo nombre combina el identificador del clúster y el rango de puertos. El cerrojo serializa la unión de los procesos del mismo equipo, de modo que un arranque simultáneo se convierte en una secuencia de uniones y cada uno ve las ranuras ya reclamadas. Entre equipos distintos no aplica y el reparto se resuelve con el desempate por UUID y los \texttt{JOIN} rechazados. Si el cerrojo no se puede tomar, el nodo continúa y advierte que el reparto depende del desempate.
+
+La primera pasada sondea cada par anunciado con \texttt{HELLO} y recibe un \texttt{WELCOME} con la tabla de membresía, la época y el mapa de reservas. La tabla se fusiona con las reglas de siempre y el mapa de reservas se importa para que el nodo no reutilice páginas que el coordinador ya entregó. De cada tabla se registra solo la fila que el par publica de sí mismo, porque esa es la única que el emisor garantiza; las filas de terceros pueden estar atrasadas y no sirven como reclamación de ranura.
+
+Un nodo que no ve ningún par no se declara primero de inmediato. Reclama la ranura cero y espera una ventana de asentamiento de al menos 1.5 s, o de \texttt{DISCOVERY\_TIMEOUT\_MS} si es mayor, para que un segundo nodo que arranca casi al mismo tiempo alcance a publicar su propio reclamo. La ventana termina en cuanto un par responde y un nodo solo paga como máximo ese plazo. La corrección no depende de la espera: si un reclamo aparece después, el reparto lo repara.
+
+La ranura elegida es la primera libre que no esté reclamada por otro ni ocupada por un par vivo, conservando la propia si nadie la disputa. Antes de pedirla, el nodo la publica como reclamación provisional y envía un \texttt{JOIN} a cada par alcanzado en la pasada, no solo a los que ya figuran en su tabla. Cada miembro aplica el mismo desempate: si la ranura está libre, registra al solicitante y responde \texttt{JOIN\_ACK}; si la ocupa y su propio reparto sigue provisional, responde \texttt{BUSY} cuando el solicitante tiene UUID menor y cede en su propia vuelta; en cualquier otra colisión responde \texttt{SLOT\_TAKEN} y el solicitante toma la siguiente ranura. La búsqueda solo avanza, con lo cual el bucle no oscila, y se acota a treinta y dos vueltas.
+
+El hilo de latidos arranca antes de resolver el reparto, porque la ranura ya está reclamada y los pares que registraron al nodo deben recibir señales de vida mientras termina de escanear. Al confirmarse la ranura, el nodo espera a que su vista coincida con la de los pares alcanzables, con un límite de dos veces el plazo de descubrimiento, y solo entonces retira la marca de reclamación provisional. Con redundancia activa, la unión termina con una espera de al menos tres nodos vivos con memoria y con el ajuste del tamaño de franja; si no se alcanzan, el nodo no se une.
+
+\subsection{Latidos, sospecha y expulsión}
+
+Cada participante envía un latido a los demás miembros presentes cada \texttt{HB\_INTERVAL\_MS}, 500 ms por omisión. El latido lleva la época, la ranura, las páginas libres y, en una extensión, la identidad completa del emisor. El receptor actualiza la marca de tiempo, borra el conteo de latidos perdidos y devuelve a \texttt{ALIVE} un nodo que estaba en sospecha. Si el latido proviene de una ranura que la tabla no conoce pero trae identidad válida, el nodo incorpora al emisor, replica la tabla y ajusta la franja si corresponde; así un miembro que se perdió el \texttt{JOIN} original no queda fuera de la vista.
+
+Un nodo recién incorporado dispone de un plazo de gracia antes de que se evalúe su silencio. Mientras no haya enviado su primer latido, el detector le concede treinta segundos o el producto de \texttt{HB\_DEAD} por el intervalo, el mayor de los dos, porque el \texttt{JOIN} puede llegar mientras el nuevo nodo todavía recorre el rango de puertos y resuelve sus vecinos. En cuanto llega el primer latido, rige la detección normal.
+
+La evaluación compara el tiempo transcurrido desde el último latido con el intervalo configurado y obtiene la cantidad de latidos perdidos. Al alcanzar \texttt{HB\_SUSPECT}, tres por omisión, el nodo pasa a \texttt{SUSPECT}; al alcanzar \texttt{HB\_DEAD}, seis por omisión, se declara \texttt{DEAD}. La sospecha no cierra la ranura ni retira al nodo de la vista: solo advierte que dejó de responder y permite que un latido lo devuelva a \texttt{ALIVE}. La muerte sí cierra la ranura, borra su marca de tiempo y programa su reutilización para dentro de \texttt{RECONNECT\_MAX\_MS}.
+
+El contador global \texttt{hb\_missed} cuenta transiciones, no intervalos. Un episodio de silencio suma una vez cuando el nodo entra en sospecha y otra cuando se declara muerto; los intervalos adicionales dentro de la misma sospecha no lo incrementan. Dos marcas por ranura, una para la sospecha y otra para la muerte, evitan que la evaluación repetida del mismo silencio infle el contador. Esa definición hace que el número sea comparable entre corridas y no dependa de cuántas veces despertó el hilo de latidos.
+
+Cuando un nodo se declara muerto, el detector encola la recuperación de la ranura en un trabajador, que reasigna las páginas custodiadas, migra los cerrojos y programa la reconstrucción de la paridad. El detector no hace ese trabajo en el hilo de latidos, porque una espera por red retrasaría la evaluación y podría declarar muertos a los demás. Después difunde un \texttt{NODE\_DOWN} a los miembros presentes. Quien recibe el aviso cierra la ranura si todavía la tenía abierta y, si fue el primero en hacerlo, también recupera; los demás encuentran la ranura ya cerrada y su paso no tiene efecto. Si el aviso se pierde, el detector ya recuperó por su cuenta, y la coherencia no depende del broadcast.
+
+La salida ordenada recorre el mismo camino con un mensaje \texttt{LEAVE} dirigido a cada miembro. El nodo se marca como cerrado, detiene el descubrimiento y los latidos, y los demás cierran su ranura y recuperan sus páginas. Un nodo que muere sin avisar no envía nada: los latidos lo delatan en unos tres segundos con los valores por omisión.
+
+\subsection{Identidad, épocas y reincorporación}
+
+El UUID de 128 bits es la identidad estable del nodo; la ranura es su dirección en la tabla y puede cambiar. El UUID se persiste en \texttt{\$HOME/.dsm} con un nombre que combina el identificador del clúster, el nombre del equipo y la etiqueta \texttt{DSM\_NODE\_TAG}. Dos procesos del mismo equipo necesitan etiquetas distintas para obtener identidades distintas; sin la etiqueta, el segundo reutiliza el archivo del primero y el descubrimiento detecta el duplicado cuando un par responde con el mismo UUID, lo reporta y pide una etiqueta diferente. Un cliente sin etiqueta recibe un UUID efímero en cada ejecución, porque no representa una identidad estable del clúster y no debe chocar con el archivo del nodo local.
+
+Como el anillo deriva las posiciones de los vnodes del UUID y no de la ranura, un nodo que se reincorpora con la misma identidad vuelve a ocupar los mismos puntos del anillo y conserva la custodia que le correspondía. Esa propiedad evita una migración masiva de páginas después de un reinicio. La ranura, en cambio, puede ser otra: el nodo pide la primera libre y los pares reemplazan la fila vieja cuando reciben el \texttt{JOIN} o un latido con la identidad en la ranura nueva.
+
+La época es un contador de 64 bits que describe la generación de la vista de membresía. Aumenta cuando el nodo que origina un cambio lo difunde: una unión toma el máximo observado más uno, una reubicación incrementa el valor local y la aceptación de un \texttt{JOIN} adopta la época del solicitante y la incrementa cuando no es menor que la local. Al fusionar dos vistas se conserva la mayor, y la tabla local refleja la generación más reciente que haya visto. Los mensajes de membresía se comparan por sus propios campos —ranura e identidad— y no por la época, porque dos nodos pueden originar cambios concurrentes con números distintos; los mensajes de datos llevan la secuencia transaccional de la página, que el custodio usa para descartar respuestas de una transacción ya concluida.
+
+La reincorporación después de una caída sigue un camino distinto al de la salida ordenada. El nodo vuelve con su UUID persistente, descubre a los miembros que quedaron, propone una ranura y repite el \texttt{JOIN}. Su ranura anterior puede estar en periodo de reutilización, que dura \texttt{RECONNECT\_MAX\_MS}, o puede haber sido ocupada por otro nodo mientras estaba ausente. En el primer caso la recupera; en el segundo toma otra, la fusión retira la fila vieja del mismo UUID y el nodo no aparece dos veces en la tabla.
+
+El desempate entre dos reclamos de la misma ranura es lexicográfico por UUID y se aplica en los dos lados del intercambio. Un nodo con UUID menor gana la ranura y el otro se repliega; si el titular ya confirmó su reparto, no se renumera y el recién llegado busca otra. Esa regla, junto con la época, mantiene un orden total sin coordinador y permite que dos vistas converjan aunque hayan visto los cambios en distinto orden.
+
+\subsection{Configuración heterogénea de memoria por nodo}
+
+\texttt{NODE\_MEM} es una clave local: no entra en el hash compartido y puede diferir entre equipos; un nodo aporta 256 MiB, otro 128 MiB y el clúster los suma. La cantidad se valida contra el tamaño de página, se puede reemplazar en la llamada de inicialización y se publica como cantidad de páginas en el anuncio, el \texttt{JOIN} y el latido. Los demás nodos no necesitan el valor en bytes, solo las páginas que ese miembro aporta y cuántas le quedan libres.
+
+La capacidad agregada es la suma de las páginas de los nodos vivos que aportan memoria. Un cliente publica cero páginas y queda fuera del total, igual que un nodo declarado muerto. La vista de 4 GiB no es capacidad utilizable: es el espacio de direcciones donde se reparten los bloques, y su tamaño no cambia cuando cambia la membresía.
+
+El anillo pondera la custodia por la memoria aportada. Cada mebibyte proyecta \texttt{VNODES\_PER\_MB} vnodes, de modo que un nodo con el doble de memoria recibe aproximadamente el doble de páginas y tiene el doble de marcos para respaldarlas. El margen \texttt{HOME\_SLACK}, 1.25 por omisión, dimensiona el respaldo por encima del aporte nominal para absorber la varianza del reparto y dejar espacio a las páginas que llegan durante una reconfiguración. El respaldo se mide en marcos de \texttt{PAGE\_SIZE} y no en páginas activas: un marco vacío no consume memoria física hasta que se escribe.
+
+La heterogeneidad también alcanza a la paridad. Con \texttt{REDUNDANCY = true} el sistema exige al menos tres nodos vivos que aporten memoria y deriva la cantidad de páginas de datos por franja como los nodos vivos menos uno, acotada entre dos y ocho. Un clúster de cuatro nodos usa tres páginas de datos y una de paridad; uno de seis usa cinco y una. Si las franjas ya tienen contenido, la reconfiguración conserva el valor con el que se formaron, porque cambiarlo obligaría a reescribir la paridad completa.
+
+Las mediciones del clúster local ilustran el efecto. Cuatro nodos con 64 MiB cada uno suman 256 MiB y forman una franja de tres datos más paridad; el clúster físico aporta 256, 128, 128 y 128 MiB, para 640 MiB, y el reparto del anillo asigna más páginas y más vnodes al equipo de mayor memoria. En ambos casos la suma de páginas publicadas coincide con la capacidad que el asignador ofrece y con la que aparece en el reporte global.

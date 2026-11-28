@@ -1,0 +1,35 @@
+\begin{description}[leftmargin=2.7cm, style=nextline, itemsep=0.35em]
+
+\item[Vista] Proyección virtual del espacio compartido que observa la aplicación. Todos los procesos la sitúan en la misma dirección base y sus permisos cambian por página según el estado de coherencia.
+
+\item[Página] Unidad de coherencia, de transferencia y de protección de la vista, de 4096 bytes por omisión. Una página puede estar ausente, compartida o modificada en cada proceso.
+
+\item[Marco] Espacio físico del respaldo local de un nodo donde se guarda el contenido de una página cuya custodia le corresponde. Cada página custodiada ocupa un marco fijo.
+
+\item[Home o custodio] Nodo que mantiene la entrada de directorio de una página y su respaldo físico. Registra qué procesos tienen copia, quién la tiene modificada y cuál es la versión vigente; se elige de forma determinista con el anillo.
+
+\item[Ranura] Posición de un miembro dentro de la tabla de membresía, numerada desde cero. Identifica al emisor y al destino en los mensajes de datos y acota el tamaño del mapa de copias.
+
+\item[Época] Contador que describe la generación de la vista de membresía. Aumenta cuando un nodo se incorpora o se reubica, y viaja en los mensajes para identificar la generación con la que fueron emitidos.
+
+\item[MSI] Protocolo de coherencia con tres estados estables: modificado, compartido e inválido. Un cuarto conjunto de estados transitorios representa las transiciones que esperan una respuesta por red.
+
+\item[tseq] Secuencia transaccional que el custodio asigna a cada operación sobre una página. Ordena las respuestas y permite descartar acuses o datos huérfanos de una transacción ya concluida.
+
+\item[Copyset] Conjunto de ranuras que poseen una copia válida de la página. El custodio lo consulta para invalidar o degradar copias antes de conceder escritura.
+
+\item[Franja] Grupo formado por varias páginas de datos y una página de paridad. La cantidad de páginas de datos se deriva de la membresía y la paridad permite reconstruir una de ellas si su custodio falla.
+
+\item[Paridad] Página calculada con la disyunción exclusiva del contenido de las páginas de datos de una franja. Junto con las páginas sobrevivientes reconstruye la que falta.
+
+\item[Delta] Diferencia acumulada entre el contenido anterior y el nuevo de una página modificada. Los deltas mantienen la paridad al día sin reescribir la franja completa en cada modificación.
+
+\item[Kernel] Función que un proceso registra en la biblioteca y que un nodo ejecuta sobre una partición de la vista durante una operación distribuida.
+
+\item[Partición] Rango de la vista, descrito por una dirección de inicio y una cantidad de elementos, que un trabajo distribuido asigna a un nodo para ejecutar un kernel.
+
+\item[Cliente] Proceso que usa la memoria del clúster sin aportar páginas ni custodiar ninguna. No cuenta como nodo en la membresía ni en la capacidad agregada.
+
+\item[Nodo] Proceso que aporta un bloque de memoria física al espacio global y puede ser custodio de páginas. Participa en el descubrimiento, en los latidos y en el reparto de custodia.
+
+\end{description}

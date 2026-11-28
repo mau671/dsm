@@ -1,0 +1,221 @@
+\section{API pública}\label{sec:api}
+
+La biblioteca expone una interfaz en C11 declarada en \texttt{include/dsm.h} y \texttt{include/dsm\_types.h}. Una aplicación llama a \texttt{dsm\_init} una vez al arrancar, vincula cada hilo que toque la vista con \texttt{dsm\_thread\_attach}, reserva memoria con \texttt{dsm\_alloc}, usa punteros normales para leer y escribir, y cierra con \texttt{dsm\_finalize}. Los fallos de página de la vista los resuelve la biblioteca; la aplicación no ve mensajes, sockets ni transiciones MSI, salvo cuando consulta las estadísticas o genera un reporte.
+
+\subsection{Modelo de programación}
+
+Un proceso elige su papel con la variable de entorno \texttt{DSM\_NODE\_MODE}. El valor \texttt{node}, que es el predeterminado, aporta memoria al clúster y puede ser custodio de páginas. El valor \texttt{client} usa la memoria del clúster sin aportar ninguna, nunca es custodio y no cuenta en \texttt{dsm\_node\_count} ni en \texttt{dsm\_global\_size}. Un cliente necesita al menos un nodo en marcha, porque ninguna página tendría un custodio que la sirviera; un nodo sin pares puede asumir la ranura 0 y arrancar el clúster por sí solo.
+
+La vista compartida se mapea en \texttt{BASE\_ADDR}, una dirección idéntica en todos los procesos, y se reserva con \texttt{memfd} y \texttt{mmap}. Esa uniformidad hace que un puntero calculado en un nodo tenga el mismo valor en otro, y permite describir una partición distribuida con direcciones virtuales. Cada reserva recibe un rango distinto del mapa global, de modo que dos llamadas a \texttt{dsm\_alloc} en procesos diferentes no devuelven el mismo bloque. Para compartir datos, el creador comunica la dirección que recibió y los demás la usan dentro de su propia vista; la API no descubre bloques por nombre ni por contenido.
+
+Todas las funciones que realizan una operación devuelven \texttt{dsm\_status\_t}. \texttt{DSM\_OK} vale cero y los errores son negativos; \texttt{dsm\_strerror} traduce cualquier código a una cadena estática en español. Cuando una función devuelve error, no escribe en sus parámetros de salida salvo que la documentación indique lo contrario. \texttt{dsm\_is\_initialized} devuelve un booleano y \texttt{dsm\_strerror} devuelve un puntero constante, así que ninguna de las dos usa el código de estado.
+
+El modelo de hilos es explícito: la biblioteca crea el listener, los workers, los despachadores y el hilo de latidos, pero no vincula automáticamente los hilos de la aplicación. Cada hilo que acceda a memoria reservada con \texttt{dsm\_alloc} debe llamar a \texttt{dsm\_thread\_attach} antes del primer acceso y a \texttt{dsm\_thread\_detach} antes de terminar. El hilo principal no es una excepción: si va a tocar la vista, también necesita su pila alternativa.
+
+La coherencia garantiza una única versión válida por página, no una serialización global de las operaciones de la aplicación. Dos hilos que escriben la misma página sin un cerrojo producen una carrera, igual que en memoria compartida local; la diferencia es que la resolución del conflicto ocurre entre nodos y el valor final depende del orden en que las escrituras se aplican a la página. Para ordenar secciones críticas se usan \texttt{dsm\_lock} y \texttt{dsm\_unlock}, y para separar fases de un cálculo se usa \texttt{dsm\_barrier}. \texttt{dsm\_sync} no cambia la visibilidad entre procesos: persiste el contenido modificado en el custodio, de modo que una caída posterior no pierda la última versión confirmada.
+
+\subsection{Inicialización y ciclo de vida}
+
+\texttt{dsm\_init} recibe la ruta del archivo de configuración y un posible reemplazo de \texttt{NODE\_MEM}. Una ruta \texttt{NULL} usa \texttt{dsm.conf}; un reemplazo en cero conserva el valor del archivo y un valor mayor que cero lo sustituye y vuelve a validar la configuración. La función carga y valida las claves compartidas, eleva el límite blando de descriptores, ignora \texttt{SIGPIPE}, inicializa la cola de fallos, la membresía, la red, el directorio MSI y la sincronización, crea el \texttt{memfd} y los dos mapeos de la vista, instala el manejador de \texttt{SIGSEGV}, arranca workers y despachadores, abre el socket de descubrimiento y ejecuta la unión al clúster.
+
+Si el proceso no encuentra pares y es un nodo, asume la ranura 0 con época 1 y arranca los latidos. Si es un cliente, falla con \texttt{DSM\_ERR\_NO\_SPACE}, porque no aporta la memoria que una página necesita como respaldo. Con \texttt{REDUNDANCY} activo, la unión exige al menos tres nodos vivos que aporten memoria y deriva el número de datos por franja como $K = \text{nodos vivos} - 1$, acotado entre 2 y 8; si no reúne ese mínimo, devuelve \texttt{DSM\_ERR\_CONFIG}. Una segunda llamada a \texttt{dsm\_init} sobre un proceso ya inicializado no hace nada y devuelve \texttt{DSM\_OK}.
+
+Cada paso de la inicialización tiene una ruta de limpieza inversa. Si el descubrimiento falla después de crear el listener, la función apaga el ciclo, detiene despachadores y workers, restaura la señal, libera la memoria y cierra el listener antes de liberar el contexto. Esa precaución evita que un hilo de servicio siga leyendo una configuración ya liberada. Cuando la función devuelve un error, el subsistema queda sin inicializar y \texttt{dsm\_is\_initialized} devuelve \texttt{false}.
+
+\texttt{dsm\_finalize} detiene el ciclo de ejecución, cierra el socket y el hilo de descubrimiento, anuncia \texttt{LEAVE} a los pares, detiene los latidos, los despachadores y los workers, cierra el listener y las conexiones, restaura el manejador de \texttt{SIGSEGV} anterior, desmapea la memoria y destruye los módulos. Después de una finalización exitosa, el proceso puede volver a llamar a \texttt{dsm\_init}. Si el subsistema no estaba inicializado, la función devuelve \texttt{DSM\_ERR\_NOT\_INIT} sin modificar nada.
+
+\subsection{Hilos y acceso a la vista}
+
+\texttt{dsm\_thread\_attach} asigna al hilo una pila alternativa de 64 KiB con \texttt{mmap} y la instala con \texttt{sigaltstack}. El manejador de \texttt{SIGSEGV} se ejecuta sobre esa pila, porque la pila normal puede estar en el punto exacto del acceso que produjo el fallo y no ofrece espacio para atender la señal. La función guarda en una variable TLS si el hilo ya estaba vinculado; una segunda llamada no hace nada y devuelve \texttt{DSM\_OK}. Si la reserva o la instalación fallan, devuelve \texttt{DSM\_ERR\_MEM}.
+
+La vista se mapea con \texttt{PROT\_NONE} en \texttt{BASE\_ADDR} y se protege página por página con \texttt{mprotect}. Una página en estado \texttt{I} no tiene permisos, una en \texttt{S} permite lectura y una en \texttt{M} permite lectura y escritura. El acceso indebido produce un \texttt{SIGSEGV} con \texttt{SA\_SIGINFO}; el manejador obtiene la dirección de \texttt{siginfo\_t.si\_addr}, calcula la página, deduce el tipo de acceso del bit de error y encola una ranura en una cola de 4096 entradas. El hilo queda dormido en un \texttt{futex} hasta que un despachador resuelve la transición y marca la ranura como terminada.
+
+Un hilo que toca la vista sin haber llamado a \texttt{dsm\_thread\_attach} ejecuta el manejador sobre la pila normal, y el sistema puede terminar el proceso o dejar el fallo sin resolver. La vinculación no es opcional para los hilos de aplicación, para los hilos de una biblioteca que reciban punteros de la vista ni para el hilo principal. Los workers de la biblioteca se vinculan por su cuenta antes de ejecutar un kernel distribuido, y se desvinculan al salir.
+
+\texttt{dsm\_thread\_detach} desactiva la pila alternativa con \texttt{SS\_DISABLE} y libera su memoria. Si el hilo no estaba vinculado, no hace nada y devuelve \texttt{DSM\_OK}. La llamada debe ocurrir antes de que el hilo termine; un hilo que sale sin desvincularse deja la pila reservada hasta que el proceso termina.
+
+\subsection{Reserva y liberación de memoria}
+
+\texttt{dsm\_alloc} redondea el tamaño a páginas completas y devuelve la dirección base de un bloque contiguo dentro de la vista. El mapa global lo mantiene el coordinador, el nodo vivo de menor ranura que aporta memoria. El coordinador busca primero en los huecos que dejaron las liberaciones, en orden de primera página y con fusión de rangos contiguos, y solo después avanza la marca de agua. Un nodo que no coordina envía \texttt{ALLOC\_REQ} y recibe el rango en \texttt{ALLOC\_RESP}; si la respuesta señala otra ranura de coordinador, reintenta una vez contra ella. Al asumir la coordinación, el nodo sincroniza el mapa con los pares vivos mediante \texttt{ALLOC\_SYNC} y \texttt{ALLOC\_STATE}, y rechaza la reserva con \texttt{DSM\_ERR\_BUSY} si no puede reconstruirlo.
+
+Cada página del bloque queda anotada con el PID del proceso y con su índice dentro del bloque. Esos metadatos alimentan \texttt{dsm\_pages\_global} y los reportes HTML, y no cambian la dirección ni el contenido. La reserva ocupa una entrada en una tabla de bloques vivos de capacidad acotada; si la tabla se llena, la llamada devuelve \texttt{DSM\_ERR\_NO\_SPACE} aunque queden páginas libres en la vista.
+
+La dirección devuelta está alineada a página y pertenece a la vista local, de modo que el puntero se puede usar directamente con aritmética de bytes. Un bloque de 8192 bytes ocupa dos páginas contiguas y la segunda página empieza en la dirección base más 4096. Un bloque nuevo se lee como ceros, porque la primera página que se toca se pide al custodio y este entrega un marco vacío; después de una liberación, \texttt{dsm\_free} deja las páginas en cero antes de devolverlas al mapa. Para compartir el bloque, el proceso creador envía a los demás la dirección que recibió; cada uno la usa dentro de su propia vista, sin volver a llamar a \texttt{dsm\_alloc}. Dos reservas simultáneas en nodos distintos reciben rangos diferentes porque el coordinador serializa las peticiones y avanza el mapa una sola vez por concesión.
+
+\texttt{dsm\_free} valida que el puntero sea la dirección base de un bloque vivo, que esté alineado a página y que el tamaño redondeado coincida con el de la reserva. En éxito, cada página se retira del protocolo de coherencia, se deja en ceros, se marca con \texttt{PROT\_NONE} y estado \texttt{I}, y el rango vuelve al mapa global. La limpieza garantiza que una reserva posterior no observe el contenido anterior. Si el coordinador no confirma la devolución, el bloque sigue vivo y la función devuelve \texttt{DSM\_ERR\_NET} para que la operación pueda reintentarse.
+
+\texttt{dsm\_sync} recorre la tabla local y persiste las páginas en estado \texttt{M}. Si el nodo es el home de la página, copia el contenido al marco de respaldo; si no lo es, envía \texttt{WRITEBACK} al home y espera su confirmación. Las páginas en \texttt{S} y en \texttt{I} no se tocan. La función devuelve el primer fallo de persistencia que encuentra, de modo que un respaldo incompleto no se reporta como éxito. Un \texttt{dsm\_sync} sin páginas modificadas devuelve \texttt{DSM\_OK} sin tráfico.
+
+\subsection{Sincronización}
+
+\texttt{dsm\_lock} adquiere un cerrojo distribuido identificado por un entero. El custodio se calcula de forma determinista con el anillo de dispersión, así que todos los nodos coinciden sin un servidor central. Si el custodio es el nodo local y el cerrojo está libre, la concesión es inmediata y sin red; si está ocupado, el solicitante entra en la cola FIFO del custodio y espera con \texttt{sem\_timedwait} durante \texttt{LOCK\_TIMEOUT\_MS}, 10 000 ms por defecto. La propiedad se registra por hilo: solo el hilo que tomó el cerrojo puede liberarlo, y dos hilos del mismo proceso quedan serializados igual que dos nodos distintos.
+
+\texttt{dsm\_unlock} libera el cerrojo que el hilo llamador posee. Si el custodio es local, la concesión pasa al siguiente de la cola o el cerrojo queda libre; si es remoto, se envía \texttt{LOCK\_REL}. Un hilo que no posee el cerrojo recibe \texttt{DSM\_ERR\_INVALID}. Cuando el custodio cae, los supervivientes migran la propiedad y la cola al nuevo custodio con \texttt{LOCK\_MIGRATE} y \texttt{LOCK\_STATE}; una concesión de una época anterior se descarta.
+
+\texttt{dsm\_barrier} implementa una barrera de \texttt{n} participantes. El custodio se calcula con el anillo sobre un dominio distinto al de los cerrojos, cuenta los arribos y difunde \texttt{BARRIER\_GO} cuando alcanza el umbral. Cada ronda usa una generación, de modo que un aviso atrasado o duplicado no libera una ronda futura. Los participantes esperan con \texttt{sem\_timedwait} durante \texttt{LOCK\_TIMEOUT\_MS}; si el umbral no se completa, la llamada devuelve \texttt{DSM\_ERR\_TIMEOUT}. Un participante que anuncia un \texttt{n} distinto del fijado por el custodio recibe \texttt{NACK} con \texttt{DSM\_ST\_INVALID}.
+
+El cerrojo y la barrera no sustituyen a la coherencia. Sirven para ordenar secciones críticas de la aplicación o para separar fases de un cálculo distribuido, y su costo es una ida y vuelta al custodio cuando el recurso no es local. La coherencia de las páginas sigue funcionando sin ellos, porque cada acceso a la vista se resuelve por el camino MSI.
+
+\subsection{Ejecución distribuida}
+
+\texttt{dsm\_dist\_register} asocia un \texttt{kernel\_id} con una función y un argumento opaco. El registro es local al proceso y no se propaga al clúster; un trabajador solo ejecuta kernels que estén compilados en su binario o registrados por su aplicación después de \texttt{dsm\_init}. Registrar un identificador existente reemplaza la función y el argumento. La tabla admite 32 ranuras de kernel, una de ellas ocupada por el kernel de demostración, y devuelve \texttt{DSM\_ERR\_NO\_SPACE} cuando se agota.
+
+\texttt{dsm\_dist\_launch} valida las particiones, los trabajadores, el kernel y el \texttt{job\_id}, reserva una ranura de trabajo y reparte las particiones por turno entre los trabajadores. El lanzamiento no espera los resultados: devuelve \texttt{DSM\_OK} después de enviar las órdenes. \texttt{dsm\_dist\_collect} entrega los resultados no recogidos, en el orden en que llegaron, y admite una consulta no bloqueante con plazo cero. \texttt{dsm\_dist\_verify} espera a que el trabajo termine y compara el XOR de los CRC32 de las particiones con el valor esperado; una partición fallida aporta cero.
+
+Las particiones se describen con \texttt{dsm\_dist\_part\_t} y sus direcciones pertenecen a la vista compartida. Un trabajo admite hasta 4096 particiones, acotadas por \texttt{WAIT\_POOL\_ENTRIES}, y un proceso mantiene 16 trabajos activos. El kernel se ejecuta en un hilo worker del nodo destino, con la pila alternativa instalada y con los mismos permisos de página que un hilo de aplicación. El plazo del lanzamiento viaja en la orden, mientras que las esperas reales las fijan \texttt{collect} y \texttt{verify}.
+
+El contrato del kernel es pequeño y explícito. La función recibe el argumento opaco, el descriptor de la partición y una estructura de resultado que ya viene inicializada. Debe escribir \texttt{status} en cero cuando termina bien, \texttt{items} con la cantidad de elementos procesados y, si lo desea, un valor propio de diagnóstico en los campos restantes. El trabajador completa \texttt{slot}, \texttt{part\_id}, \texttt{us} y los contadores de fallos, y calcula el CRC32 sobre el rango de salida si el estado es cero. La aplicación compara el XOR de esos CRC con el valor que obtuvo de una ejecución secuencial o de una suma conocida; el marco distribuido no conoce la semántica del kernel ni interpreta los elementos.
+
+\subsection{Diagnóstico y estadísticas}
+
+\texttt{dsm\_node\_id} escribe la ranura del nodo local en la membresía, en el intervalo $0 \ldots 255$. \texttt{dsm\_node\_count} cuenta las ranuras presentes cuyo estado no es \texttt{DEAD}, es decir, las que están \texttt{ALIVE} o \texttt{SUSPECT}, e incluye al nodo local; los clientes quedan fuera porque no aportan memoria. \texttt{dsm\_global\_size} suma las páginas aportadas por esos nodos y multiplica por el tamaño de página configurado.
+
+\texttt{dsm\_wait\_members} espera a que el clúster reúna una cantidad mínima de nodos vivos. La espera usa una condición de membresía que se señaliza al publicarse una ranura, al registrarse una unión, al recibirse un \texttt{JOIN\_ACK} o al procesarse una baja; no hay sondeo periódico. El plazo acota la espera total y, al vencer, devuelve \texttt{DSM\_ERR\_TIMEOUT}.
+
+\texttt{dsm\_stats} sobrescribe una estructura \texttt{dsm\_stats\_t} con una instantánea de los contadores acumulados desde \texttt{dsm\_init}. Los campos se agrupan por función: \texttt{read\_faults}, \texttt{write\_faults}, \texttt{faults\_serviced}, \texttt{fault\_latency\_us\_total}, \texttt{fault\_latency\_us\_avg}, \texttt{slots\_enqueued} y \texttt{slots\_woken} describen los fallos de página; \texttt{msgs\_sent}, \texttt{msgs\_recv}, \texttt{bytes\_sent}, \texttt{bytes\_recv} y \texttt{pending\_count} describen el tráfico; \texttt{invalidations}, \texttt{tseq\_discarded}, \texttt{pages\_m}, \texttt{pages\_s} y \texttt{pages\_i} describen la coherencia; \texttt{parity\_deltas}, \texttt{parity\_bytes}, \texttt{stripe\_rebuilds} y \texttt{parity\_latency\_us} describen la redundancia; \texttt{dist\_tasks\_run} y \texttt{dist\_tasks\_failed} describen la ejecución distribuida; \texttt{hb\_missed} cuenta las transiciones de membresía y \texttt{wait\_pool\_used} las entradas ocupadas del conjunto de espera. Los valores previos de la estructura se descartan.
+
+\texttt{dsm\_pages\_global} escribe una tabla de texto con las páginas materializadas del clúster. Cada fila incluye el identificador de página, el home calculado por el anillo, el proceso que reservó la página, el orden dentro del bloque, el copyset y la franja de paridad. La función consulta la tabla local y la de cada nodo remoto presente con \texttt{QUERY\_REQ} de tipo \texttt{DSM\_QUERY\_PAGES}; la consulta se hace por bloques de 4096 páginas para no reservar una entrada por página de la vista.
+
+\texttt{dsm\_html\_report} genera un archivo por nodo presente y un archivo global en el directorio indicado. El archivo de cada nodo describe sus páginas con el estado MSI, el home, el proceso que las reservó, el orden, el copyset y la franja; el global agrega las tablas de todos los nodos y lista a los clientes con su rol. El directorio se crea si no existe, y una ruta \texttt{NULL} o vacía usa \texttt{OUTPUT\_DIR}. \texttt{dsm\_strerror} devuelve la descripción de un código y \texttt{dsm\_debug\_dump\_fd} escribe una línea con la ranura, la época, la dirección base, el tamaño de la vista y la cantidad de nodos activos al descriptor indicado.
+
+Las tablas~\ref{tab:funciones-base} y~\ref{tab:funciones-dist} reúnen las firmas de la API con su propósito y los errores que cada llamada documenta. Los nombres de la última columna omiten el prefijo \texttt{DSM\_ERR\_}; por ejemplo, \texttt{INVALID} corresponde a \texttt{DSM\_ERR\_INVALID}. La columna de errores no es exhaustiva de las condiciones internas, sino de los códigos que la función puede devolver al llamador.
+
+{\scriptsize
+\begin{xltabular}{\linewidth}{l P{5.4cm} Y >{\RaggedRight\arraybackslash\hyphenpenalty=10000\exhyphenpenalty=10000}p{2.7cm}}
+\caption{Funciones de ciclo de vida, hilos, memoria y sincronización.}\label{tab:funciones-base}\\
+\toprule
+\textbf{Función} & \textbf{Firma} & \textbf{Propósito} & \textbf{Errores} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Función} & \textbf{Firma} & \textbf{Propósito} & \textbf{Errores} \\
+\midrule
+\endhead
+\texttt{dsm\_init} & \texttt{dsm\_status\_t dsm\_init(const char *conf\_path, uint64\_t node\_mem\_override)} & Carga la configuración, crea la vista y se une al clúster. & CONFIG, MEM, NET, PROTO, NO\_SPACE, INVALID \\
+\texttt{dsm\_finalize} & \texttt{dsm\_status\_t dsm\_finalize(void)} & Detiene los hilos, anuncia la salida y libera los recursos. & NOT\_INIT \\
+\texttt{dsm\_is\_initialized} & \texttt{bool dsm\_is\_initialized(void)} & Indica si existe un contexto DSM activo. & Ninguno \\
+\texttt{dsm\_thread\_attach} & \texttt{dsm\_status\_t dsm\_thread\_attach(void)} & Instala la pila alternativa de 64 KiB del hilo. & NOT\_INIT, MEM \\
+\texttt{dsm\_thread\_detach} & \texttt{dsm\_status\_t dsm\_thread\_detach(void)} & Desactiva y libera la pila alternativa. & NOT\_INIT \\
+\texttt{dsm\_alloc} & \texttt{dsm\_status\_t dsm\_alloc(uint64\_t size, void **out)} & Reserva un bloque contiguo en la vista global. & NOT\_INIT, INVALID, NO\_SPACE, BUSY, NET, PROTO \\
+\texttt{dsm\_free} & \texttt{dsm\_status\_t dsm\_free(void *ptr, uint64\_t size)} & Devuelve el bloque, lo limpia y lo deja inaccesible. & NOT\_INIT, INVALID, NO\_SPACE, BUSY, NET, PROTO \\
+\texttt{dsm\_sync} & \texttt{dsm\_status\_t dsm\_sync(void)} & Persiste las páginas locales en estado M. & NOT\_INIT, NET, TIMEOUT, MEM, BUSY \\
+\texttt{dsm\_lock} & \texttt{dsm\_status\_t dsm\_lock(uint32\_t lock\_id)} & Adquiere un cerrojo distribuido. & NOT\_INIT, INVALID, BUSY, NO\_SPACE, TIMEOUT, NET \\
+\texttt{dsm\_unlock} & \texttt{dsm\_status\_t dsm\_unlock(uint32\_t lock\_id)} & Libera el cerrojo que posee el hilo llamador. & NOT\_INIT, INVALID, NET \\
+\texttt{dsm\_barrier} & \texttt{dsm\_status\_t dsm\_barrier(uint32\_t barrier\_id, uint32\_t n)} & Espera a \texttt{n} participantes en una ronda. & NOT\_INIT, INVALID, NO\_SPACE, TIMEOUT, NET \\
+\bottomrule
+\end{xltabular}
+}
+
+{\scriptsize
+\begin{xltabular}{\linewidth}{l P{5.4cm} Y >{\RaggedRight\arraybackslash\hyphenpenalty=10000\exhyphenpenalty=10000}p{2.7cm}}
+\caption{Funciones de ejecución distribuida y diagnóstico.}\label{tab:funciones-dist}\\
+\toprule
+\textbf{Función} & \textbf{Firma} & \textbf{Propósito} & \textbf{Errores} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Función} & \textbf{Firma} & \textbf{Propósito} & \textbf{Errores} \\
+\midrule
+\endhead
+\texttt{dsm\_dist\_register} & \texttt{dsm\_status\_t dsm\_dist\_register(uint32\_t kernel\_id, dsm\_dist\_kernel\_fn fn, void *arg)} & Asocia un identificador con una función local. & NOT\_INIT, INVALID, NO\_SPACE \\
+\texttt{dsm\_dist\_launch} & \texttt{dsm\_status\_t dsm\_dist\_launch(uint32\_t job\_id, uint32\_t kernel\_id, const dsm\_dist\_part\_t *parts, uint32\_t nparts, const uint32\_t *workers, uint32\_t nworkers, uint32\_t timeout\_ms)} & Reparte las particiones y envía las órdenes sin esperar. & NOT\_INIT, INVALID, NO\_SPACE, NET \\
+\texttt{dsm\_dist\_collect} & \texttt{dsm\_status\_t dsm\_dist\_collect(uint32\_t job\_id, dsm\_dist\_result\_t *out, uint32\_t *n, uint32\_t timeout\_ms)} & Entrega los resultados aún no recogidos. & NOT\_INIT, INVALID, TIMEOUT, NET \\
+\texttt{dsm\_dist\_verify} & \texttt{dsm\_status\_t dsm\_dist\_verify(uint32\_t job\_id, uint64\_t expected\_crc32, bool *ok)} & Compara el XOR de los CRC con el valor esperado. & NOT\_INIT, INVALID, TIMEOUT, NET \\
+\texttt{dsm\_node\_id} & \texttt{dsm\_status\_t dsm\_node\_id(uint32\_t *out)} & Escribe la ranura del nodo local. & NOT\_INIT, INVALID \\
+\texttt{dsm\_node\_count} & \texttt{dsm\_status\_t dsm\_node\_count(uint32\_t *out)} & Cuenta los nodos vivos que aportan memoria. & NOT\_INIT, INVALID \\
+\texttt{dsm\_wait\_members} & \texttt{dsm\_status\_t dsm\_wait\_members(uint32\_t min\_nodes, uint32\_t timeout\_ms)} & Espera a reunir el mínimo de nodos vivos. & NOT\_INIT, TIMEOUT \\
+\texttt{dsm\_global\_size} & \texttt{dsm\_status\_t dsm\_global\_size(uint64\_t *out)} & Suma la memoria aportada por los nodos vivos. & NOT\_INIT, INVALID \\
+\texttt{dsm\_stats} & \texttt{dsm\_status\_t dsm\_stats(dsm\_stats\_t *out)} & Copia la instantánea de contadores del nodo. & NOT\_INIT, INVALID \\
+\texttt{dsm\_pages\_global} & \texttt{dsm\_status\_t dsm\_pages\_global(uint32\_t first, uint32\_t max, char *out, size\_t cap)} & Arma la tabla de páginas del clúster. & NOT\_INIT, INVALID, NO\_SPACE, NET, PROTO \\
+\texttt{dsm\_html\_report} & \texttt{dsm\_status\_t dsm\_html\_report(const char *out\_dir)} & Genera el reporte global y uno por nodo. & NOT\_INIT, INVALID, NO\_SPACE, NET, PROTO \\
+\texttt{dsm\_strerror} & \texttt{const char *dsm\_strerror(dsm\_status\_t st)} & Traduce un código a una cadena estática. & Ninguno \\
+\texttt{dsm\_debug\_dump\_fd} & \texttt{dsm\_status\_t dsm\_debug\_dump\_fd(int fd)} & Vuelca el estado del nodo al descriptor. & NOT\_INIT \\
+\bottomrule
+\end{xltabular}
+}
+
+\subsection{Códigos de error}
+
+La tabla~\ref{tab:errores-api} enumera los códigos de \texttt{dsm\_status\_t}. Los valores negativos son errores y el cero es éxito. Algunos códigos se usan de forma interna y no llegan a la aplicación; la columna de funciones indica las llamadas públicas que los documentan.
+
+\begin{table}[H]
+\centering
+\footnotesize
+\begin{tabularx}{\linewidth}{l r Y >{\RaggedRight\arraybackslash\hyphenpenalty=10000\exhyphenpenalty=10000}p{3.4cm}}
+\toprule
+\textbf{Código} & \textbf{Valor} & \textbf{Significado} & \textbf{Origen típico} \\
+\midrule
+\texttt{DSM\_OK} & 0 & Operación completada. & Todas \\
+\texttt{DSM\_ERR\_CONFIG} & $-1$ & Archivo ausente, no regular, mayor a 1 MiB, valor inválido, configuración compartida distinta o redundancia sin tres nodos. & \texttt{dsm\_init} \\
+\texttt{DSM\_ERR\_NOT\_INIT} & $-2$ & No existe contexto DSM activo en el proceso. & Todas salvo \texttt{dsm\_init} \\
+\texttt{DSM\_ERR\_MEM} & $-3$ & Fallo de memoria, de hilos, de semáforos, de \texttt{memfd} o de instalación de la señal. & \texttt{dsm\_init}, \texttt{dsm\_thread\_attach} \\
+\texttt{DSM\_ERR\_NET} & $-4$ & Sin puerto libre, conexión rechazada o socket caído. & \texttt{dsm\_init}, memoria, sincronización y distribución \\
+\texttt{DSM\_ERR\_TIMEOUT} & $-5$ & Venció un plazo de solicitud, cerrojo, barrera o verificación. & \texttt{dsm\_lock}, \texttt{dsm\_barrier}, \texttt{dsm\_dist\_collect}, \texttt{dsm\_dist\_verify} \\
+\texttt{DSM\_ERR\_NO\_SPACE} & $-6$ & Sin páginas, ranuras, entradas de trabajo o capacidad de tabla. & \texttt{dsm\_alloc}, \texttt{dsm\_dist\_launch}, reportes \\
+\texttt{DSM\_ERR\_INVALID} & $-7$ & Puntero nulo, tamaño cero, índice fuera de rango, cerrojo no poseído o kernel no registrado. & Validaciones de la API \\
+\texttt{DSM\_ERR\_NODE\_DOWN} & $-8$ & La ranura destino no pertenece a la membresía activa. & Uso interno \\
+\texttt{DSM\_ERR\_BUSY} & $-9$ & Página con una transición en curso o coordinador sin mapa reconstruido. & \texttt{dsm\_alloc}, \texttt{dsm\_free}, \texttt{dsm\_lock} \\
+\texttt{DSM\_ERR\_PROTO} & $-10$ & Cabecera inválida, versión incompatible, tipo inesperado o CRC32 incorrecto. & \texttt{dsm\_init}, \texttt{dsm\_alloc}, \texttt{dsm\_free} \\
+\texttt{DSM\_ERR\_INTR} & $-11$ & Llamada interrumpida por una señal. & Sin uso público \\
+\texttt{DSM\_ERR\_AGAIN} & $-12$ & Recurso no disponible de inmediato; la operación puede reintentarse. & Sin uso público \\
+\texttt{DSM\_ERR\_NOT\_FOUND} & $-13$ & Sin pares durante el descubrimiento. & Consumido por \texttt{dsm\_init} \\
+\bottomrule
+\end{tabularx}
+\caption{Códigos de estado de la API y las llamadas que los documentan.}
+\label{tab:errores-api}
+\end{table}
+
+El manejo de errores distingue condiciones transitorias de condiciones terminales. \texttt{DSM\_ERR\_TIMEOUT}, \texttt{DSM\_ERR\_NET} y \texttt{DSM\_ERR\_BUSY} describen una operación que puede reintentarse cuando el enlace o el recurso vuelve a estar disponible; \texttt{DSM\_ERR\_INVALID}, \texttt{DSM\_ERR\_NO\_SPACE} y \texttt{DSM\_ERR\_CONFIG} describen una solicitud que no cambia de resultado con un reintento y requiere corregir el programa o la configuración. \texttt{DSM\_ERR\_NOT\_INIT} aparece cuando una llamada se ejecuta fuera del intervalo entre \texttt{dsm\_init} y \texttt{dsm\_finalize}, y \texttt{DSM\_ERR\_PROTO} señala una respuesta que no cumple el formato y que el llamador no debe interpretar.
+
+Una aplicación típica comprueba el estado después de cada llamada, traduce el código con \texttt{dsm\_strerror} y decide si continúa o abandona. Las funciones no modifican sus parámetros de salida cuando devuelven error, así que un puntero reservado conserva su valor anterior y no se debe liberar dos veces. \texttt{dsm\_finalize} se llama una sola vez al final del camino, incluso si alguna operación intermedia falló, porque la función tolera un subsistema ya detenido y devuelve \texttt{DSM\_ERR\_NOT\_INIT} sin efectos adicionales.
+
+\subsection{Ejemplo mínimo de aplicación}
+
+El programa de la lista~\ref{lst:api-ejemplo} inicializa el subsistema, reserva dos páginas, escribe un patrón, toma un cerrojo distribuido, persiste el contenido y consulta el estado del clúster. El ejemplo supone que existe al menos un nodo en marcha; un cliente sin nodos falla en \texttt{dsm\_init}. La compilación incluye \texttt{dsm.h} y enlaza la biblioteca del proyecto. La reserva de 8192 bytes ocupa dos páginas de 4096. La escritura de \texttt{v[0]} y \texttt{v[2047]} toca ambas páginas aunque estén separadas por 8 KiB, porque cada página se resuelve de forma independiente. El cerrojo con identificador 1 se concede sin red si el custodio es el nodo local y, si es remoto, viaja al nodo que el anillo asigna. \texttt{dsm\_sync} persiste la página modificada antes de que la aplicación consulte el estado y libere el bloque.
+
+\begin{lstlisting}[language=C, caption={Aplicación mínima sobre la API pública.}, label={lst:api-ejemplo}]
+#include "dsm.h"
+#include <stdio.h>
+
+int main(void)
+{
+    dsm_status_t st = dsm_init(NULL, 0);
+    if (st != DSM_OK) {
+        fprintf(stderr, "dsm_init: %s\n", dsm_strerror(st));
+        return 1;
+    }
+    if (dsm_thread_attach() != DSM_OK) {
+        dsm_finalize();
+        return 1;
+    }
+    void *buf = NULL;
+    st = dsm_alloc(8192, &buf);
+    if (st != DSM_OK) {
+        fprintf(stderr, "dsm_alloc: %s\n", dsm_strerror(st));
+        goto salida;
+    }
+    int *v = (int *)buf;
+    for (int i = 0; i < 2048; i++) {
+        v[i] = i;                 /* el fallo de página lo resuelve DSM */
+    }
+    if (dsm_lock(1) == DSM_OK) {
+        v[0] = 42;
+        dsm_unlock(1);
+    }
+    dsm_sync();
+    uint32_t self = 0, nodos = 0; uint64_t total = 0;
+    dsm_stats_t stats;
+    dsm_node_id(&self);
+    dsm_node_count(&nodos);
+    dsm_global_size(&total);
+    dsm_stats(&stats);
+    printf("nodo %u de %u, %llu bytes, %llu fallos de lectura\n",
+           self, nodos, (unsigned long long)total,
+           (unsigned long long)stats.read_faults);
+    dsm_free(buf, 8192);
+salida:
+    dsm_thread_detach();
+    dsm_finalize();
+    return st == DSM_OK ? 0 : 1;
+}
+\end{lstlisting}

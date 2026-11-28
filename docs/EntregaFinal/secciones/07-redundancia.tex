@@ -1,0 +1,187 @@
+\section{Tolerancia a fallos y redundancia}\label{sec:redundancia}
+
+La tolerancia a fallos descansa en dos mecanismos que operan en escalas distintas. La membresía detecta que un nodo dejó de responder, retira su ranura y obliga a recalcular los custodios; la paridad por franjas permite recuperar el contenido de una página cuando el nodo que la custodiaba ya no está. Ninguno de los dos sustituye al otro: la detección sin paridad reasigna páginas que nadie conserva, y la paridad sin detección no sabe cuándo debe reconstruir. El sistema los encadena en un mismo worker de recuperación, con el anillo ya actualizado y la membresía cerrada antes de tocar una franja.
+
+\subsection{Modelo de fallos}
+
+El modelo es de parada franca a granularidad de nodo. Un proceso que muere, que pierde la conectividad o que abandona el clúster deja de responder a los latidos y se declara muerto; el sistema no intenta distinguir una caída de una partición de red, porque en ambos casos la consecuencia práctica es la misma: la ranura deja de estar disponible y sus páginas pierden su custodio. La salida ordenada con \texttt{LEAVE} recorre el mismo camino de reasignación que una caída, con la diferencia de que el nodo avisa antes de irse. El modelo no cubre corrupción silenciosa en un nodo vivo, respuestas maliciosas ni la pérdida simultánea de dos piezas de la misma franja.
+
+El dominio de fallo es el nodo, no la página, y el efecto de una caída depende de la colocación. Una página tiene un custodio calculado por el anillo, puede tener copias en otros nodos y pertenece a una franja con una página de paridad. La pérdida de un nodo elimina su custodia, sus copias locales y, si era el custodio de paridad de una franja, el marco de paridad de esa franja. La reasignación recupera la custodia a partir de una copia viva; la reconstrucción recupera el contenido a partir de la paridad y de las piezas supervivientes. Cuando ambas fuentes faltan para la misma página, la página queda inválida y el sistema no publica una versión anterior como si fuera vigente.
+
+La durabilidad tiene una frontera explícita en \texttt{dsm\_sync}, donde la paridad se calcula sobre la versión persistida de cada página, de modo que una escritura que permanece en estado \texttt{M} y todavía no se sincronizó no está reflejada en el marco de paridad. Si el dueño de esa escritura cae antes de una sincronización, la reconstrucción puede recuperar la versión anterior, que es la última que llegó al respaldo. La ventana es la misma que existe sin redundancia, y la diferencia es que con paridad el contenido anterior sigue siendo recuperable en lugar de perderse por completo.
+
+La recuperación es local al conocimiento de cada nodo. \texttt{home\_map} guarda el último custodio calculado para cada página, y la reasignación actúa sobre las páginas cuyo último custodio conocido es la ranura caída. Un nodo que nunca resolvió el custodio de una página no tiene una entrada que corregir y no participa de esa reasignación; el nuevo custodio puede recuperar el contenido bajo demanda cuando recibe una solicitud, consultando a los pares que todavía lo conservan. Esa división evita un coordinador global de recuperación y permite que varios nodos trabajen en paralelo sobre páginas distintas, a costa de que la recuperación no sea una operación única y centralizada.
+
+\subsection{Detección de caída y reconfiguración}
+
+El hilo de latidos recorre la tabla de membresía cada \texttt{HB\_INTERVAL\_MS}, 500 ms por defecto, y envía un \texttt{HEARTBEAT} con la incarnation del emisor y sus páginas libres. \texttt{membership\_evaluate} degrada un nodo a \texttt{SUSPECT} tras \texttt{HB\_SUSPECT} latidos perdidos, tres por defecto, y a \texttt{DEAD} tras \texttt{HB\_DEAD}, seis por defecto, lo que sitúa la detección alrededor de tres segundos. El contador \texttt{hb\_missed} suma una vez por transición y no por cada intervalo de retraso, de modo que una caída breve no infla la estadística con docenas de fallos. \texttt{SUSPECT} conserva la ranura y el anillo; \texttt{DEAD} retira el bit de presencia, libera la ranura y difunde \texttt{NODE\_DOWN} a los miembros vivos.
+
+El detector no ejecuta la recuperación, porque el hilo de latidos solo actualiza la membresía y encola un mensaje sintético \texttt{NODE\_DOWN} en la cola de trabajadores. La recuperación recorre páginas y hace RPC por cada una, de modo que no puede correr en el listener, que es el único que completa las respuestas, ni en el hilo de latidos, cuyo retraso declararía muertos a los demás nodos. El trabajador que atiende el mensaje ejecuta \texttt{msi\_on\_node\_down}, después \texttt{sync\_on\_node\_down} y, si la redundancia está activa, \texttt{raid\_on\_node\_down}. El orden importa: la membresía ya está cerrada, el anillo se reconstruye con los nodos vivos y la reconstrucción de paridad consulta la membresía antes de tomar el mutex de la franja. La figura~\ref{fig:flujo-caida} ordena la secuencia completa, desde el silencio del custodio hasta la franja reconstruida.
+
+El anillo se reconstruye por demanda y no por una orden explícita. \texttt{ring\_home\_of} compara la firma de la membresía con la que se usó para construir el arreglo y, si cambió, toma el \texttt{rwlock} de escritura y vuelve a proyectar los vnodes. La firma incluye época, ranura, páginas aportadas, estado y UUID de cada nodo vivo, así que una baja, un cambio de memoria o un cambio de estado invalidan el anillo aunque la época no se haya incrementado. Los clientes quedan fuera del anillo porque no aportan páginas y no pueden custodiar; su alta o baja no desplaza el custodio de ninguna página.
+
+Los cerrojos usan una época propia, distinta de la época de membresía. \texttt{sync\_on\_node\_down} deriva la época nueva del máximo entre la membresía y la última migración conocida, y difunde \texttt{LOCK\_MIGRATE} con la ranura caída. Dos detectores distintos pueden anunciar la misma baja con el mismo número, y el mapa de ranuras muertas evita que el segundo aviso se descarte como duplicado. Una concesión emitida por el custodio anterior con una época menor se descarta en \texttt{sync\_epoch\_stale}, de modo que el estado reconstruido por el nuevo custodio no retrocede. El mismo mecanismo de época protege las respuestas de página que llegan después de una reconfiguración.
+
+El factor $K$ se recalcula solo mientras la paridad no tiene contenido. \texttt{raid\_reconfigure} cambia el número de datos por franja cuando la membresía viva cambia, pero solo si ninguna franja tiene versión distinta de cero, marco de paridad reservado o estado distinto de \texttt{ACTIVE}. Una vez que la paridad se escribe, las franjas conservan el $K$ con el que se formaron y un nodo nuevo no las redistribuye; el alta o la baja cambian los custodios y la paridad se reconstruye con el mismo tamaño de franja.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.78, every node/.style={transform shape},
+    >={Latex},
+    actor/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\scriptsize, minimum width=3.9cm, minimum height=0.9cm},
+    dead/.style={draw=red!60!black, fill=red!8, thick, rounded corners, align=center, font=\scriptsize, minimum width=3.9cm, minimum height=0.9cm},
+    work/.style={draw=bordergreen, fill=softgreen, thick, rounded corners, align=center, font=\scriptsize, minimum width=3.9cm, minimum height=0.9cm},
+    store/.style={draw=borderorange, fill=softorange, thick, rounded corners, align=center, font=\scriptsize, minimum width=3.9cm, minimum height=0.9cm},
+    flow/.style={->, thick, draw=black!65, font=\scriptsize, align=center}
+]
+
+\node[dead] (down) at (0, 0) {Custodio cae\\o pierde la red};
+\node[actor] (hb) at (4.9, 0) {Latidos\\\texttt{SUSPECT} y \texttt{DEAD}};
+\node[actor] (msg) at (9.8, 0) {\texttt{NODE\_DOWN}\\al worker};
+\node[work] (re) at (14.7, 0) {Reasignación MSI\\nuevo \texttt{home}};
+
+\node[work] (lock) at (14.7, -3.0) {Migración de\\cerrojos};
+\node[store] (deg) at (9.8, -3.0) {Franjas\\\texttt{DEGRADED}};
+\node[store] (xor) at (4.9, -3.0) {XOR y traslado\\al nuevo home};
+\node[work] (ok) at (0, -3.0) {\texttt{ACTIVE}\\y página servible};
+
+\draw[flow] (down) -- node[above, font=\tiny] {sin red} (hb);
+\draw[flow] (hb) -- node[above, font=\tiny] {$\approx$3 s} (msg);
+\draw[flow] (msg) -- (re);
+\draw[flow] (re) -- node[right, font=\tiny] {baja} (lock);
+\draw[flow] (lock) -- node[above, font=\tiny] {franja} (deg);
+\draw[flow] (deg) -- node[above, font=\tiny] {XOR} (xor);
+\draw[flow] (xor) -- node[above, font=\tiny] {ack} (ok);
+
+\end{tikzpicture}
+\caption{Flujo de una caída: detección por latidos, recuperación en un worker, migración de cerrojos y reconstrucción de las franjas afectadas.}
+\label{fig:flujo-caida}
+\end{figure}
+
+\subsection{Reasignación del custodio}
+
+\texttt{msi\_on\_node\_down} empieza por retirar la ranura caída de todos los copyset del directorio, no solo de las páginas cuyo custodio era ese nodo. Una copia que figura en el copyset pero ya no puede responder haría que la próxima concesión de escritura esperara un acuse que nunca llega, de modo que la limpieza es global y ocurre antes de cualquier otra decisión. Después recorre las páginas cuyo \texttt{home\_known} coincide con la ranura caída, calcula el nuevo custodio con \texttt{ring\_home\_of} y descarta el caso en que el anillo devuelva la misma ranura o una ranura inválida.
+
+La búsqueda de contenido sigue un orden fijo que empieza por la vista local en estado \texttt{S} o \texttt{M} y por el marco de respaldo del propio nodo, porque una copia cacheada no siempre figura en el copyset del directorio. Si no hay contenido local, se recorre el copyset y se envía \texttt{PAGE\_REQUEST} con las banderas \texttt{PROBE} y \texttt{WANT\_DATA} a cada miembro vivo distinto del caído y del propio nodo. La sonda la atiende \texttt{home\_handle\_probe}, que entrega lo que todavía conserva y suelta la página si ya no es el custodio. El primer par que responde con una página completa se convierte en la fuente.
+
+Si el nuevo custodio es el propio nodo, el contenido se guarda en el marco de respaldo, se instala en la vista con \texttt{PROT\_READ} y la página queda en \texttt{S}. Si el nuevo custodio es otro, se envía \texttt{PAGE\_MOVE} con la página completa y la secuencia del custodio anterior, y se espera \texttt{PAGE\_MOVE\_ACK}; el receptor siembra su contador de secuencia con el valor recibido, de modo que sus respuestas superen el \texttt{tseq\_seen} que los demás ya registraron. En ambos casos se incrementa la versión del directorio, se guarda el nuevo custodio en \texttt{home\_map} y la entrada queda en \texttt{SHARED} con el nuevo custodio y, si corresponde, el nodo que ejecutó la recuperación en el copyset.
+
+Una transferencia fallida no destruye la copia local: si el nuevo custodio no responde o rechaza la página, la recuperación conserva el contenido en el nodo que lo tenía y lo registra; esa copia sigue siendo la única fuente y el nuevo custodio la recuperará con una sonda cuando la necesite. Cuando no se encontró ninguna copia, la entrada queda en \texttt{UNCACHED}, sin dueño y con el copyset vacío, la copia local se invalida y el marco de respaldo se libera. Esa decisión evita publicar una versión antigua como si fuera la vigente, y deja la pérdida visible en el estado del directorio y en el registro.
+
+La reasignación no es un barrido único del clúster. Cada nodo actúa sobre su propio \texttt{home\_map}, de modo que dos nodos que conocían la misma página pueden intentar el traspaso al mismo nuevo custodio; la instalación repetida del mismo contenido es inocua y el sembrado de secuencia conserva el orden. Lo que la reasignación no hace es inventar contenido: si ninguna copia sobrevive y la página no estaba en la paridad persistida, el custodio sirve ceros cuando recibe una solicitud y el sistema no distingue entre una página que nunca se escribió y una cuyo contenido se perdió. La diferencia queda en el estado \texttt{UNCACHED} y en el registro de la recuperación, no en el valor leído.
+
+\subsection{Franjas, factor K y dispersión}
+
+Con \texttt{REDUNDANCY=true}, la vista se divide en franjas de $K$ páginas de datos consecutivas y una página de paridad. La página $j$ de la franja $i$ es $D_{i,j}$ y la paridad se calcula como
+\begin{equation}
+P_i = D_{i,1} \oplus D_{i,2} \oplus \dots \oplus D_{i,K}.
+\end{equation}
+El número de franjas es $\lceil N_{\text{páginas}} / K \rceil$, y la última franja puede tener menos de $K$ datos válidos. La tabla de franjas se reserva completa al arrancar, porque su tamaño depende del tamaño de la vista y de $K$, pero los marcos de paridad se reservan bajo demanda. La figura~\ref{fig:franja-paridad} muestra la composición de una franja y su colocación en tres ranuras para $K=2$.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.86, every node/.style={transform shape},
+    >={Latex},
+    data/.style={draw=borderblue, fill=softblue, thick, rounded corners, align=center, font=\small, minimum width=1.7cm, minimum height=0.8cm},
+    par/.style={draw=borderorange, fill=softorange, thick, rounded corners, align=center, font=\small, minimum width=1.7cm, minimum height=0.8cm},
+    slot/.style={draw=bordergreen, fill=softgreen, thick, rounded corners, align=left, font=\footnotesize, minimum width=4.4cm, minimum height=0.75cm},
+    lab/.style={font=\scriptsize, text=black!70},
+    xor/.style={->, thick, draw=black!60}
+]
+
+% Franja: datos y paridad en columna
+\node[data] (d1) at (0, 0) {$D_1$};
+\node[data] (d2) at (0, -0.85) {$D_2$};
+\node[data] (d3) at (0, -1.7) {$D_3$};
+\node[lab]  (dots) at (0, -2.3) {$\vdots$};
+\node[data] (dk) at (0, -2.95) {$D_K$};
+\node[par]  (p)  at (0, -4.05) {$P$};
+
+\draw[xor] (d1.east) -- (1.55, 0);
+\draw[xor] (d2.east) -- (1.55, -0.85);
+\draw[xor] (d3.east) -- (1.55, -1.7);
+\draw[xor] (dk.east) -- (1.55, -2.95);
+\draw[xor] (1.55, 0) -- (1.55, -4.05) -- (p.east);
+\node[lab] at (1.85, -2.0) {$\oplus$};
+\node[lab, below=0.5cm of p] {$P = D_1 \oplus \dots \oplus D_K$};
+
+% Colocación
+\node[lab] at (7.6, 0.35) {Colocación con $K=2$ y tres nodos};
+\node[slot] (s0) at (7.6, -0.5) {Ranura 0 \quad $D_1$};
+\node[slot] (s1) at (7.6, -1.55) {Ranura 1 \quad $D_2$};
+\node[slot] (s2) at (7.6, -2.6) {Ranura 2 \quad $P$};
+\node[lab, text width=4.6cm, align=center] at (7.6, -3.85) {La paridad nunca comparte ranura con un dato de su franja; los datos pueden compartirla entre sí.};
+
+\end{tikzpicture}
+\caption{Franja de $K$ páginas de datos y una de paridad, y su colocación en tres ranuras para $K=2$.}
+\label{fig:franja-paridad}
+\end{figure}
+
+El valor de $K$ no se configura sino que se deriva de la membresía viva como $K = N_{\text{vivos}} - 1$, acotado a $[2,8]$, y queda fijado al formar la paridad. Con tres nodos vivos $K$ vale 2; con cinco vale 4; con nueve o más se queda en 8. Un cliente no cuenta como nodo vivo para este cálculo ni entra en el anillo, porque no aporta páginas que custodiar. La unión con \texttt{REDUNDANCY=true} exige al menos tres nodos vivos que aporten memoria y espera hasta treinta segundos a que aparezcan; si no los reúne, el nodo no se une y \texttt{dsm\_init} falla con \texttt{DSM\_ERR\_CONFIG}.
+
+El custodio de la paridad se elige como la primera ranura viva que no sea custodio de ninguna de las $K$ páginas de datos de la franja. \texttt{raid\_stripe\_refresh} recalcula los custodios de datos con \texttt{ring\_home\_of} y recorre las ranuras en orden ascendente hasta encontrar una libre para la paridad. Esa condición garantiza que la pérdida de un nodo no destruya a la vez un dato y la paridad de la misma franja, y es la única garantía de colocación que el sistema ofrece: no reparte los datos para que cada uno viva en una ranura distinta. Dos páginas de datos de una franja pueden compartir custodio si el anillo las concentra, y en ese caso la pérdida de ese nodo elimina dos incógnitas y la reconstrucción no alcanza.
+
+
+\subsection{Paridad y actualizaciones por delta}
+
+La paridad no se recalcula completa en cada almacenamiento. Cuando una página se persiste, el emisor conserva la versión anterior del respaldo y calcula el delta contra la nueva:
+\begin{equation}
+\Delta = D_{\text{previa}} \oplus D_{\text{nueva}}, \qquad P' = P \oplus \Delta.
+\end{equation}
+El delta tiene el tamaño de una página y viaja en \texttt{PARITY\_DELTA} con el identificador de franja; el custodio de la paridad lo aplica sobre su marco y responde \texttt{PARITY\_ACK} con la versión resultante. Aplicar un delta cuesta una XOR por byte, muy por debajo de releer las $K$ páginas de la franja para recalcular la paridad completa, y esa es la razón por la que la actualización sigue el camino incremental.
+
+Cada franja mantiene una versión en su tabla de tiempo de ejecución. El emisor la incrementa bajo el mutex de la franja antes de enviar y espera que el receptor confirme la versión siguiente. El receptor comprueba que el marco sea utilizable, es decir, que tenga paridad válida, que esté en estado de instalación o que su versión sea cero, y que la versión recibida sea exactamente la vigente más uno. Si el marco no representa el contenido de la franja, responde \texttt{DSM\_ST\_NOT\_HOME} para que el emisor no insista contra un marco vacío; si la versión no coincide, responde \texttt{DSM\_ST\_BAD\_STATE} con la versión vigente. El emisor adopta esa versión, reintenta con la siguiente y abandona tras tres intentos.
+
+La comparación de versiones resuelve la competencia entre dos escritores de la misma franja sin un cerrojo global de paridad. Dos deltas simultáneos pueden llegar en orden distinto al que se emitieron; el primero que encuentra la versión esperada se aplica y el segundo recibe el rechazo con la versión ya avanzada, de modo que el emisor reemite su delta sobre el estado que realmente quedó. Si el custodio informa una versión menor que la que el emisor ya había publicado, el delta se abandona y la franja queda sin actualización de paridad hasta su reconstrucción: aplicar ese delta sobre un marco atrasado produciría una paridad falsa que ninguna verificación posterior detectaría.
+
+El costo de la paridad se reparte entre espacio, tráfico y memoria. Una página de paridad por cada $K$ de datos deja una capacidad útil de $K/(K+1)$: 66.7\% con $K=2$, 80\% con $K=4$ y 88.9\% con $K=8$. Un \texttt{PARITY\_DELTA} mide $56 + 4 + 4096 = 4156$ bytes y su acuse 60, mientras que un \texttt{WRITEBACK} mide 4152 y su acuse 56; persistir una página con paridad local cuesta 4216 bytes en dos mensajes, y con custodio remoto 8424 bytes en cuatro. La tabla de franjas ocupa 84 bytes por franja, unos 42 MiB con la vista de 4 GiB y $K=2$, y el índice de marcos de paridad otros 4 MiB; los marcos de 4 KiB se reservan solo cuando el nodo pasa a custodiar la franja o recibe su primer delta, en lugar de reservar los 2 GiB que ocuparía un arreglo denso.
+
+\subsection{Reconstrucción de franjas}
+
+\texttt{raid\_on\_node\_down} encola la ranura caída en una cola acotada de \texttt{MAX\_NODES} entradas, sin duplicados, y arranca el hilo de reconstrucción si no hay otro activo. El hilo procesa una ranura por vez y se auto-termina cuando la cola queda vacía; su descriptor se recoge en la siguiente baja o en el apagado, de modo que no sobrevive un hilo joinable. Para cada baja, el hilo recorre las franjas afectadas, que son aquellas cuya página de paridad o alguna de cuyas páginas de datos pertenecía al nodo caído, y marca cada una en \texttt{DEGRADED}.
+
+Antes de reconstruir, la franja se refresca con la membresía nueva y se elige un líder: la ranura viva más baja entre los custodios de datos y el de paridad. Solo el líder reconstruye, de modo que varios nodos que detectan la misma baja no dupliquen el trabajo. El líder envía \texttt{STATE\_REPORT} a los custodios vivos de la franja para que la marquen degradada y, cuando reúne las piezas, calcula
+\begin{equation}
+D_{\text{perdida}} = P \oplus \bigoplus_{j \ne \text{perdida}} D_j
+\end{equation}
+si lo que falta es un dato, o reconstruye $P$ con la XOR de los $K$ datos si lo que falta es la paridad.
+
+La recolección se hace contra los custodios anteriores a la baja, no contra los nuevos. El anillo ya se recalculó y los nuevos custodios todavía no recibieron el contenido, así que apoyarse en ellos devolvería páginas vacías. Para un dato perdido, el líder reúne la paridad y los $K-1$ datos supervivientes con \texttt{STRIPE\_READ} y \texttt{STRIPE\_DATA}; para una paridad perdida, reúne los $K$ datos. Cada respuesta debe traer la versión de la franja que el líder conoce; una copia con otra versión se descarta y la franja queda degradada, porque mezclar versiones produciría una reconstrucción silenciosamente incorrecta.
+
+El resultado se entrega al nuevo custodio por el mismo camino que usa la reasignación. Si el líder es el nuevo custodio del dato, instala la página en su respaldo y en su vista con \texttt{PROT\_READ} y estado \texttt{S}; si es otro nodo, la envía con \texttt{PAGE\_MOVE} y espera el acuse. En ambos casos actualiza el directorio, incrementa la versión, guarda el nuevo custodio en \texttt{home\_map} y avisa al líder con \texttt{DIR\_DONE}. Cuando lo perdido es la paridad, el líder instala el marco reconstruido si él es el nuevo custodio, o envía \texttt{STRIPE\_PUT} con la descripción de la franja y después un \texttt{PARITY\_DELTA} con el marco completo y la versión siguiente; la franja solo vuelve a \texttt{ACTIVE} cuando ese delta recibe acuse.
+
+Los caminos de fallo son explícitos y cada uno deja la franja en un estado conocido. Si un dato se perdió y la paridad anterior ya no está viva, la franja tiene dos piezas perdidas y no se reconstruye: el líder invalida la página del nodo caído y deja la franja degradada. Si la recolección no se completa, se invalida únicamente la página que de verdad se perdió y se conserva el resto; cuando lo perdido es la paridad, el marco local se marca inválido. La invalidación es deliberada: una página que no se pudo recuperar no debe servirse como si su contenido fuera vigente. Las páginas de una franja con pérdida de paridad que siguen vivas en sus custodios no se tocan.
+
+El costo de una reconstrucción se puede calcular a partir del formato. Para $K$ piezas, la recolección usa $K$ \texttt{STRIPE\_READ} de 64 bytes y $K$ \texttt{STRIPE\_DATA} de 4152 bytes, es decir $2K$ mensajes y $4216K$ bytes, más el \texttt{PAGE\_MOVE} y su acuse cuando el nuevo custodio es remoto. Con $K=2$ son cuatro mensajes y unos 12.6 KB por franja; con $K=4$, ocho mensajes y unos 21.1 KB. El hilo de reconstrucción es separado del listener justamente para que este siga aceptando las respuestas \texttt{STRIPE\_DATA} que la reconstrucción espera; si el hilo que recibe la baja se bloqueara en esa espera, las respuestas no tendrían quién las leyera.
+
+\subsection{Nivel de tolerancia y costo de overhead}
+
+La unidad de tolerancia es una pieza por franja, no un nodo cualquiera del clúster. Con $K=2$ y tres nodos, la configuración típica coloca $D_1$, $D_2$ y $P$ en ranuras distintas y tolera la pérdida de cualquiera de los tres, porque cada franja pierde a lo sumo una pieza. Con $K=8$ y nueve nodos ocurre lo mismo: cada franja tolera una pieza, aunque la probabilidad de que dos datos compartan custodio crece si el anillo concentra páginas en pocos nodos. La caída de un nodo afecta a muchas franjas a la vez, y cada una se recupera por separado si solo perdió una pieza; si dos datos de la misma franja vivían en el nodo caído, esa franja queda irrecuperable aunque el resto del clúster esté sano.
+
+El overhead de espacio equivale a una página de paridad por cada $K$ de datos, y el de tráfico depende de dónde se persiste la página. Una persistencia local con paridad envía dos mensajes y 4216 bytes, poco más de una página; una persistencia remota con paridad envía cuatro mensajes y 8424 bytes, poco más de dos páginas. En una corrida de tres nodos con 24 páginas persistidas, los contadores registraron entre 30 y 33 deltas de paridad, un promedio cercano a 1.3 por página, porque los reintentos de versión reemiten algunos deltas. El overhead de memoria es la tabla de franjas y el índice de marcos, unos 46 MiB por nodo con la vista de 4 GiB y $K=2$, más 4 KiB por cada franja cuyo custodio de paridad sea ese nodo.
+
+El custodio de paridad es el punto donde se serializan las actualizaciones de paridad de su franja. La actualización ocurre dentro del turno de la página, que el custodio toma antes de leer el respaldo anterior y emitir el delta, de modo que dos escrituras de la misma página no calculan deltas sobre versiones distintas. La contrapartida es que la franja depende de ese custodio: si cae, \texttt{raid\_on\_write} devuelve \texttt{DSM\_ERR\_NODE\_DOWN} y la escritura de datos continúa, pero la actualización de paridad se omite. La franja queda degradada y el siguiente fallo dentro de ella puede ser irreversible hasta que la reconstrucción designe otro custodio y instale el marco.
+
+\subsection{Escenario de caída y recuperación}
+
+La corrida de validación usa tres nodos con \texttt{REDUNDANCY=true}, $K=2$ y la vista de 4 GiB. Un proceso cliente reserva 24 páginas, escribe un patrón verificable y ejecuta \texttt{dsm\_sync}; el cliente termina y sus copias locales desaparecen, de modo que el contenido queda en los custodios y en la paridad. Los tres nodos registran entre 30 y 33 deltas por la sincronización. Después se derriba uno de los nodos custodios y se observa la recuperación desde un nodo superviviente.
+
+La detección tarda alrededor de tres segundos, los seis latidos que separan \texttt{ALIVE} de \texttt{DEAD}. El nodo detector retira la ranura, difunde \texttt{NODE\_DOWN} y encola la recuperación; el worker reasigna las páginas cuyo custodio era la víctima, migra los cerrojos a la época nueva y programa la reconstrucción de las franjas afectadas. La reconstrucción por XOR completa seis franjas, y el nodo superviviente lee y verifica cinco páginas cuyo dato custodiaba el nodo caído y cuya franja conservaba la compañera y la paridad. Las franjas con dos páginas de datos en el mismo nodo no se reconstruyen, y el escenario lo refleja en lugar de ocultarlo.
+
+Las páginas verificadas recorren el camino completo, porque la lectura de una página cuyo dato estaba en la víctima produce un fallo, el despachador pide la página al custodio nuevo, y ese custodio ya tiene la copia reconstruida en su respaldo y en su vista, de modo que responde \texttt{PAGE\_DATA} sin volver a consultar la paridad. El patrón leído coincide con el que escribió el cliente, y el contador \texttt{stripe\_rebuilds} confirma que la reconstrucción ocurrió antes de la lectura. La prueba de extremo a extremo automatiza esa secuencia con los roles \texttt{raid hold} y \texttt{raid produce} de \texttt{demo}, y falla si ninguna franja permite reconstruir un dato o si la lectura posterior no coincide.
+
+El escenario valida la detección, la reasignación, la reconstrucción y el camino de lectura. La corrida se hace con tres procesos en la misma máquina, de modo que el tiempo de detección no incluye la latencia de una red física; la validación en equipos del laboratorio cubre la coherencia y la ejecución distribuida con cuatro equipos y 640 MiB aportados, no la reconstrucción de paridad. Los escenarios de dos bajas simultáneas y de reinicio completo del clúster quedan fuera del modelo de una paridad por franja y de una paridad en memoria.
+
+\subsection{Condiciones de la reconstrucción}
+
+La primera condición es que la página esté persistida, porque la paridad se calcula sobre la versión que llegó al respaldo y una página escrita y no sincronizada no está representada en el marco de paridad; si su dueño en \texttt{M} cae antes de \texttt{dsm\_sync}, la reconstrucción recupera la versión anterior. Una página que nunca se persistió y cuya única copia desapareció no tiene contenido que reconstruir, y el custodio sirve ceros cuando recibe la solicitud. El sistema no distingue ese cero de una página que legítimamente nunca se escribió; la diferencia queda en el estado del directorio y en el registro.
+
+La segunda condición es que el custodio nuevo sea calculable y que la página tenga un hogar conocido. La reasignación actúa sobre las entradas de \texttt{home\_map} que apuntan al nodo caído; un nodo que nunca resolvió esa página no participa, y el nuevo custodio la recupera bajo demanda consultando a los pares que todavía la conservan. Si el anillo no converge porque las tablas de membresía difieren, \texttt{PAGE\_MOVE} responde \texttt{NOT\_HOME} y la operación se reintenta cuando la membresía se estabiliza. La reconstrucción de una franja exige que el líder conozca la descripción de la franja y que los custodios de las piezas supervivientes estén vivos.
+
+La tercera condición es de colocación: la franja debe haber perdido a lo sumo una pieza. La paridad se guarda en una ranura distinta de los $K$ custodios de datos, de modo que la caída de un nodo no elimina a la vez un dato y la paridad de la misma franja. Lo que la colocación no garantiza es que los $K$ datos vivan en ranuras distintas; si dos comparten custodio, la pérdida de ese nodo deja dos incógnitas y la XOR no alcanza. El $K$ queda fijado cuando la franja recibe contenido, así que un cambio posterior de membresía no redistribuye las páginas para corregir esa concentración.
+
+La cuarta condición combina versión e instalación, porque cada copia recolectada debe traer la versión de la franja que el líder conoce; una copia con otra versión se descarta y la franja queda degradada, porque una reconstrucción con piezas de versiones distintas produciría un contenido incorrecto sin señal de error. Cuando lo perdido es la paridad, el nuevo custodio recibe primero la descripción con \texttt{STRIPE\_PUT} y después el marco completo con \texttt{PARITY\_DELTA}; la franja solo se marca activa cuando ese delta recibe acuse. Sin el acuse, el marco no se publica como válido y la franja permanece degradada.
+
+La quinta condición es de alcance temporal: la paridad vive en memoria, en los marcos que indexa la tabla de franjas, y la versión es un contador de esa tabla; un reinicio de todos los procesos pierde ambos. El mecanismo tolera la caída de un nodo mientras el clúster sigue vivo, y no la pérdida simultánea de la paridad y de un dato de la misma franja, ni la desaparición del estado de todas las franjas a la vez. La reconstrucción tampoco tiene un plazo global ni cancelación: una franja cuyo custodio de paridad no responde se queda en \texttt{DEGRADED}, y las páginas que no se pudieron recuperar se invalidan para que ninguna lectura posterior las tome por vigentes.

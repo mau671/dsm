@@ -1,0 +1,213 @@
+\section{Protocolo de comunicación}\label{sec:protocolo}
+
+Los procesos del clúster intercambian tramas binarias sobre TCP para la coherencia, la membresía, la sincronización, la ejecución distribuida y las consultas. El descubrimiento inicial usa un datagrama UDP independiente, porque su destino es anunciar la existencia de un proceso antes de que exista una conexión. La cabecera de las tramas TCP mide 56 bytes en el cable, tiene dieciséis campos en orden de red y termina con un CRC32 que cubre la cabecera y la carga. Cada tipo de mensaje fija una longitud de carga, de modo que una trama truncada o con un contador corrupto se rechaza antes de llegar a la lógica de coherencia.
+
+\subsection{Transporte TCP y ciclo de conexiones}
+
+TCP aporta entrega completa, ordenada y con control de flujo, tres propiedades que la transferencia de una página necesita y que un protocolo sobre UDP tendría que reconstruir. Una página de 4096 bytes debe llegar completa antes de instalarse en la vista, y una secuencia de invalidaciones debe conservar el orden en que el custodio las emitió. La pila de TCP resuelve la retransmisión, la ventana y la detección de congestión, y deja al protocolo DSM solo la responsabilidad de delimitar las tramas y validar su contenido.
+
+Cada nodo abre un socket de escucha en el primer puerto libre del rango \texttt{PORT\_MIN}--\texttt{PORT\_MAX}, que por defecto cubre 27600 a 27699. El socket se enlaza con \texttt{SO\_REUSEADDR}, escucha con una cola de 128 conexiones y se atiende desde un hilo listener que espera con \texttt{poll} en intervalos de 500 ms. El listener acepta una conexión, lee la cabecera completa con un plazo de \texttt{CONNECT\_TIMEOUT\_MS}, desempaqueta los campos y decide si la trama se atiende en línea o se encola para un worker. Al terminar de procesarla, cierra el descriptor.
+
+La conexión es por mensaje: el emisor llama a \texttt{peer\_ensure\_connected}, que comprueba si existe un descriptor utilizable para el par y, si no lo hay, abre uno nuevo con \texttt{dsm\_connect\_timeout}; el socket se crea no bloqueante, se conecta y se espera con \texttt{poll} hasta \texttt{CONNECT\_TIMEOUT\_MS}, que vale 200 ms por defecto. Después escribe la cabecera y la carga con \texttt{dsm\_send\_full\_deadline}, cuyo plazo es \texttt{SEND\_TIMEOUT\_MS}, 2000 ms por defecto. Al terminar el envío, el emisor hace \texttt{shutdown} y cierra el descriptor. El receptor cierra su extremo después de procesar la única trama, así que mantener el descriptor abierto llevaría la siguiente escritura a un socket que el otro lado ya cerró.
+
+La comprobación de vida del par usa \texttt{peer\_socket\_alive}, que consulta el descriptor con \texttt{poll} y un \texttt{recv} con \texttt{MSG\_PEEK} y \texttt{MSG\_DONTWAIT}. Un socket cerrado por el par se detecta antes de reutilizarlo, se descarta y se abre uno nuevo en el siguiente envío. \texttt{dsm\_net\_send} intenta la operación dos veces: si el enlace muere entre la conexión y la escritura, cierra el descriptor y repite con uno nuevo. Ese segundo intento cubre la carrera entre la comprobación de vida y la escritura, no un fallo persistente del par.
+
+El costo del modelo es un saludo TCP por mensaje y la imposibilidad de pipelining sobre un mismo descriptor. La ventaja es que cada trama tiene un límite claro: si la cabecera no valida o la carga no coincide con la longitud esperada, el receptor cierra la conexión y no necesita resincronizar un flujo que podría haber quedado a mitad de una página. El clúster no mantiene $N \times (N-1)$ descriptores abiertos ni un hilo lector por par, y el límite de descriptores se eleva al valor duro con \texttt{raise\_nofile\_limit} durante \texttt{dsm\_init} para cubrir las conexiones entrantes y salientes del momento.
+
+La cola de workers es una lista enlazada protegida por un mutex, con un semáforo que cuenta los elementos y otro que cuenta la capacidad libre; el listener no sostiene el mutex mientras procesa un mensaje. El listener atiende directamente dos mensajes de arranque y consulta: \texttt{HELLO} y \texttt{QUERY\_REQ}. \texttt{HELLO} se procesa en el listener porque el nodo solicitante todavía no tiene ranura ni una conexión establecida, y su respuesta \texttt{WELCOME} debe salir por el mismo descriptor antes de cerrarlo. \texttt{QUERY\_REQ} también se resuelve en línea, porque \texttt{dsmctl} abre una conexión efímera y espera la respuesta en ese socket. \texttt{JOIN}, \texttt{HEARTBEAT}, \texttt{LEAVE} y \texttt{NODE\_DOWN} se atienden en el listener por su efecto directo sobre la membresía; \texttt{ALLOC\_STATE} se resuelve ahí para no depender de un worker libre, y los acuses de concesión y barrera con la bandera \texttt{PROBE} se atienden en línea. El resto de los tipos se encola para que un worker aplique la lógica de coherencia, paridad, cerrojos, ejecución distribuida o asignación.
+
+\subsection{Cabecera, serialización y tamaños}
+
+La cabecera lógica tiene dieciséis campos y 56 bytes. La estructura en memoria \texttt{msg\_header\_t} ocupa 64 bytes porque el campo \texttt{epoch}, un entero de 64 bits en el desplazamiento 12, obliga al compilador a insertar cuatro bytes de relleno para alinearlo a ocho en el desplazamiento 16. Esa diferencia es la razón por la que la estructura nunca se transmite cruda: el formato del cable se define por desplazamientos explícitos y no por el tamaño que resulta de la alineación natural del compilador.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    scale=0.86, every node/.style={transform shape},
+    seg/.style={draw=borderblue, fill=softblue, thick, rounded corners=2pt, align=center, font=\scriptsize, minimum height=1.35cm, inner sep=2pt},
+    wide/.style={seg, minimum width=2.2cm},
+    half/.style={seg, minimum width=1.1cm},
+    pay/.style={draw=bordergreen, fill=softgreen, thick, rounded corners=2pt, align=center, font=\scriptsize, minimum width=4.2cm, minimum height=0.9cm},
+    off/.style={font=\tiny\ttfamily, text=black!65}
+]
+
+\node[wide] (a) at (0, 0) {\texttt{magic} 0\\\texttt{cluster\_id} 4\\8 B};
+\node[half, minimum width=1.6cm, right=0.14cm of a] (b) {\texttt{ver} 8\\\texttt{type} 10\\4 B};
+\node[wide, right=0.14cm of b] (c) {\texttt{epoch}\\@12\\8 B};
+\node[wide, right=0.14cm of c] (d) {\texttt{src\_slot} 20\\\texttt{dst\_slot} 24\\8 B};
+
+\node[wide, below=0.75cm of a.south west, anchor=north west] (e) {\texttt{req\_id} 28\\\texttt{page\_id} 32\\8 B};
+\node[wide, right=0.14cm of e] (f) {\texttt{tseq} 36\\\texttt{data\_version} 40\\8 B};
+\node[half, minimum width=1.6cm, right=0.14cm of f, font=\tiny] (g) {\texttt{access} 44\\\texttt{flags} 45\\\texttt{status} 46\\4 B};
+\node[wide, right=0.14cm of g] (h) {\texttt{payload\_len} 48\\\texttt{crc32} 52\\8 B};
+
+\node[off, above=0.04cm of a.north west, anchor=south west] {0};
+\node[off, above=0.04cm of b.north west, anchor=south west] {8};
+\node[off, above=0.04cm of c.north west, anchor=south west] {12};
+\node[off, above=0.04cm of d.north west, anchor=south west] {20};
+\node[off, below=0.04cm of e.south west, anchor=north west] {28};
+\node[off, below=0.04cm of f.south west, anchor=north west] {36};
+\node[off, below=0.04cm of g.south west, anchor=north west] {44};
+\node[off, below=0.04cm of h.south west, anchor=north west] {48};
+\node[off, below=0.04cm of h.south east, anchor=north east] {56};
+
+\node[pay, below=0.62cm of f] (p) {Carga útil: \texttt{payload\_len} bytes desde el desplazamiento 56};
+
+\end{tikzpicture}
+\caption{Cabecera de 56 bytes en el cable. La fila superior cubre los desplazamientos 0 a 27 y la inferior los desplazamientos 28 a 55; cada segmento indica el campo, su desplazamiento y su ancho.}
+\label{fig:cabecera-campos}
+\end{figure}
+
+El empaquetado ocurre campo por campo. \texttt{dsm\_wire\_pack} limpia el búfer, escribe cada entero con \texttt{put\_u16}, \texttt{put\_u32} o \texttt{put\_u64} y deja el CRC en cero. Las funciones auxiliares aplican \texttt{htons} y \texttt{htonl}; la de 64 bits, \texttt{dsm\_htonll}, intercambia las dos mitades de 32 bits porque \texttt{htobe64} no está disponible en todas las bibliotecas. El desempaquetado invierte el recorrido con \texttt{get\_u16}, \texttt{get\_u32} y \texttt{get\_u64}, y rechaza la trama en el acto si el \texttt{magic} no es \texttt{0x44534D32} o si la versión no coincide con \texttt{DSM\_PROTO\_VERSION}, que vale 2.
+
+La escritura de un entero de 64 bits se hace con \texttt{memcpy} sobre una variable local ya convertida a orden de red, no con una asignación directa al búfer. El desplazamiento 12 no es múltiplo de ocho, y una escritura alineada sobre esa posición funcionaría en x86\_64 pero fallaría en arquitecturas que exigen alineación. El mismo cuidado aparece en la lectura: \texttt{get\_u64} copia ocho bytes a una variable alineada y convierte después. La cabecera conserva así un formato independiente de la alineación del procesador.
+
+La integridad usa CRC32 IEEE 802.3 con el polinomio reflejado \texttt{0xEDB88320}. \texttt{dsm\_crc32} recibe una semilla y encadena bloques, y la tabla de 256 entradas se construye la primera vez que se llama a la función, porque el empaquetado ocurre en hilos distintos y no existe una fase de inicialización previa garantizada. \texttt{dsm\_wire\_finish} escribe la longitud real en la cabecera, empaqueta con el CRC en cero, calcula la suma sobre los 56 bytes, la extiende sobre la carga cuando existe y escribe el resultado en el desplazamiento 52. \texttt{dsm\_wire\_validate} copia la cabecera recibida, pone el CRC en cero, repite el cálculo y compara.
+
+Los tamaños están fijados con \texttt{\_Static\_assert}. La cabecera debe medir 64 bytes en memoria y alinear a 8; \texttt{membership\_wire\_t} debe medir 40 en memoria y 36 en el cable; \texttt{discovery\_wire\_t} debe medir 80; \texttt{alloc\_rec\_t} 24; \texttt{dir\_entry\_t} 72; \texttt{dist\_run\_wire\_t} 48; \texttt{dist\_done\_wire\_t} 44 en el cable y 48 en memoria por el relleno final; \texttt{stripe\_wire\_t} 76; \texttt{stats\_wire\_t} 96. Una modificación de un campo que rompa esas medidas detiene la compilación antes de que el formato llegue a dos procesos distintos.
+
+El límite de carga es \texttt{DSM\_MAX\_PAYLOAD}, 1 MiB, y el mensaje máximo en el cable es la cabecera más ese límite. La carga más grande que el sistema produce es el \texttt{WELCOME}, que contiene la lista de membresía y la instantánea del mapa global: 28 bytes de cabecera lógica, 36 por cada uno de los 256 nodos posibles, 4 del contador de reservas y 24 por cada una de las 64 reservas, para un máximo de 10 784 bytes. Ese tamaño cabe con holgura en el límite y se valida antes de reservar el búfer de recepción.
+
+\subsection{Catálogo de mensajes}
+
+El protocolo define 44 códigos. La tabla~\ref{tab:catalogo-mensajes} los enumera con su dirección, la longitud de carga que exige \texttt{wire\_payload\_ok} y su propósito. La columna de carga usa \texttt{page\_size} para la página configurada, que por defecto es 4096 bytes, y distingue los mensajes sin carga de aquellos que transportan una página completa o una estructura serializada. Los códigos se agrupan por rangos: \texttt{0x01} a \texttt{0x0B} para descubrimiento, membresía y migración de custodia; \texttt{0x10} a \texttt{0x18} para coherencia y persistencia; \texttt{0x20} a \texttt{0x27} para paridad y franjas; \texttt{0x30} a \texttt{0x37} para cerrojos y barreras; \texttt{0x40} y \texttt{0x41} para consultas; \texttt{0x50} y \texttt{0x51} para ejecución distribuida; \texttt{0x60} a \texttt{0x65} para el mapa global de reservas; y \texttt{0x7F} para el rechazo genérico.
+
+{\scriptsize
+\renewcommand{\arraystretch}{1.02}
+\setlength{\tabcolsep}{4pt}
+\begin{xltabular}{\linewidth}{l l P{3.55cm} P{1.75cm} Y}
+\caption{Catálogo de mensajes del protocolo. La carga indica la longitud exacta o el rango que acepta la validación.}\label{tab:catalogo-mensajes}\\
+\toprule
+\textbf{Tipo} & \textbf{Código} & \textbf{Dirección} & \textbf{Carga} & \textbf{Propósito} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Tipo} & \textbf{Código} & \textbf{Dirección} & \textbf{Carga} & \textbf{Propósito} \\
+\midrule
+\endhead
+\texttt{HELLO} & $0\text{x}01$ & Nodo nuevo a par & 20 B & UUID de 16 bytes y \texttt{shared\_hash} de 4; inicia el descubrimiento. \\
+\texttt{WELCOME} & $0\text{x}02$ & Par a nodo nuevo & 32--10 784 B & Época, UUID de origen, lista de membresía y mapa global; el estado viaja en la cabecera. \\
+\texttt{JOIN} & $0\text{x}03$ & Nodo nuevo a cada miembro & 36 B & \texttt{membership\_wire\_t} con la ranura propuesta. \\
+\texttt{JOIN\_ACK} & $0\text{x}04$ & Miembro a nodo nuevo & 0 B & Confirma la ranura; la época vigente viaja en la cabecera. \\
+\texttt{HEARTBEAT} & $0\text{x}05$ & Nodo a sus pares & 12 o 48 B & Incarnation, páginas libres y, en la variante extendida, la membresía del emisor. \\
+\texttt{LEAVE} & $0\text{x}06$ & Nodo saliente a sus pares & 0 o 28 B & Salida ordenada; la ranura viaja en \texttt{src\_slot}. \\
+\texttt{NODE\_DOWN} & $0\text{x}07$ & Detector a los demás & 0 o 28 B & Declara caída una ranura; el slot afectado viaja en \texttt{page\_id}. \\
+\texttt{PAGE\_MOVE} & $0\text{x}0A$ & Home anterior a nuevo home & \texttt{page\_size} & Transfiere el contenido al asumir la custodia. \\
+\texttt{PAGE\_MOVE\_ACK} & $0\text{x}0B$ & Nuevo home a emisor & 0 B & Confirma la instalación del contenido. \\
+\texttt{PAGE\_REQUEST} & $0\text{x}10$ & Solicitante a home & 0 B & Pide la página; \texttt{access} distingue lectura de escritura. \\
+\texttt{PAGE\_DATA} & $0\text{x}11$ & Home a solicitante & \texttt{page\_size} & Entrega el contenido solicitado. \\
+\texttt{GRANT} & $0\text{x}12$ & Home a solicitante & 0 o \texttt{page\_size} & Concede permiso; lleva datos si \texttt{HAS\_DATA} está activo. \\
+\texttt{INVALIDATE} & $0\text{x}13$ & Home a tenedor & 0 B & Ordena invalidar una copia. \\
+\texttt{INVALIDATE\_ACK} & $0\text{x}14$ & Tenedor a home & 0 o \texttt{page\_size} & Confirma la invalidación y devuelve datos si se pidieron. \\
+\texttt{DOWNGRADE} & $0\text{x}15$ & Home a owner en M & 0 B & Ordena degradar la copia; \texttt{access} fija el permiso conservado. \\
+\texttt{DOWNGRADE\_ACK} & $0\text{x}16$ & Owner a home & 0 o \texttt{page\_size} & Confirma la degradación y entrega el contenido si corresponde. \\
+\texttt{WRITEBACK} & $0\text{x}17$ & Owner a home & \texttt{page\_size} & Persiste una página modificada. \\
+\texttt{WRITEBACK\_ACK} & $0\text{x}18$ & Home a owner & 0 B & Confirma la persistencia. \\
+\texttt{PARITY\_DELTA} & $0\text{x}20$ & Escritor a custodio de paridad & $4 + \texttt{page\_size}$ & Identificador de franja y vector XOR del cambio. \\
+\texttt{PARITY\_ACK} & $0\text{x}21$ & Custodio a escritor & 4 B & Confirma la franja aplicada. \\
+\texttt{STRIPE\_PUT} & $0\text{x}22$ & Líder a nuevo custodio & 76 B & Describe la franja, sus datos y sus custodios. \\
+\texttt{STRIPE\_PUT\_ACK} & $0\text{x}23$ & Custodio a líder & 4 B & Confirma la descripción de la franja. \\
+\texttt{STRIPE\_READ} & $0\text{x}24$ & Líder a custodio & 8 B & Pide un dato o la paridad de una franja. \\
+\texttt{STRIPE\_DATA} & $0\text{x}25$ & Custodio a líder & \texttt{page\_size} & Devuelve el bloque solicitado. \\
+\texttt{STATE\_REPORT} & $0\text{x}26$ & Miembro a líder & 4 B & Informa el estado de la franja tras una caída. \\
+\texttt{DIR\_DONE} & $0\text{x}27$ & Nuevo home a líder & 4 B & Marca la franja activa después de la recuperación. \\
+\texttt{LOCK\_REQ} & $0\text{x}30$ & Solicitante a custodio & 0 B & Pide un cerrojo; el identificador viaja en \texttt{page\_id}. \\
+\texttt{LOCK\_GRANT} & $0\text{x}31$ & Custodio a solicitante & 0 B & Concede el cerrojo. \\
+\texttt{LOCK\_REL} & $0\text{x}32$ & Titular a custodio & 0 B & Libera el cerrojo o acusa una concesión anterior. \\
+\texttt{BARRIER\_ARRIVE} & $0\text{x}33$ & Participante a custodio & 8 B & Umbral y generación de la ronda. \\
+\texttt{BARRIER\_GO} & $0\text{x}34$ & Custodio a participantes & 4 B & Generación que libera la ronda. \\
+\texttt{LOCK\_MIGRATE} & $0\text{x}36$ & Detector a los pares & 12 B & Época de sincronización y ranura caída. \\
+\texttt{LOCK\_STATE} & $0\text{x}37$ & Par a nuevo custodio & $20 + 12k$ B & Cerrojos propios y peticiones en vuelo, hasta 512 registros. \\
+\texttt{QUERY\_REQ} & $0\text{x}40$ & Cliente a nodo & 12 B & Tipo y ámbito de la consulta; la ruta HTML sigue después. \\
+\texttt{QUERY\_RESP} & $0\text{x}41$ & Nodo a cliente & $8 + $ registros & Cabecera de respuesta y registros del tipo consultado. \\
+\texttt{DIST\_RUN} & $0\text{x}50$ & Coordinador a trabajador & 48 B & Rango, trabajo, kernel, particiones, plazo y correlato. \\
+\texttt{DIST\_DONE} & $0\text{x}51$ & Trabajador a coordinador & 44 B & Estado, elementos, CRC, duración, correlato y fallos. \\
+\texttt{ALLOC\_REQ} & $0\text{x}60$ & Nodo a coordinador & 16 B & Pide un rango de páginas. \\
+\texttt{ALLOC\_RESP} & $0\text{x}61$ & Coordinador a nodo & 16 B & Concede el rango o informa el rechazo; puede señalar al coordinador vigente. \\
+\texttt{FREE\_REQ} & $0\text{x}62$ & Nodo a coordinador & 16 B & Devuelve un rango reservado. \\
+\texttt{FREE\_RESP} & $0\text{x}63$ & Coordinador a nodo & 16 B & Confirma o rechaza la devolución. \\
+\texttt{ALLOC\_SYNC} & $0\text{x}64$ & Coordinador a pares & 0 B & Sondea el mapa global al asumir la coordinación. \\
+\texttt{ALLOC\_STATE} & $0\text{x}65$ & Par a coordinador & Hasta 1 MiB & Marca de agua y huecos conocidos, serializados como \texttt{welcome\_t}. \\
+\texttt{NACK} & $0\text{x}7F$ & Receptor a emisor & 0 B & Rechazo; la causa viaja en \texttt{status}. \\
+\bottomrule
+\end{xltabular}
+}
+
+La tabla describe el formato, no la frecuencia de uso. Los mensajes de membresía sostienen el descubrimiento y la detección de caídas; los de coherencia y persistencia atienden los fallos de página y \texttt{dsm\_sync}; los de paridad mantienen las franjas y reconstruyen un dato perdido; los de cerrojos y barreras implementan la sincronización distribuida; los de consulta alimentan \texttt{dsmctl} y los reportes; los de ejecución distribuida transportan las órdenes y los resultados; los del asignador coordinan los rangos de la vista; y \texttt{NACK} comunica un rechazo que no encaja en la respuesta esperada.
+
+\subsection{Validación, rechazos y NACK}
+
+La recepción aplica tres filtros en orden. \texttt{dsm\_wire\_unpack} comprueba el \texttt{magic} y la versión antes de interpretar el resto de los campos, de modo que una respuesta de un servicio ajeno se descarta sin leer offsets que no le corresponden. \texttt{dsm\_wire\_validate} comprueba que el \texttt{cluster\_id} coincida con el configurado, que \texttt{payload\_len} no supere 1 MiB, que una cabecera con carga no llegue sin búfer y que el CRC32 calculado coincida con el recibido. \texttt{wire\_payload\_ok} comprueba después que la longitud sea la que el tipo exige, con reglas exactas para las cargas fijas y reglas modulares para las listas.
+
+Las reglas de longitud son estrictas: \texttt{HELLO} exige 20 bytes; \texttt{JOIN} exige los 36 de \texttt{membership\_wire\_t}; \texttt{JOIN\_ACK} y \texttt{NACK} exigen cero; \texttt{HEARTBEAT} acepta 12 o 48; \texttt{DIST\_RUN} exige 48 y \texttt{DIST\_DONE} 44; las cuatro cargas de \texttt{ALLOC} y \texttt{FREE} exigen 16; \texttt{STRIPE\_PUT} exige 76; \texttt{STRIPE\_READ} 8; \texttt{PARITY\_DELTA} exige 4 más \texttt{page\_size}; \texttt{PAGE\_DATA} y \texttt{WRITEBACK} exigen exactamente \texttt{page\_size}; \texttt{GRANT}, \texttt{INVALIDATE\_ACK} y \texttt{DOWNGRADE\_ACK} aceptan cero o una página según \texttt{HAS\_DATA}; \texttt{WELCOME} exige al menos 32 bytes y se valida como rango modular; \texttt{LOCK\_STATE} exige 20 bytes de cabecera más un múltiplo de 12, con un máximo de 512 registros.
+
+Una trama que falla cualquiera de los filtros se descarta y la conexión se cierra. El receptor no intenta recuperar el flujo porque la cabecera ya declaró una longitud y un contenido que no se pueden verificar; seguir leyendo dejaría el siguiente mensaje en un desplazamiento incierto. El cierre es la respuesta que impide que un mensaje corrupto llegue a \texttt{msi.c}, \texttt{raid.c} o \texttt{dist.c}. Los contadores \texttt{msgs\_recv} y \texttt{bytes\_recv} se incrementan solo después de que la validación y la comprobación de longitud pasan, de modo que las estadísticas no cuentan basura.
+
+El rechazo explícito usa \texttt{NACK}: el campo \texttt{status} transporta un valor de \texttt{dsm\_status\_code\_t}: \texttt{DSM\_ST\_STALE\_EPOCH} para una época anterior, \texttt{DSM\_ST\_NOT\_HOME} cuando el receptor no es el custodio, \texttt{DSM\_ST\_BAD\_STATE} para una transición que la página no admite, \texttt{DSM\_ST\_BUSY} para un recurso ocupado, \texttt{DSM\_ST\_SLOT\_TAKEN} y \texttt{DSM\_ST\_NO\_SPACE} para los rechazos de membresía y capacidad, \texttt{DSM\_ST\_CONFIG\_MISMATCH} para un \texttt{shared\_hash} distinto, \texttt{DSM\_ST\_NODE\_DOWN} para un dueño muerto y \texttt{DSM\_ST\_INVALID} para un parámetro inconsistente. Un \texttt{JOIN} que propone una ranura ocupada o fuera de rango recibe \texttt{NACK} con el estado correspondiente; una barrera con un umbral distinto del fijado por el custodio recibe \texttt{DSM\_ST\_INVALID}; una cola de cerrojos llena recibe \texttt{DSM\_ST\_NO\_SPACE}.
+
+El \texttt{WELCOME} también comunica rechazos. Si el \texttt{shared\_hash} del \texttt{HELLO} no coincide, la respuesta lleva \texttt{DSM\_ST\_CONFIG\_MISMATCH} y el nodo nuevo no se incorpora; si el empaquetado de la lista de miembros y reservas no cabe en el búfer máximo, la respuesta lleva \texttt{DSM\_ST\_NO\_SPACE} y omite la carga. El solicitante lee el estado antes de aceptar la membresía, de modo que un clúster con configuración incompatible se detecta en el primer intercambio y no en una operación posterior.
+
+Un \texttt{NACK} sin solicitud pendiente no desaparece. El listener solo descarta las respuestas huérfanas de página, \texttt{PAGE\_DATA} y \texttt{GRANT}, porque aplicarlas sobrescribiría una copia vigente. Los demás mensajes clasificados como respuesta caen al worker: \texttt{NACK} incrementa \texttt{nacks\_received} y se ofrece al módulo de sincronización, que lo usa para cerrar la espera de una barrera; si no hay una petición local que lo espere, se registra el diagnóstico con la ranura, el \texttt{req\_id}, la página y el estado. \texttt{DIST\_DONE} sigue el mismo camino y \texttt{dist\_on\_done} lo rechaza si el trabajo o la partición no existen. La clasificación de \texttt{dsm\_msg\_is\_response} abarca \texttt{WELCOME}, \texttt{JOIN\_ACK}, \texttt{PAGE\_DATA}, \texttt{GRANT}, \texttt{INVALIDATE\_ACK}, \texttt{DOWNGRADE\_ACK}, \texttt{WRITEBACK\_ACK}, \texttt{LOCK\_GRANT}, \texttt{QUERY\_RESP}, \texttt{DIST\_DONE}, \texttt{ALLOC\_RESP}, \texttt{FREE\_RESP} y \texttt{NACK}; el listener intenta completar una solicitud pendiente antes de encolarlas.
+
+\subsection{Descubrimiento por UDP}
+
+El descubrimiento no usa la cabecera TCP. Cada proceso construye un anuncio de 80 bytes con \texttt{discovery\_wire\_t} y lo envía por UDP al grupo \texttt{DISCOVERY\_GROUP} en el puerto \texttt{DISCOVERY\_PORT}, que por defecto son \texttt{239.255.42.99} y 27699. El anuncio se repite cada 500 ms y contiene el \texttt{magic}, la versión del protocolo, el \texttt{cluster\_id}, el \texttt{shared\_hash}, el UUID del nodo, un nombre de 32 bytes, la IP, el puerto TCP, las páginas de memoria, la ranura cuando ya está asignada y el rol. Los campos se serializan por separado con los mismos helpers de orden de red que la cabecera TCP.
+
+El socket UDP se crea con \texttt{SO\_REUSEADDR} para que dos procesos de la misma máquina puedan enlazarse al mismo puerto de descubrimiento. El proceso se une al grupo multicast en la interfaz principal cuando la dirección de configuración pertenece al rango multicast; si la unión falla, el socket queda en modo broadcast y envía a \texttt{INADDR\_BROADCAST}. Con multicast disponible, cada anuncio sale por tres vías: una copia por loopback, otra por la interfaz principal y una copia broadcast. La copia por loopback hace que dos procesos locales se vean aunque la ruta multicast por defecto no devuelva los paquetes; la copia por la interfaz principal alcanza equipos distintos; el broadcast es el respaldo cuando el multicast no está disponible. Sin multicast, el anuncio se emite solo por broadcast.
+
+El receptor exige que el datagrama mida exactamente 80 bytes. Desempaqueta, comprueba \texttt{magic}, versión y \texttt{cluster\_id}, descarta el anuncio cuyo UUID coincide con el propio y rechaza un \texttt{shared\_hash} distinto. En ese último caso registra un aviso limitado por UUID cada 5 segundos, para que un anuncio repetido no llene el registro. También exige un puerto TCP distinto de cero, un rol menor o igual a uno y una dirección IP utilizable; la IP que publica el emisor se sustituye por la dirección de origen observada en el socket cuando la publicada es loopback o no es alcanzable.
+
+Un anuncio válido no incorpora al nodo por sí solo. El hilo de descubrimiento lo registra como candidato y envía un \texttt{HELLO} por TCP a la IP y el puerto anunciados. El \texttt{HELLO} lleva el UUID propio y el \texttt{shared\_hash}, y el par responde con un \texttt{WELCOME} que incluye su época, su UUID, la lista de miembros y la instantánea del mapa global. Si el UUID que responde coincide con el propio, el proceso detecta que dos instancias comparten identidad y rechaza la unión. Si la respuesta es válida, el nodo nuevo elige la primera ranura libre, envía \texttt{JOIN} a cada miembro y espera los \texttt{JOIN\_ACK}. Un \texttt{NACK} con \texttt{DSM\_ST\_SLOT\_TAKEN} obliga a reintentar con otra ranura; un \texttt{NACK} con \texttt{DSM\_ST\_CONFIG\_MISMATCH} descarta al par.
+
+El primer proceso de un clúster no encuentra pares. Cuando el descubrimiento agota su ventana sin respuestas, el nodo asume la ranura 0 con época 1 y arranca los latidos; un cliente no puede asumir ese papel porque no aporta la memoria que ninguna página tendría como custodio, y \texttt{dsm\_init} devuelve \texttt{DSM\_ERR\_NO\_SPACE}. La incorporación de los siguientes procesos reutiliza la lista del \texttt{WELCOME}, de modo que un nodo que llega después conoce a todos los miembros sin una lista de equipos configurada.
+
+La membresía se mantiene con latidos TCP cada \texttt{HB\_INTERVAL\_MS}. Cada latido lleva la incarnation, las páginas libres y la membresía del emisor, y un receptor que no conoce la ranura puede incorporarla desde esa carga extendida. Tras \texttt{HB\_SUSPECT} latidos perdidos la ranura pasa a \texttt{SUSPECT}, y tras \texttt{HB\_DEAD} pasa a \texttt{DEAD}; el detector difunde \texttt{NODE\_DOWN} y encola la recuperación de coherencia en un worker. El contador \texttt{hb\_missed} suma una unidad por cada transición, no por cada intervalo de retraso.
+
+\subsection{Timeouts, reintentos y respuestas duplicadas}
+
+Los plazos separan el costo de cada etapa. \texttt{CONNECT\_TIMEOUT\_MS} acota la apertura del socket, con 200 ms por defecto; \texttt{DISCOVERY\_TIMEOUT\_MS} acota la lectura del \texttt{HELLO} y del \texttt{WELCOME}, con 300 ms; \texttt{SEND\_TIMEOUT\_MS} acota la escritura de una trama, con 2000 ms; \texttt{REQUEST\_TIMEOUT\_MS} acota la espera de una respuesta, con 3000 ms; \texttt{LOCK\_TIMEOUT\_MS} acota la espera de un cerrojo o una barrera, con 10 000 ms; y \texttt{DIST\_TIMEOUT\_MS} acota la espera de \texttt{dsm\_dist\_verify}, con 5000 ms. Los valores viven en \texttt{dsm.conf} y se validan al cargar la configuración.
+
+La RPC correlacionada registra una estructura \texttt{pending\_req\_t} en una tabla de 1024 cubetas indexada por \texttt{req\_id}, envía la solicitud y espera en un semáforo con \texttt{sem\_timedwait} hasta \texttt{REQUEST\_TIMEOUT\_MS}. La respuesta llega como otro mensaje, el listener la reconoce por su tipo y por el \texttt{req\_id}, copia la carga al búfer del solicitante y publica el resultado. Si la respuesta no cabe en la capacidad declarada, la operación devuelve \texttt{DSM\_ERR\_NO\_SPACE} y descarta la carga. La tabla se protege con un mutex y la entrada se retira antes de destruir el semáforo, de modo que una respuesta tardía no escriba en una estructura liberada.
+
+Los reintentos se aplican solo a fallos de transporte, \texttt{DSM\_ERR\_TIMEOUT} y \texttt{DSM\_ERR\_NET}. Una respuesta con un estado de protocolo distinto de cero es una respuesta válida y se entrega al llamador; repetirla produciría el mismo rechazo. El número de intentos es \texttt{REQUEST\_RETRIES}, con valor predeterminado 3 y un máximo de 10. Entre intentos hay una espera exponencial que empieza en \texttt{RECONNECT\_MIN\_MS}, 100 ms, y se duplica hasta \texttt{RECONNECT\_MAX\_MS}, 2000 ms. Cada intento abre una conexión nueva; cuando la llamada no fija un \texttt{req\_id}, el intento toma uno nuevo, porque el enlace anterior se cerró después de la trama y el identificador viejo ya no tiene una entrada pendiente.
+
+La retransmisión es segura porque los manejadores son idempotentes en el estado actual. Un \texttt{PAGE\_REQUEST} de lectura que llega repetido se responde desde el copyset vigente; uno de escritura que encuentra al solicitante como owner devuelve \texttt{GRANT} o \texttt{PAGE\_DATA} según corresponda; una invalidación sobre un nodo que ya perdió la copia responde \texttt{INVALIDATE\_ACK} sin cambiar nada. El receptor no conserva una caché de respuestas anteriores: recalcula la respuesta a partir del estado, lo que evita que una respuesta vieja se reutilice después de que la página cambió de estado.
+
+Las respuestas duplicadas se descartan en dos puntos. El listener descarta un \texttt{PAGE\_DATA} o un \texttt{GRANT} que no encuentra una solicitud pendiente, porque aplicarlo sobrescribiría una copia que pudo haber avanzado de estado. Las demás respuestas huérfanas caen al worker, que las trata como diagnóstico o las rechaza en su propio módulo. En la ejecución distribuida, un \texttt{DIST\_DONE} repetido se rechaza porque el \texttt{part\_id} ya está en la tabla del trabajo; en la sincronización, un \texttt{BARRIER\_GO} atrasado no libera una ronda futura porque cada ronda usa una generación distinta; y un \texttt{LOCK\_GRANT} de una época anterior se descarta por el campo \texttt{epoch} de la cabecera.
+
+\subsection{Estructuras y cargas útiles}
+
+Las cargas fijas se serializan campo por campo y tienen una longitud exacta en el cable. \texttt{membership\_wire\_t} ocupa 36 bytes y contiene el UUID, la IP, el puerto, la ranura, el estado, la incarnation y las páginas de memoria. \texttt{alloc\_rec\_t} ocupa 24 bytes y describe un bloque vivo, un hueco o la marca de agua del asignador. \texttt{dir\_entry\_t} ocupa 72 bytes y reúne el estado del directorio de una página, incluido el copyset de 32 bytes que cubre las 256 ranuras. \texttt{dist\_run\_wire\_t} ocupa 48 bytes y \texttt{dist\_done\_wire\_t} 44 en el cable, aunque la estructura en memoria mida 48 por el relleno final.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\linewidth}{l r Y}
+\toprule
+\textbf{Estructura} & \textbf{Bytes en el cable} & \textbf{Contenido} \\
+\midrule
+\texttt{discovery\_wire\_t} & 80 & Magic, versión, clúster, hash, UUID, nombre, IP, puerto, páginas, ranura y rol. \\
+\texttt{membership\_wire\_t} & 36 & UUID, IP, puerto, ranura, estado, incarnation y páginas. \\
+\texttt{alloc\_rec\_t} & 24 & Identificador, primera página, cantidad, ranura, PID y reservado. \\
+\texttt{dir\_entry\_t} & 72 & Página, owner, versión, \texttt{tseq}, marco, franja, cola, estado y copyset. \\
+\texttt{stripe\_wire\_t} & 76 & Franja, $K$, custodio de paridad y hasta ocho páginas y ranuras de datos. \\
+\texttt{dist\_run\_wire\_t} & 48 & Trabajo, kernel, partición, total, plazo, direcciones, bytes y correlato. \\
+\texttt{dist\_done\_wire\_t} & 44 & Trabajo, partición, estado, elementos, CRC, duración, correlato y fallos. \\
+\texttt{alloc\_msg\_t} & 16 & Páginas, primera página, estado y PID. \\
+\texttt{page\_rec\_t} & 24 & Página, home, versión, estado, banderas, PID y orden. \\
+\texttt{node\_rec\_t} & 52 & Ranura, UUID, IP, puerto, estado, latidos, memoria y época. \\
+\texttt{stats\_wire\_t} & 96 & Doce contadores de 64 bits para \texttt{dsmctl}. \\
+\texttt{query\_req\_t} / \texttt{query\_resp\_t} & 12 / 8 & Tipo, ámbito y rango; cabecera de respuesta con tipo, continuación y conteo. \\
+\texttt{lock\_migrate\_wire\_t} & 12 & Época de sincronización y ranura caída. \\
+\texttt{lock\_state\_wire\_t} & $20 + 12k$ & Época, ranura, conteo y registros de cerrojos. \\
+\texttt{wire\_word\_t} & 4 & Identificador de franja o generación según el mensaje. \\
+\texttt{stripe\_read\_wire\_t} & 8 & Franja y tipo de bloque pedido. \\
+\bottomrule
+\end{tabularx}
+\caption{Tamaños de las estructuras fijas del protocolo. Las listas variables se validan con aritmética modular antes de recorrerlas.}
+\label{tab:cargas-utiles}
+\end{table}
+
+El \texttt{WELCOME} es la única carga de tamaño variable relevante. Su formato es un \texttt{epoch} de 8 bytes, el UUID de origen de 16, un contador de 4, la lista de \texttt{membership\_wire\_t}, un contador de reservas de 4 y hasta 64 \texttt{alloc\_rec\_t}. El desempaquetador comprueba que el conteo de miembros no supere 256, que la longitud alcance para esa lista, que el conteo de reservas no supere 64 y que la longitud alcance para los registros. Un contador corrupto que declare una lista absurda se rechaza antes de recorrerla, y el empaquetador aplica la misma comprobación antes de escribir.
+
+Las páginas viajan como bytes crudos dentro de la carga, sin conversión de orden. \texttt{dsm\_pack\_page\_payload} copia exactamente \texttt{page\_size} bytes y \texttt{dsm\_unpack\_page\_payload} hace lo inverso; la validación previa garantiza que la longitud sea la configurada, de modo que el desempaquetador no necesita comprobar el tamaño otra vez. La paridad usa el mismo mecanismo con un prefijo de 4 bytes para la franja. Las estructuras con listas, como \texttt{LOCK\_STATE}, validan la relación entre la longitud y el conteo antes de leer el primer registro.
