@@ -103,11 +103,11 @@ ninguna, así que ejecutarlas no agrega un nodo. Solo necesitan un clúster en m
 
 ```sh
 # Filtro de blanco y negro sobre un video real (RGB24 → luminancia)
-./build/bin/release/filtro_video datos/video_128x96.rgb /tmp/gris.gris 4
+./build/bin/release/filtro_video data/video_128x96.rgb /tmp/gris.gris 4
 
 # Autómata de Conway sembrado con una fotografía real de 192 x 192
-./build/bin/release/juego_vida --imagen datos/tablero_192.gray 192 192 30 4
-./build/bin/release/juego_vida --imagen datos/tablero_192.gray --verificar 192 192 30 4
+./build/bin/release/juego_vida --imagen data/tablero_192.gray 192 192 30 4
+./build/bin/release/juego_vida --imagen data/tablero_192.gray --verificar 192 192 30 4
 
 # Multiplicación de matrices cuadradas sobre la vista distribuida
 ./build/bin/release/matmul 256 --hilos 4
@@ -120,7 +120,7 @@ de C y lo compara elemento por elemento contra una referencia secuencial en memo
 e imprime `VERIFICACION: OK` o `VERIFICACION: FALLO`. `N` vale 256 por defecto y cada
 matriz ocupa `N² × 8 B`: con 256 son 0.5 MiB por matriz y con 2048, 32 MiB por matriz.
 
-Los archivos de `datos/` son material real versionado en el repositorio, no datos
+Los archivos de `data/` son material real versionado en el repositorio, no datos
 sintéticos generados al vuelo: un video y una fotografía convertidos con `ffmpeg`. Para
 producir más, `video_pack` añade la cabecera que espera `filtro_video` a cualquier
 secuencia RGB24 cruda.
@@ -226,7 +226,7 @@ apps/        dsm (nodo), demo, matmul, filtro_video, juego_vida
 tools/       dsmctl y video_pack
 tests/       unit/ y e2e/ (flujo MSI, ejecución distribuida y reconstrucción con paridad)
 docs/        API.md e informes compilados
-datos/       video y fotografía reales para las aplicaciones de prueba
+data/        video y fotografía reales para las aplicaciones de prueba
 ```
 
 ## Documentación
